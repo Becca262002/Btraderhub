@@ -1,15 +1,69 @@
 // ========================================================
 // 🔐 GLOBAL APPLICATION CONFIGURATION & RUNTIME STATES
 // ========================================================
-const derivWS = new WebSocket(`wss://ws.binaryws.com/websockets/v3?app_id=${DERIV_APP_ID}`);
+// DO NOT initialize the WebSocket here in the global scope
+let derivWS; // Global variable
 
+function connectToDeriv() {
+    if (typeof DERIV_APP_ID === 'undefined') {
+        console.error("DERIV_APP_ID missing! Check config.js");
+        return;
+    }
+
+    // 1. Create the instance
+    const socket = new WebSocket(`wss://ws.binaryws.com/websockets/v3?app_id=${DERIV_APP_ID}`);
+
+    // 2. Attach listeners to the local 'socket' variable, NOT the global 'derivWS' yet
+    socket.onopen = () => {
+        console.log("Connected to Deriv!");
+        derivWS = socket; // Now assign to the global variable
+        document.querySelector('.status').innerText = "ONLINE";
+    };
+
+    socket.onerror = (err) => console.error("WS Error:", err);
+    
+    socket.onclose = () => {
+        console.log("Connection lost.");
+        document.querySelector('.status').innerText = "OFFLINE";
+    };
+}
+
+window.addEventListener('load', connectToDeriv);
+
+function connectToDeriv() {
+    // Just assign it here, don't use 'const' again
+    derivWS = new WebSocket(`wss://ws.binaryws.com/websockets/v3?app_id=${DERIV_APP_ID}`);
+    // ... rest of your logic
+}
+
+// const derivWS = new WebSocket(...); // <--- REMOVE THIS IF IT IS AT THE TOP
+
+function connectToDeriv() {
+    // Check if the ID exists; if not, wait 1 second and try again
+    if (typeof DERIV_APP_ID === 'undefined') {
+        console.warn("Config not loaded yet, waiting...");
+        setTimeout(connectToDeriv, 1000);
+        return;
+    }
+
+    const derivWS = new WebSocket(`wss://ws.binaryws.com/websockets/v3?app_id=${DERIV_APP_ID}`);
+
+
+    derivWS.onopen = () => {
+        console.log("Connected to Deriv!");
+        // Update your UI here
+    };
+    
+    derivWS.onerror = (err) => console.error("WS Error:", err);
+}
+
+// Wait for the whole page to load before starting the connection
+window.addEventListener('load', connectToDeriv);
 // 1. SECURE INTEGRATED OAUTH REDIRECTION ROUTER
 function loginWithDeriv() {
     const redirectUrl = window.location.href.split('?')[0]; 
-    // Add the redirect_uri parameter to the end of the URL
     const oauthUrl = `https://oauth.deriv.com/oauth2/authorize?app_id=${DERIV_APP_ID}&l=en&brand=deriv&redirect_uri=${encodeURIComponent(redirectUrl)}`;
     window.location.href = oauthUrl;
-}
 }
 
 function signUpWithDeriv() {
@@ -828,7 +882,7 @@ function renderDigitCircles() {
 }
 
 const CONFIG = {
-    APP_ID: "33ByqD0GecGTE5whirko8"
+    APP_ID: "YOUR_ACTUAL_APP_ID_HERE"
 };
 window.addEventListener('DOMContentLoaded', () => {
     initializeTradingViewChart("OANDA:XAUUSD");
