@@ -1,1 +1,1 @@
-const DERIV_APP_ID = "YOUR_ACTUAL_APP_ID_HERE"; // Replace with your ID
+const DERIV_APP_ID = "33ByqD0GecGTE5whirko8"; // Replace with your ID
