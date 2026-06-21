@@ -20,19 +20,35 @@
             }
         }
     </script>
+    <style>
+        .digit-circle {
+            transition: all 0.3s ease;
+            border: 2px solid #e5e7eb;
+            cursor: pointer;
+        }
+        .digit-circle:hover { transform: scale(1.1); }
+    </style>
 </head>
 <body class="bg-derivDark text-slate-800 font-sans h-screen flex flex-col overflow-hidden">
 
+    <!-- ===== HEADER ===== -->
     <header class="bg-derivNav border-b border-gray-200 h-14 flex items-center justify-between px-4 z-50 flex-shrink-0 shadow-sm">
         <div class="flex items-center gap-6">
             <span class="text-xl font-black tracking-wider text-slate-900">B<span class="text-brandGreen">traderhub</span></span>
         </div>
-        <div id="auth-header-controls" class="flex items-center gap-3">
+        <div class="flex items-center gap-3">
+            <!-- Connection Status -->
+            <div class="flex items-center text-xs font-bold px-3">
+                <span id="status-dot" class="h-2 w-2 rounded-full bg-red-500 mr-2"></span>
+                <span id="status-text">OFFLINE</span>
+            </div>
+
+            <!-- Balance (hidden until logged in) -->
             <div id="balance-display" class="hidden bg-gray-100 border border-gray-200 rounded px-3 py-1 flex items-center gap-2 text-sm">
                 <span class="text-xs font-semibold text-gray-500">💵 Balance</span>
                 <span id="account-balance" class="font-bold text-slate-900">0.00</span>
             </div>
-            
+
             <button onclick="loginWithDeriv()" id="login-nav-btn" class="bg-blue-600 hover:bg-blue-700 text-white font-medium text-xs px-4 py-1.5 rounded transition shadow-sm">
                 Log in
             </button>
@@ -40,16 +56,9 @@
                 Sign up
             </button>
         </div>
-        <style>
-    .digit-circle {
-        transition: all 0.3s ease;
-        border: 2px solid #e5e7eb;
-        cursor: pointer;
-    }
-    .digit-circle:hover { transform: scale(1.1); }
-</style>
     </header>
 
+    <!-- ===== NAV TABS ===== -->
     <nav class="bg-derivCard border-b border-gray-200 h-12 flex items-center px-2 gap-1 flex-shrink-0">
         <button id="tab-btn-dashboard" onclick="switchTab('dashboard')" class="tab-btn px-4 py-1.5 rounded text-sm font-medium transition text-white bg-blue-600 shadow-sm">
             📊 Dashboard
@@ -63,25 +72,15 @@
         <button id="tab-btn-copy-trading" onclick="switchTab('copy-trading')" class="tab-btn px-4 py-1.5 rounded text-sm font-medium transition text-gray-600 hover:text-slate-900 hover:bg-gray-100">
             👥 Copy Trading
         </button>
-        <!-- Navigation Button -->
-<button id="tab-btn-digits" onclick="switchTab('digits')" class="tab-btn px-4 py-1.5 rounded text-sm font-medium transition text-gray-600 hover:text-slate-900 hover:bg-gray-100">
-    0️⃣ Digit Stats
-</button>
-
-<!-- Digit Pane -->
-<div id="digits-pane" class="tab-pane hidden p-6 w-full h-full">
-    <h2 class="text-xl font-bold mb-4">Real-Time Digit Statistics</h2>
-    <div id="digit-circles-container" class="grid grid-cols-5 gap-4 max-w-lg">
-        <!-- Circles will be injected here by JS -->
-    </div>
-</div>
+        <button id="tab-btn-digits" onclick="switchTab('digits')" class="tab-btn px-4 py-1.5 rounded text-sm font-medium transition text-gray-600 hover:text-slate-900 hover:bg-gray-100">
+            0️⃣ Digit Stats
+        </button>
     </nav>
-<div id="connection-status" class="flex items-center text-xs font-bold px-3">
-    <span id="status-dot" class="h-2 w-2 rounded-full bg-red-500 mr-2"></span>
-    <span id="status-text">OFFLINE</span>
-</div>
+
+    <!-- ===== MAIN CONTENT ===== -->
     <main class="flex-1 flex overflow-hidden relative w-full h-full">
-        
+
+        <!-- DASHBOARD PANE -->
         <div id="dashboard-pane" class="tab-pane w-full p-6 overflow-y-auto">
             <div class="max-w-xl mx-auto bg-derivCard border border-gray-200 rounded-xl p-8 shadow-md mt-10 text-center">
                 <div class="w-16 h-16 bg-blue-50 text-blue-600 rounded-full flex items-center justify-center text-2xl mx-auto mb-4">
@@ -91,54 +90,35 @@
                 <p class="text-gray-500 text-sm mb-6 max-w-sm mx-auto">
                     Connect your Deriv profile instantly via secure single sign-on to launch your automation trading systems.
                 </p>
-                
-                <div id="dashboard-auth-box" class="space-y-4">
+                <div class="space-y-4">
                     <button onclick="loginWithDeriv()" class="w-full bg-blue-600 hover:bg-blue-700 text-white font-bold py-3 rounded-lg text-sm tracking-wide transition shadow-md">
                         Connect My Deriv Account
                     </button>
+                    <!-- FIX: Removed duplicate id="connection-status"; using unique id here -->
                     <div id="connection-status" class="hidden text-xs p-3 rounded-lg border"></div>
                 </div>
             </div>
         </div>
 
+        <!-- BOT BUILDER PANE -->
         <div id="bot-builder-pane" class="tab-pane hidden flex flex-1 overflow-hidden w-full h-full">
-            <div id="copy-trading-pane" class="tab-pane hidden p-6">
-    <div class="max-w-4xl mx-auto">
-        <h2 class="text-lg font-bold mb-4">Mirror Trading Configuration</h2>
-        
-        <!-- index.html -->
-<div id="copy-trading-pane" class="tab-pane hidden p-6">
-    <h2 class="text-xl font-bold mb-4">Mirror Trading Configuration</h2>
-    
-    <!-- Your Add Slave Form -->
-    <div class="bg-white p-6 rounded-xl border shadow-sm">
-        <input id="slave-token-input" placeholder="Slave API Token" class="w-full p-2 border rounded mb-2">
-        <input id="slave-multiplier-input" type="number" value="1.0" class="w-full p-2 border rounded mb-2">
-        <button onclick="addNewSlave()" class="w-full bg-blue-600 text-white py-2 rounded">ADD SLAVE</button>
-    </div>
 
-    <!-- The list container -->
-    <div id="slave-accounts-list" class="mt-4 space-y-2"></div>
-</div>
-
-        <div id="slave-accounts-list" class="space-y-3">
-            </div>
-    </div>
-</div>
+            <!-- Left sidebar: Strategy Parameters -->
             <aside class="w-72 bg-derivCard border-r border-gray-200 flex flex-col flex-shrink-0 h-full">
                 <div class="p-3 border-b border-gray-200 bg-slate-50 font-bold text-xs tracking-wider text-slate-700">
-                     ⚙️ STRATEGY PARAMETERS
+                    ⚙️ STRATEGY PARAMETERS
                 </div>
                 <div class="flex-1 overflow-y-auto p-4 space-y-4 text-xs">
                     <div>
                         <label class="block text-[11px] font-bold uppercase tracking-wide text-gray-500 mb-1">Market Asset</label>
                         <select id="market-asset-select" class="w-full p-2 border rounded text-sm">
-    <option value="">Select Market Asset</option>
-</select>
+                            <option value="">Select Market Asset</option>
+                        </select>
+                        <button onclick="suggestBestMarket()" class="mt-2 w-full bg-indigo-600 text-white py-1 rounded text-xs font-bold hover:bg-indigo-700">
+                            ✨ AI SUGGEST MARKET
+                        </button>
                     </div>
-<button onclick="suggestBestMarket()" class="mt-2 w-full bg-indigo-600 text-white py-1 rounded text-xs font-bold hover:bg-indigo-700">
-    ✨ AI SUGGEST MARKET
-</button>
+
                     <div>
                         <label class="block text-[11px] font-bold uppercase tracking-wide text-gray-500 mb-1">Trade Type</label>
                         <select id="bot-trade-type" onchange="toggleAccumulatorFields()" class="w-full bg-gray-50 border border-gray-300 rounded p-2 font-medium focus:ring-1 focus:ring-blue-500 outline-none">
@@ -189,36 +169,57 @@
                     <div class="grid grid-cols-2 gap-2">
                         <div>
                             <label class="block text-[11px] font-bold uppercase tracking-wide text-gray-500 mb-1">Take Profit</label>
-                            <input type="number" id="bot-tp" value="50.00" class="w-full bg-gray-50 border border-gray-300 border-emerald-300 rounded p-2 text-center text-emerald-600 font-bold">
+                            <input type="number" id="bot-tp" value="50.00" class="w-full bg-gray-50 border rounded p-2 text-center text-emerald-600 font-bold">
                         </div>
                         <div>
                             <label class="block text-[11px] font-bold uppercase tracking-wide text-gray-500 mb-1">Stop Loss</label>
-                            <input type="number" id="bot-sl" value="100.00" class="w-full bg-gray-50 border border-gray-300 border-red-300 rounded p-2 text-center text-red-600 font-bold">
+                            <input type="number" id="bot-sl" value="100.00" class="w-full bg-gray-50 border rounded p-2 text-center text-red-600 font-bold">
                         </div>
+                    </div>
+
+                    <!-- Bot market selector (used by bot engine) -->
+                    <div>
+                        <label class="block text-[11px] font-bold uppercase tracking-wide text-gray-500 mb-1">Bot Market Symbol</label>
+                        <select id="bot-market" onchange="updateLiveChartAsset()" class="w-full bg-gray-50 border border-gray-300 rounded p-2 font-medium outline-none text-xs">
+                            <option value="R_10">Volatility 10</option>
+                            <option value="R_25">Volatility 25</option>
+                            <option value="R_50">Volatility 50</option>
+                            <option value="R_75">Volatility 75</option>
+                            <option value="R_100">Volatility 100</option>
+                            <option value="1HZ10V">Volatility 10 (1s)</option>
+                            <option value="1HZ25V">Volatility 25 (1s)</option>
+                            <option value="1HZ50V">Volatility 50 (1s)</option>
+                            <option value="1HZ75V">Volatility 75 (1s)</option>
+                            <option value="1HZ100V">Volatility 100 (1s)</option>
+                            <option value="JD10">Jump 10 Index</option>
+                            <option value="JD25">Jump 25 Index</option>
+                            <option value="JD50">Jump 50 Index</option>
+                            <option value="JD75">Jump 75 Index</option>
+                            <option value="JD100">Jump 100 Index</option>
+                        </select>
                     </div>
                 </div>
             </aside>
 
+            <!-- Center: Chart -->
             <section class="flex-1 bg-derivDark p-3 flex flex-col overflow-hidden h-full">
                 <div class="bg-white border border-gray-200 rounded-xl shadow-sm flex-1 overflow-hidden relative flex flex-col">
                     <div class="h-10 border-b border-gray-100 bg-slate-50 px-4 flex items-center justify-between text-xs font-semibold text-slate-700">
                         <span class="flex items-center gap-1.5 text-blue-600">📈 Live Technical Feed</span>
                         <span id="chart-asset-ticker" class="bg-blue-50 text-blue-700 font-bold px-2 py-0.5 rounded text-[10px]">OANDA:XAUUSD</span>
                     </div>
-                    
-                    <div id="tradingview-widget-container" class="flex-1 w-full h-full bg-white">
-                        <div id="tv-chart-frame" class="w-full h-full"></div>
-                    </div>
+                    <div id="tv-chart-frame" class="flex-1 w-full h-full"></div>
                 </div>
             </section>
 
+            <!-- Right sidebar: Bot controls -->
             <aside class="w-80 bg-derivCard border-l border-gray-200 flex flex-col flex-shrink-0 h-full">
                 <div class="p-3 border-b border-gray-200">
                     <button id="run-bot-btn" onclick="toggleBotExecution()" class="w-full bg-brandGreen hover:bg-brandGreenHover text-white font-bold py-2 rounded text-xs tracking-wider transition shadow-sm">
                         ▶ RUN BOT
                     </button>
                 </div>
-                
+
                 <div class="p-3 bg-gray-50 border-b border-gray-200 text-[11px] font-bold tracking-wide uppercase text-gray-500">
                     <div class="grid grid-cols-3 gap-2 text-center mb-3">
                         <div class="bg-white p-1.5 border border-gray-200 rounded">
@@ -234,7 +235,6 @@
                             <div id="stat-profit" class="text-sm font-mono font-black text-slate-800 mt-0.5">0.00</div>
                         </div>
                     </div>
-
                     <div class="grid grid-cols-3 gap-2 text-center">
                         <div class="bg-white p-1.5 border border-gray-200 rounded">
                             <div>Win Rate</div>
@@ -256,7 +256,7 @@
                 </div>
 
                 <div class="flex-1 overflow-y-auto p-2 space-y-1.5" id="transaction-rows-container">
-                    <div id="empty-rows-msg" class="text-center text-gray-400 text-xs my-auto pt-10 px-4">
+                    <div id="empty-rows-msg" class="text-center text-gray-400 text-xs pt-10 px-4">
                         Connect your account and hit Run to stream live transaction payloads.
                     </div>
                 </div>
@@ -270,6 +270,7 @@
             </aside>
         </div>
 
+        <!-- CHARTS PANE -->
         <div id="charts-pane" class="tab-pane hidden flex-1 w-full h-full bg-slate-50 p-4 overflow-hidden">
             <div class="bg-white border border-gray-200 rounded-xl shadow-sm w-full h-full flex flex-col overflow-hidden" style="min-height: calc(100vh - 160px);">
                 <div class="h-12 border-b border-gray-100 bg-slate-50 px-4 flex items-center justify-between text-xs font-semibold text-slate-700 flex-shrink-0">
@@ -278,21 +279,45 @@
                     </span>
                     <span class="bg-blue-100 text-blue-700 font-bold px-2 py-0.5 rounded text-[10px]">PRO TERMINAL</span>
                 </div>
-                
-                <div id="standalone-tv-chart-container" class="flex-1 w-full h-full bg-white">
-                    <div id="tv-standalone-frame" class="w-full h-full" style="min-height: 550px;"></div>
+                <div id="tv-standalone-frame" class="flex-1 w-full h-full" style="min-height: 550px;"></div>
+            </div>
+        </div>
+
+        <!-- COPY TRADING PANE -->
+        <div id="copy-trading-pane" class="tab-pane hidden p-6 w-full overflow-y-auto">
+            <div class="max-w-2xl mx-auto">
+                <h2 class="text-lg font-bold mb-4">Mirror Trading Configuration</h2>
+                <div class="bg-white p-6 rounded-xl border shadow-sm mb-4">
+                    <label class="block text-xs font-bold text-gray-500 uppercase mb-1">Slave API Token</label>
+                    <input id="slave-token-input" placeholder="Enter slave account API token" class="w-full p-2 border rounded mb-3 text-sm">
+                    <label class="block text-xs font-bold text-gray-500 uppercase mb-1">Stake Multiplier</label>
+                    <input id="slave-multiplier-input" type="number" value="1.0" step="0.1" class="w-full p-2 border rounded mb-3 text-sm">
+                    <button onclick="addNewSlave()" class="w-full bg-blue-600 hover:bg-blue-700 text-white font-bold py-2 rounded text-sm transition">
+                        + ADD SLAVE ACCOUNT
+                    </button>
+                </div>
+                <!-- FIX: Single slave list container with correct id used by app.js -->
+                <div id="slave-list-container" class="space-y-2">
+                    <p class="text-xs text-gray-400">No slave accounts added yet.</p>
                 </div>
             </div>
         </div>
 
-        <div id="copy-trading-pane" class="tab-pane hidden p-6 w-full text-center text-sm text-gray-400 font-mono">[ Multi-Account Mirror Systems Panel ]</div>
+        <!-- DIGIT STATS PANE -->
+        <!-- FIX: Moved out of <nav> where it was incorrectly nested -->
+        <div id="digits-pane" class="tab-pane hidden p-6 w-full overflow-y-auto">
+            <h2 class="text-xl font-bold mb-4">Real-Time Digit Statistics</h2>
+            <p class="text-xs text-gray-400 mb-6">Authorize your account and run the bot to stream live digit data.</p>
+            <div id="digit-circles-container" class="grid grid-cols-5 gap-4 max-w-lg">
+                <!-- Injected by JS -->
+            </div>
+        </div>
+
     </main>
 
-    <!-- Load configuration first -->
-<script src="config.js"></script>
-
-<!-- Load your main logic second -->
-<script src="app.js"></script>
+    <!-- config.js MUST load before app.js -->
+    <script src="config.js"></script>
+    <script src="app.js"></script>
 
 </body>
 </html>
