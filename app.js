@@ -215,9 +215,9 @@ function switchTab(tabId) {
 
     if (tabId === 'bot-builder') {
         setTimeout(() => {
+            // Bot builder uses Deriv iframe — just sync the symbol
             const marketSelector = document.getElementById('bot-market');
-            const currentAsset = marketSelector ? marketSelector.value : "OANDA:XAUUSD";
-            initializeTradingViewChart(currentAsset);
+            if (marketSelector) updateLiveChartAsset();
         }, 50);
     }
 
@@ -591,12 +591,15 @@ function initializeTradingViewChart(symbolName = "OANDA:XAUUSD") {
     }
 }
 
+// Update the Deriv SmartCharts iframe when market changes
 function updateLiveChartAsset() {
     const selectedSymbol = document.getElementById('bot-market').value;
     const ticker = document.getElementById('chart-asset-ticker');
     if (ticker) ticker.innerText = selectedSymbol;
-    logJournalMessage(`Switching chart feed to: ${selectedSymbol}`);
-    initializeTradingViewChart(selectedSymbol);
+    // Update iframe src with new Deriv symbol — no TradingView mapping needed
+    const iframe = document.getElementById('deriv-chart-frame');
+    if (iframe) iframe.src = `https://charts.deriv.com/?symbol=${selectedSymbol}&granularity=60`;
+    logJournalMessage(`Switching chart to: ${selectedSymbol}`);
 }
 
 function initializeStandaloneFullScreenChart(symbolName = "OANDA:XAUUSD") {
