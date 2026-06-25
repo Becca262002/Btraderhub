@@ -1,19 +1,30 @@
-/* Custom clean scrollbars for light mode */
+/* ✨ Btraderhub — Bright Girly Scrollbar & Base Styles */
 ::-webkit-scrollbar {
-    width: 6px;
-    height: 6px;
+  width: 6px;
+  height: 6px;
 }
+
 ::-webkit-scrollbar-track {
-    background: #F4F6F8;
+  background: #fce7f3; /* soft pink rose */
 }
+
 ::-webkit-scrollbar-thumb {
-    background: #CBD5E1;
-    border-radius: 3px;
+  background: #f9a8d4; /* bubblegum pink */
+  border-radius: 3px;
 }
+
 ::-webkit-scrollbar-thumb:hover {
-    background: #94A3B8;
+  background: #ec4899; /* hot pink */
 }
 
 body {
-    user-select: none;
+  user-select: none;
+  background: #fdf0f7; /* blush white */
+  accent-color: #ec4899; /* pink focus rings on inputs */
+}
+
+/* ✨ Optional: pink selection highlight */
+::selection {
+  background: #f9a8d4;
+  color: #831843;
 }
