@@ -548,32 +548,56 @@ function executeContract(entrySpot) {
     const contractType = typeMap?.[botDirection];
 
     if (!contractType) {
-        log(`❌ Invalid: ${botDirection} for ${type}`, 'x');
+        log(`❌ Invalid direction "${botDirection}" for type "${type}"`, 'x');
         return;
     }
 
-    // Build order
-    const order = {
-        buy: 1,
-        price: currentStake,
-        parameters: {
-            amount:        currentStake,
-            basis:         "stake",
-            contract_type: contractType,
-            currency:      "USD",
-            symbol:        market,
-            duration:      duration,
-            duration_unit: "t"
-        }
+    // Validate stake
+    if (currentStake < 0.35) {
+        log(`❌ Stake $${currentStake.toFixed(2)} below minimum $0.35`, 'x');
+        currentStake = 0.35;
+    }
+
+    // Digit contracts use ticks for duration
+    const isDigit = ['DIGITEVEN','DIGITODD','DIGITOVER','DIGITUNDER','DIGITMATCH','DIGITDIFF'].includes(contractType);
+
+    // Build order — exact Deriv API format
+    const params = {
+        amount:        parseFloat(currentStake.toFixed(2)),
+        basis:         "stake",
+        contract_type: contractType,
+        currency:      "USD",
+        symbol:        market,
     };
 
-    // Add barrier for digit contracts
-    if (type === 'over_under') order.parameters.barrier = pred.toString();
+    // Duration — digit contracts need ticks
+    if (isDigit) {
+        params.duration      = Math.max(1, Math.min(10, duration));
+        params.duration_unit = "t";
+    } else if (type === 'rise_fall') {
+        params.duration      = Math.max(1, duration);
+        params.duration_unit = "t";
+    } else if (type === 'only_ups_downs') {
+        params.duration      = Math.max(2, Math.min(10, duration));
+        params.duration_unit = "t";
+    }
+
+    // Barrier only for over/under digit contracts
+    if (type === 'over_under') {
+        params.barrier = pred.toString();
+    }
+
+    const order = {
+        buy:        1,
+        price:      parseFloat(currentStake.toFixed(2)),
+        parameters: params
+    };
+
+    log(`🎯 Sending: ${contractType} @ $${currentStake.toFixed(2)} | ${MKT[market]||market} | ${JSON.stringify({dur:params.duration, unit:params.duration_unit, barrier:params.barrier})}`, 'i');
 
     pendingContract = true;
     lastContractId  = "pending";
     derivWS.send(JSON.stringify(order));
-    log(`🎯 ${contractType} @ $${currentStake.toFixed(2)} | ${MKT[market]||market} | Entry: ${entrySpot}`, 'i');
 }
 
 function handleBuyResponse(r) {
