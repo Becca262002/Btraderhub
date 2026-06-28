@@ -48,16 +48,32 @@ let signalHistory    = [];
 const winAudio  = new Audio('https://actions.google.com/sounds/v1/cartoon/slide_whistle_up.ogg');
 const lossAudio = new Audio('https://actions.google.com/sounds/v1/cartoon/boing_long.ogg');
 
-// Market labels
+// Market labels — valid Deriv underlying_symbols only
 const MKT = {
-    R_10:"Volatility 10",R_25:"Volatility 25",R_50:"Volatility 50",
-    R_75:"Volatility 75",R_100:"Volatility 100",
-    "1HZ10V":"V10 (1s)","1HZ25V":"V25 (1s)","1HZ50V":"V50 (1s)",
-    "1HZ75V":"V75 (1s)","1HZ100V":"V100 (1s)",
-    JD10:"Jump 10",JD25:"Jump 25",JD50:"Jump 50",JD75:"Jump 75",JD100:"Jump 100"
+    "R_10":     "Volatility 10",
+    "R_25":     "Volatility 25",
+    "R_50":     "Volatility 50",
+    "R_75":     "Volatility 75",
+    "R_100":    "Volatility 100",
+    "1HZ10V":   "Volatility 10 (1s)",
+    "1HZ25V":   "Volatility 25 (1s)",
+    "1HZ50V":   "Volatility 50 (1s)",
+    "1HZ75V":   "Volatility 75 (1s)",
+    "1HZ100V":  "Volatility 100 (1s)",
+    "jump_10":  "Jump 10 Index",
+    "jump_25":  "Jump 25 Index",
+    "jump_50":  "Jump 50 Index",
+    "jump_75":  "Jump 75 Index",
+    "jump_100": "Jump 100 Index",
 };
 
-const ALL_MKTS = ["R_10","R_25","R_50","R_75","R_100","1HZ10V","1HZ50V","JD10","JD50"];
+const ALL_MKTS = ["R_10","R_25","R_50","R_75","R_100","1HZ10V","1HZ25V","1HZ50V","1HZ75V","1HZ100V"];
+
+// Pending proposal tracking
+let pendingProposalId  = null;
+let pendingProposalPrice = null;
+let reqIdCounter       = 1;
+function nextReqId() { return ++reqIdCounter; }
 
 // Contract type map
 const CONTRACT_MAP = {
@@ -323,12 +339,21 @@ function onConnected() {
 
     // Subscribe to balance + ticks
     derivWS.send(JSON.stringify({ balance: 1, subscribe: 1 }));
+
+    // Fetch valid active symbols from Deriv
+    derivWS.send(JSON.stringify({
+        active_symbols: "brief",
+        product_type:   "basic",
+        req_id:         nextReqId()
+    }));
+
+    // Subscribe to digit feeds
     subscribeDigitFeed(currentDigitMkt);
     subscribeDigitFeed(document.getElementById('bot-market')?.value || 'R_10');
 
     // Start AI scan loop
     startAILoop();
-    log("Connected to Deriv API ✅", 'i');
+    log("✅ Connected to Deriv API", 'i');
 }
 
 // ================================================================
@@ -352,7 +377,34 @@ function routeMsg(r) {
         if (sym) processHistory(sym, r.history);
     }
 
-    // Buy response
+    // Active symbols — log valid symbols for debugging
+    if (r.msg_type === 'active_symbols' && r.active_symbols) {
+        const digitMkts = r.active_symbols.filter(s =>
+            s.market === 'synthetic_index' && s.submarket !== 'random_daily'
+        );
+        log(`📡 ${digitMkts.length} valid markets loaded from Deriv`, 'i');
+        // Update valid symbol list dynamically
+        digitMkts.slice(0, 5).forEach(s => {
+            log(`   ${s.symbol} = ${s.display_name}`, 'd');
+        });
+    }
+
+    // STEP 2: Proposal response — extract ID and ask_price, then buy
+    if (r.msg_type === 'proposal') {
+        if (r.error) {
+            pendingContract = false;
+            lastContractId  = null;
+            log(`❌ Proposal rejected: ${r.error.message}`, 'x');
+            log(`   Code: ${r.error.code} | Check market symbol and contract params`, 'x');
+        } else if (r.proposal && isBotRunning) {
+            const proposalId = r.proposal.id;
+            const askPrice   = r.proposal.ask_price;
+            log(`✅ Proposal received: ${proposalId} | Ask: $${askPrice}`, 'i');
+            buyFromProposal(proposalId, parseFloat(askPrice));
+        }
+    }
+
+    // STEP 3: Buy response
     if (r.msg_type === 'buy') handleBuyResponse(r);
 
     // Contract settled
@@ -535,6 +587,7 @@ function runBotLogic(digit, quote) {
     }
 }
 
+// ── STEP 1: Send proposal (Amy-verified flow) ──
 function executeContract(entrySpot) {
     if (!isBotRunning || pendingContract) return;
 
@@ -552,55 +605,64 @@ function executeContract(entrySpot) {
         return;
     }
 
-    // Validate stake
+    // Validate stake minimum
     if (currentStake < 0.35) {
-        log(`❌ Stake $${currentStake.toFixed(2)} below minimum $0.35`, 'x');
         currentStake = 0.35;
+        log(`⚠️ Stake adjusted to minimum $0.35`, 'x');
     }
 
     const isDigit    = ['DIGITEVEN','DIGITODD','DIGITOVER','DIGITUNDER','DIGITMATCH','DIGITDIFF'].includes(contractType);
     const isRiseFall = ['CALL','PUT'].includes(contractType);
     const isRunHL    = ['RUNHIGH','RUNLOW'].includes(contractType);
 
-    // Build params — strict Deriv API format
-    const params = {
-        amount:        parseFloat(currentStake.toFixed(2)),
-        basis:         "stake",
-        contract_type: contractType,
-        currency:      "USD",
-        symbol:        market,
+    // Build proposal — Amy confirmed: use underlying_symbol not symbol
+    const proposal = {
+        proposal:           1,
+        amount:             parseFloat(currentStake.toFixed(2)),
+        basis:              "stake",
+        contract_type:      contractType,
+        currency:           "USD",
+        underlying_symbol:  market,
+        req_id:             nextReqId()
     };
 
+    // Duration rules per contract type
     if (isDigit) {
-        // Digit contracts: ticks 1-10
-        params.duration      = Math.max(1, Math.min(10, duration));
-        params.duration_unit = "t";
+        proposal.duration      = Math.max(1, Math.min(10, duration));
+        proposal.duration_unit = "t";
     } else if (isRunHL) {
-        // Only Ups/Downs: ticks 2-10
-        params.duration      = Math.max(2, Math.min(10, duration));
-        params.duration_unit = "t";
+        proposal.duration      = Math.max(2, Math.min(10, duration));
+        proposal.duration_unit = "t";
     } else if (isRiseFall) {
-        // Rise/Fall: use minutes (ticks not supported on all markets)
-        params.duration      = 1;
-        params.duration_unit = "m";
+        proposal.duration      = Math.max(1, duration);
+        proposal.duration_unit = "m";
     }
 
-    // Barrier for over/under only
+    // Barrier for over/under
     if (type === 'over_under') {
-        params.barrier = pred.toString();
+        proposal.barrier = pred.toString();
     }
 
-    const order = {
-        buy:        1,
-        price:      parseFloat(currentStake.toFixed(2)),
-        parameters: params
+    pendingContract  = true;
+    lastContractId   = "pending";
+    lastEntrySpot    = entrySpot;
+
+    log(`📋 Proposal: ${contractType} @ $${currentStake.toFixed(2)} | ${MKT[market]||market} | dur:${proposal.duration||'?'}${proposal.duration_unit||''}${proposal.barrier?' barrier:'+proposal.barrier:''}`, 'i');
+    derivWS.send(JSON.stringify(proposal));
+}
+
+// ── STEP 2: Buy using proposal ID (Amy-verified flow) ──
+function buyFromProposal(proposalId, askPrice) {
+    if (!isBotRunning) return;
+
+    const buyOrder = {
+        buy:    proposalId,
+        price:  parseFloat(askPrice.toFixed(2)),
+        req_id: nextReqId()
     };
 
-    log(`🎯 ${contractType} @ $${currentStake.toFixed(2)} | ${MKT[market]||market} | dur:${params.duration}${params.duration_unit}${params.barrier?' barrier:'+params.barrier:''}`, 'i');
-
-    pendingContract = true;
-    lastContractId  = "pending";
-    derivWS.send(JSON.stringify(order));
+    log(`🎯 Buying proposal ${proposalId} @ $${askPrice.toFixed(2)}`, 'i');
+    derivWS.send(JSON.stringify(buyOrder));
 }
 
 function handleBuyResponse(r) {
@@ -608,20 +670,34 @@ function handleBuyResponse(r) {
         pendingContract = false;
         lastContractId  = null;
         const reason = r.error.message || 'Unknown error';
-        log(`❌ Trade rejected: ${reason}`, 'x');
+        const code   = r.error.code   || '';
+        log(`❌ Buy rejected: ${reason} (${code})`, 'x');
         log(`   Market: ${document.getElementById('bot-market')?.value} | Type: ${document.getElementById('bot-type')?.value} | Dir: ${botDirection}`, 'x');
-        notify("Trade Rejected", reason, 'err');
-    } else {
+        // Only notify on first rejection per minute to avoid spam
+        const nKey = `buy-err-${Math.floor(Date.now()/60000)}`;
+        if (!seenSignals.has(nKey)) {
+            seenSignals.add(nKey);
+            notify("Trade Rejected", `${reason}`, 'err');
+        }
+    } else if (r.buy) {
         lastContractId = r.buy.contract_id;
         totalRuns++;
-        log(`📋 Contract #${lastContractId} placed`, 'i');
+        log(`✅ Contract #${lastContractId} confirmed | Buy price: $${r.buy.buy_price}`, 'w');
         updateAllStats();
+        // Subscribe to this contract for result
+        derivWS.send(JSON.stringify({
+            proposal_open_contract: 1,
+            contract_id: lastContractId,
+            subscribe: 1
+        }));
     }
 }
 
 function handleContractResult(c) {
-    if (!c || !c.is_expired) return;
-    if (c.contract_id !== lastContractId && lastContractId !== "pending") return;
+    if (!c) return;
+    // Only process when contract is fully settled
+    if (!c.is_sold && !c.is_expired) return;
+    if (c.contract_id !== lastContractId) return;
 
     pendingContract = false;
     lastContractId  = null;
