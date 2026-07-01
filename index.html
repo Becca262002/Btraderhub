@@ -180,6 +180,8 @@ body{padding-bottom:60px;}
 .iframe-wrap{flex:1;display:flex;flex-direction:column;overflow:hidden;min-height:0;}
 
 @media(max-width:768px){.sidebar,.sidebar-right{display:none;}.sidebar-right{display:none;}}
+
+<link rel="icon" type="image/png" href="logo.png">
     </style>
 </head>
 <body>
@@ -190,7 +192,10 @@ body{padding-bottom:60px;}
 <!-- ═══ HEADER ═══ -->
 <header>
     <div style="display:flex;align-items:center;gap:12px;">
-        <div class="logo">B<span>traderhub</span></div>
+        <div style="display:flex;align-items:center;gap:10px;">
+    <img src="logo.png" alt="Btraderhub" style="width:38px;height:38px;border-radius:6px;object-fit:contain;">
+    <div class="logo">B<span>traderhub</span></div>
+</div>
         <div style="display:flex;align-items:center;gap:5px;">
             <span class="status-dot" id="status-dot"></span>
             <span id="status-text" style="font-size:11px;font-weight:700;color:var(--muted);">OFFLINE</span>
