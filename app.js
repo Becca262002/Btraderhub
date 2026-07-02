@@ -394,14 +394,21 @@ function scheduleReconnect() {
 }
 
 function onConnected() {
-    // Show account UI
-    document.getElementById('btn-login')?.classList.add('hidden');
-    document.getElementById('btn-signup')?.classList.add('hidden');
+    // Hide login/signup buttons, show account UI
+    const btnLogin  = document.getElementById('btn-login');
+    const btnSignup = document.getElementById('btn-signup');
+    if (btnLogin)  { btnLogin.style.display  = 'none'; }
+    if (btnSignup) { btnSignup.style.display = 'none'; }
+
     const aw = document.getElementById('acct-wrap');
     if (aw) aw.style.display = 'flex';
-    document.getElementById('auth-card')?.style && (document.getElementById('auth-card').style.display = 'none');
+
+    const authCard = document.getElementById('auth-card');
+    if (authCard) authCard.style.display = 'none';
+
     const ds = document.getElementById('dash-stats');
     if (ds) ds.style.display = 'block';
+
     const bi = document.getElementById('bar-info');
     if (bi) bi.style.display = 'flex';
 
