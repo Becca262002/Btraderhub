@@ -169,6 +169,19 @@ window.addEventListener('load', async () => {
         window.history.replaceState({}, document.title, window.location.pathname);
         await handleOAuthCallback(code, state);
     }
+
+    // Show risk disclaimer on first visit (merged here to avoid duplicate load events)
+    if (!localStorage.getItem('risk-accepted')) {
+        setTimeout(() => {
+            showLegal('risk');
+            const origClose = window.closeLegal;
+            window.closeLegal = function() {
+                localStorage.setItem('risk-accepted', '1');
+                origClose();
+                window.closeLegal = origClose;
+            };
+        }, 1500);
+    }
 });
 
 // ================================================================
@@ -2060,18 +2073,4 @@ document.addEventListener('click', (e) => {
     if (e.target === modal) closeLegal();
 });
 
-// Show risk disclaimer on first visit
-window.addEventListener('load', () => {
-    if (!sessionStorage.getItem('risk-accepted')) {
-        setTimeout(() => {
-            showLegal('risk');
-            // Mark as seen after they close it
-            const origClose = window.closeLegal;
-            window.closeLegal = function() {
-                sessionStorage.setItem('risk-accepted', '1');
-                origClose();
-                window.closeLegal = origClose;
-            };
-        }, 1500);
-    }
-}, { once: true });
+// Risk disclaimer shown from main load event (no duplicate listener needed)
