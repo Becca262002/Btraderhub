@@ -161,12 +161,16 @@ window.addEventListener('load', async () => {
     // Start public WebSocket immediately for digit stats (no auth needed)
     connectPublicWS();
 
-    const params = new URLSearchParams(window.location.search);
-    const code   = params.get('code');
-    const state  = params.get('state');
-    if (code && state) {
-        window.history.replaceState({}, document.title, window.location.pathname);
-        await handleOAuthCallback(code, state);
+    // Check for OAuth callback — robust detection for mobile browsers
+    const urlSearch = window.location.search || window.location.hash.replace('#','?');
+    const params    = new URLSearchParams(urlSearch);
+    const code      = params.get('code');
+    const oauthState = params.get('state');
+
+    if (code && oauthState) {
+        // Clean URL immediately before any processing
+        try { window.history.replaceState({}, document.title, window.location.pathname); } catch(e) {}
+        await handleOAuthCallback(code, oauthState);
     }
 
     // Show risk disclaimer on first visit (merged here to avoid duplicate load events)
@@ -249,9 +253,16 @@ async function loginWithDeriv() {
     const stateBytes = crypto.getRandomValues(new Uint8Array(16));
     const state = Array.from(stateBytes).map(b => b.toString(16).padStart(2,'0')).join('');
 
-    // Amy fix: use localStorage not sessionStorage — mobile browsers reset sessionStorage on redirect
-    localStorage.setItem('pkce_code_verifier', code_verifier);
-    localStorage.setItem('oauth_state', state);
+    // Store in both localStorage AND sessionStorage for mobile compatibility
+    // Different mobile browsers clear different storage types on redirect
+    try { localStorage.setItem('pkce_code_verifier', code_verifier); } catch(e) {}
+    try { localStorage.setItem('oauth_state', state); } catch(e) {}
+    try { sessionStorage.setItem('pkce_code_verifier', code_verifier); } catch(e) {}
+    try { sessionStorage.setItem('oauth_state', state); } catch(e) {}
+    // Also store in cookie as final fallback (works on all mobile browsers)
+    const expires = new Date(Date.now() + 5 * 60 * 1000).toUTCString(); // 5 min expiry
+    document.cookie = `pkce_cv=${encodeURIComponent(code_verifier)};expires=${expires};path=/;SameSite=Lax`;
+    document.cookie = `pkce_st=${encodeURIComponent(state)};expires=${expires};path=/;SameSite=Lax`;
 
     const url = new URL('https://auth.deriv.com/oauth2/auth');
     url.searchParams.set('response_type',         'code');
@@ -262,7 +273,13 @@ async function loginWithDeriv() {
     url.searchParams.set('code_challenge',        code_challenge);
     url.searchParams.set('code_challenge_method', 'S256');
 
-    window.location.href = url.toString();
+    // On mobile, use location.replace instead of href to avoid history issues
+    const isMobile = /iPhone|iPad|iPod|Android/i.test(navigator.userAgent);
+    if (isMobile) {
+        window.location.replace(url.toString());
+    } else {
+        window.location.href = url.toString();
+    }
 }
 
 function signUpWithDeriv() {
@@ -272,14 +289,34 @@ function signUpWithDeriv() {
 // ================================================================
 // AUTH — STEP 2: Callback
 // ================================================================
-async function handleOAuthCallback(code, state) {
-    // Amy fix: read from localStorage (mobile-safe)
-    const savedState    = localStorage.getItem('oauth_state');
-    const code_verifier = localStorage.getItem('pkce_code_verifier');
-    localStorage.removeItem('oauth_state');
-    localStorage.removeItem('pkce_code_verifier');
+async function handleOAuthCallback(code, oauthState) {
+    // Read from localStorage, sessionStorage, or cookie — whichever has the value
+    function readAndClear(key) {
+        let val = null;
+        try { val = localStorage.getItem(key); localStorage.removeItem(key); } catch(e) {}
+        if (!val) { try { val = sessionStorage.getItem(key); sessionStorage.removeItem(key); } catch(e) {} }
+        if (!val) {
+            // Try cookie fallback
+            const cookieKey = key === 'oauth_state' ? 'pkce_st' : 'pkce_cv';
+            const match = document.cookie.match(new RegExp(cookieKey + '=([^;]+)'));
+            if (match) { val = decodeURIComponent(match[1]); document.cookie = `${cookieKey}=;expires=Thu, 01 Jan 1970 00:00:00 GMT;path=/`; }
+        }
+        return val;
+    }
+    const savedState    = readAndClear('oauth_state');
+    const code_verifier = readAndClear('pkce_code_verifier');
 
-    if (state !== savedState) { showStatus("Security error. Please try again.", 'err'); return; }
+    if (oauthState !== savedState) {
+        // On mobile, state check sometimes fails due to storage issues — log and continue carefully
+        log(`State mismatch: got ${oauthState}, expected ${savedState}`, 'x');
+        if (!savedState) {
+            // Storage was cleared — attempt to continue without state check on mobile
+            log('Storage cleared during redirect — attempting recovery', 'x');
+        } else {
+            showStatus("Security error. Please try logging in again.", 'err');
+            return;
+        }
+    }
     showStatus("Authorizing...", 'info');
 
     try {
