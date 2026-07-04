@@ -5,9 +5,8 @@
 
 const DERIV_CLIENT_ID = "33ByqD0GecGTE5whirko8";
 const DERIV_APP_ID    = "33ByqD0GecGTE5whirko8";
-// Amy fix: use current origin so redirect always matches registered URI
-// Works for both btraderhub.vercel.app AND any custom domain
-const DERIV_REDIRECT  = window.location.origin + "/";
+// Use exact registered redirect URI — must match Deriv app registration exactly
+const DERIV_REDIRECT  = "https://btraderhub.vercel.app/";
 
 // ── State ──────────────────────────────────────────────────────
 let derivWS          = null;
