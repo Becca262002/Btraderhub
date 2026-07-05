@@ -1498,71 +1498,54 @@ function getTopSignals(symbol, n = 5) {
     const total   = Math.max(data.ticks, 1);
     const signals = [];
 
-    // ── EVEN / ODD ──
+    // ── EVEN / ODD — show if above 50% ──
     const evenCount = counts.filter((_,i) => i%2===0).reduce((a,b)=>a+b,0);
     const evenPct   = (evenCount / total) * 100;
     const oddPct    = 100 - evenPct;
-    if (evenPct > 52) signals.push({ direction:'Even Only', confidence:Math.min(93,Math.round(evenPct)), type:'even_odd', botDirection:'even', color:'var(--green)', pred:null, reason:`Even ${evenPct.toFixed(1)}% of ${total} ticks` });
-    if (oddPct  > 52) signals.push({ direction:'Odd Only',  confidence:Math.min(93,Math.round(oddPct)),  type:'even_odd', botDirection:'odd',  color:'var(--teal)',  pred:null, reason:`Odd ${oddPct.toFixed(1)}% of ${total} ticks` });
+    if (evenPct > 50) signals.push({ direction:'Even Only', confidence:Math.min(93,Math.round(evenPct)), type:'even_odd', botDirection:'even', color:'var(--green)', pred:null, reason:`Even ${evenPct.toFixed(1)}% of ${total} ticks` });
+    if (oddPct  > 50) signals.push({ direction:'Odd Only',  confidence:Math.min(93,Math.round(oddPct)),  type:'even_odd', botDirection:'odd',  color:'var(--teal)',  pred:null, reason:`Odd ${oddPct.toFixed(1)}% of ${total} ticks` });
 
-    // ── OVER / UNDER — all barriers 0-9 ──
+    // ── OVER / UNDER — all barriers, show if above 50% ──
     for (let b = 0; b <= 9; b++) {
         const overPct  = (counts.slice(b+1).reduce((a,c)=>a+c,0)/total)*100;
         const underPct = (counts.slice(0,b).reduce((a,c)=>a+c,0)/total)*100;
-        if (overPct  > 52 && b < 9) signals.push({ direction:`Over ${b}`,  confidence:Math.min(93,Math.round(overPct)),  type:'over_under', botDirection:'over',  color:'var(--blue)',   pred:b, reason:`${overPct.toFixed(1)}% ticks above ${b}` });
-        if (underPct > 52 && b > 0) signals.push({ direction:`Under ${b}`, confidence:Math.min(93,Math.round(underPct)), type:'over_under', botDirection:'under', color:'var(--purple)', pred:b, reason:`${underPct.toFixed(1)}% ticks below ${b}` });
+        if (overPct  > 50 && b < 9) signals.push({ direction:`Over ${b}`,  confidence:Math.min(93,Math.round(overPct)),  type:'over_under', botDirection:'over',  color:'var(--blue)',   pred:b, reason:`${overPct.toFixed(1)}% ticks above ${b}` });
+        if (underPct > 50 && b > 0) signals.push({ direction:`Under ${b}`, confidence:Math.min(93,Math.round(underPct)), type:'over_under', botDirection:'under', color:'var(--purple)', pred:b, reason:`${underPct.toFixed(1)}% ticks below ${b}` });
     }
 
-    // ── RISE / FALL — always show based on recent momentum ──
+    // ── RISE / FALL — show if above 50% ──
     if (mm && mm.prices.length >= 10) {
         const recent  = mm.prices.slice(-20);
         const rising  = recent.filter((p,i) => i>0 && p>recent[i-1]).length;
         const risePct = (rising / Math.max(recent.length-1,1)) * 100;
         const fallPct = 100 - risePct;
-        // Always add Rise/Fall — pick the better direction
         const riseConf = Math.min(88, Math.round(50 + Math.abs(risePct - 50)));
-        const riseDir  = risePct >= fallPct ? 'rise' : 'fall';
-        const riseCol  = riseDir === 'rise' ? 'var(--green)' : 'var(--red)';
-        signals.push({
-            direction: riseDir === 'rise' ? 'Rise Only' : 'Fall Only',
-            confidence: riseConf,
-            type: 'rise_fall',
-            botDirection: riseDir,
-            color: riseCol,
-            pred: null,
-            reason: `${riseDir==='rise'?'Bullish':'Bearish'} momentum — ${(riseDir==='rise'?risePct:fallPct).toFixed(0)}% of last ${recent.length} ticks`
-        });
+        if (risePct > 50) signals.push({ direction:'Rise Only', confidence:riseConf, type:'rise_fall', botDirection:'rise', color:'var(--green)', pred:null, reason:`Bullish momentum — ${risePct.toFixed(0)}% of last ${recent.length} ticks` });
+        if (fallPct > 50) signals.push({ direction:'Fall Only', confidence:riseConf, type:'rise_fall', botDirection:'fall', color:'var(--red)',   pred:null, reason:`Bearish momentum — ${fallPct.toFixed(0)}% of last ${recent.length} ticks` });
     }
 
-    // ── ONLY UPS / ONLY DOWNS ──
+    // ── ONLY UPS / ONLY DOWNS — show if above 50% ──
     if (mm && mm.prices.length >= 10) {
         const recent  = mm.prices.slice(-20);
         const rising  = recent.filter((p,i) => i>0 && p>recent[i-1]).length;
         const risePct = (rising / Math.max(recent.length-1,1)) * 100;
-        const upsDir  = risePct >= 50 ? 'ups' : 'downs';
-        const upsConf = Math.min(85, Math.round(48 + Math.abs(risePct - 50)));
-        signals.push({
-            direction: upsDir === 'ups' ? 'Only Ups' : 'Only Downs',
-            confidence: upsConf,
-            type: 'only_ups_downs',
-            botDirection: upsDir,
-            color: upsDir === 'ups' ? 'var(--teal)' : 'var(--amber)',
-            pred: null,
-            reason: `${upsDir==='ups'?'Upward':'Downward'} trend — ${(upsDir==='ups'?risePct:100-risePct).toFixed(0)}% momentum`
-        });
+        const upsConf = Math.min(85, Math.round(50 + Math.abs(risePct - 50)));
+        if (risePct > 50) signals.push({ direction:'Only Ups',   confidence:upsConf, type:'only_ups_downs', botDirection:'ups',   color:'var(--teal)',  pred:null, reason:`Upward trend — ${risePct.toFixed(0)}% momentum` });
+        if (risePct < 50) signals.push({ direction:'Only Downs', confidence:upsConf, type:'only_ups_downs', botDirection:'downs', color:'var(--amber)', pred:null, reason:`Downward trend — ${(100-risePct).toFixed(0)}% momentum` });
     }
 
-    // ── HOT DIGIT MATCHES ──
+    // ── MATCHES — only show at 95%+ confidence ──
     const ranked = counts.map((c,d)=>({d,c})).sort((a,b)=>b.c-a.c);
-    ranked.slice(0,2).forEach(({d,c}) => {
-        const pct = (c/total)*100;
-        if (pct > 13) {
+    ranked.slice(0,3).forEach(({d,c}) => {
+        const pct  = (c/total)*100;
+        const conf = Math.round(pct * 6.5); // 95% conf needs ~14.6% frequency
+        if (conf >= 95) {
             signals.push({
                 direction:`Matches ${d}`,
-                confidence: Math.min(85,Math.round(pct*5)),
+                confidence: Math.min(99, conf),
                 type:'over_under', botDirection:'over',
                 color:'var(--amber)', pred:d,
-                reason:`Digit ${d} appeared ${pct.toFixed(1)}% (expected 10%)`
+                reason:`🔥 Digit ${d} at ${pct.toFixed(1)}% — far above expected 10%`
             });
         }
     });
