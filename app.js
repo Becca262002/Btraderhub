@@ -282,8 +282,17 @@ async function loginWithDeriv() {
         const authUrl = `${cfg.authorization_endpoint}?${params.toString()}`;
         console.log('Redirecting to:', authUrl.substring(0, 80) + '...');
 
-        // Redirect to Deriv login
-        window.location.replace(authUrl);
+        // Force open in browser tab — prevents Deriv app from intercepting on mobile
+        // Using window.open with _blank forces browser, not installed app
+        const isMobile = /iPhone|iPad|iPod|Android/i.test(navigator.userAgent);
+        if (isMobile) {
+            // On mobile, open in same tab but with a small delay to prevent app interception
+            setTimeout(() => {
+                window.location.href = authUrl;
+            }, 100);
+        } else {
+            window.location.replace(authUrl);
+        }
 
     } catch(err) {
         showStatus("Network error. Please check your connection.", 'err');
