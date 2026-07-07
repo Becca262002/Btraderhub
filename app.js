@@ -1407,25 +1407,27 @@ function generateSignal(symbol) {
         const underCount = counts.slice(0, barrier).reduce((a,b)=>a+b,0);
         const underPct   = (underCount / total) * 100;
 
-        // Only generate signal if probability is meaningfully above 50%
-        if (overPct > 52 && barrier < 9) {
-            const conf = Math.min(93, Math.round(overPct + consecBonus * 0.2));
+        // Only use barriers with GOOD risk/reward ratio:
+        // Win probability must be between 52% and 85%
+        // Above 85% = too likely = tiny payout = unprofitable even when winning
+        if (overPct > 52 && overPct <= 85 && barrier < 9) {
+            const conf = Math.min(88, Math.round(overPct + consecBonus * 0.2));
             signals.push({
                 type:'over_under', botDirection:'over',
                 direction:`Over ${barrier}`,
                 confidence: conf,
-                reason: `${overPct.toFixed(1)}% of ticks land above ${barrier}`,
+                reason: `${overPct.toFixed(1)}% ticks above ${barrier} | Balanced payout`,
                 color:'var(--blue)', pred: barrier
             });
         }
 
-        if (underPct > 52 && barrier > 0) {
-            const conf = Math.min(93, Math.round(underPct + consecBonus * 0.2));
+        if (underPct > 52 && underPct <= 85 && barrier > 0) {
+            const conf = Math.min(88, Math.round(underPct + consecBonus * 0.2));
             signals.push({
                 type:'over_under', botDirection:'under',
                 direction:`Under ${barrier}`,
                 confidence: conf,
-                reason: `${underPct.toFixed(1)}% of ticks land below ${barrier}`,
+                reason: `${underPct.toFixed(1)}% ticks below ${barrier} | Balanced payout`,
                 color:'var(--purple)', pred: barrier
             });
         }
@@ -1505,12 +1507,34 @@ function getTopSignals(symbol, n = 5) {
     if (evenPct > 50) signals.push({ direction:'Even Only', confidence:Math.min(93,Math.round(evenPct)), type:'even_odd', botDirection:'even', color:'var(--green)', pred:null, reason:`Even ${evenPct.toFixed(1)}% of ${total} ticks` });
     if (oddPct  > 50) signals.push({ direction:'Odd Only',  confidence:Math.min(93,Math.round(oddPct)),  type:'even_odd', botDirection:'odd',  color:'var(--teal)',  pred:null, reason:`Odd ${oddPct.toFixed(1)}% of ${total} ticks` });
 
-    // ── OVER / UNDER — all barriers, show if above 50% ──
+    // ── OVER / UNDER — only barriers with good risk/reward ──
+    // Payout is inversely proportional to win probability
+    // Over 0 = ~90% win but tiny payout (bad) | Over 4 = ~50% win, good payout
+    // Best range: Over 1-4, Under 5-8 for balanced risk/reward
     for (let b = 0; b <= 9; b++) {
         const overPct  = (counts.slice(b+1).reduce((a,c)=>a+c,0)/total)*100;
         const underPct = (counts.slice(0,b).reduce((a,c)=>a+c,0)/total)*100;
-        if (overPct  > 50 && b < 9) signals.push({ direction:`Over ${b}`,  confidence:Math.min(93,Math.round(overPct)),  type:'over_under', botDirection:'over',  color:'var(--blue)',   pred:b, reason:`${overPct.toFixed(1)}% ticks above ${b}` });
-        if (underPct > 50 && b > 0) signals.push({ direction:`Under ${b}`, confidence:Math.min(93,Math.round(underPct)), type:'over_under', botDirection:'under', color:'var(--purple)', pred:b, reason:`${underPct.toFixed(1)}% ticks below ${b}` });
+
+        // Skip barriers with win probability > 85% — payout too low to be profitable
+        // Skip barriers with win probability < 52% — not enough edge
+        if (overPct > 50 && overPct <= 85 && b < 9) {
+            signals.push({
+                direction:`Over ${b}`,
+                confidence: Math.min(93,Math.round(overPct)),
+                type:'over_under', botDirection:'over',
+                color:'var(--blue)', pred:b,
+                reason:`${overPct.toFixed(1)}% ticks above ${b} | Good risk/reward`
+            });
+        }
+        if (underPct > 50 && underPct <= 85 && b > 0) {
+            signals.push({
+                direction:`Under ${b}`,
+                confidence: Math.min(93,Math.round(underPct)),
+                type:'over_under', botDirection:'under',
+                color:'var(--purple)', pred:b,
+                reason:`${underPct.toFixed(1)}% ticks below ${b} | Good risk/reward`
+            });
+        }
     }
 
     // ── RISE / FALL — show if above 50% ──
