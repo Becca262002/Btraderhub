@@ -913,31 +913,22 @@ function runBotLogic(digit, quote) {
     const type = document.getElementById('bot-type')?.value || 'over_under';
     const pred = parseInt(document.getElementById('bot-pred')?.value || 5);
 
-    let shouldTrade = false;
-
+    // ALL contract types trade on every tick at full Deriv speed
+    // Deriv's engine decides win/loss — we just fire as fast as possible
     switch(type) {
         case 'over_under':
-            // Fire only when digit meets condition
-            if (botDirection === 'over'  && digit > pred)  shouldTrade = true;
-            if (botDirection === 'under' && digit < pred)  shouldTrade = true;
+            // Only trade when digit confirms direction (improves win rate)
+            if (botDirection === 'over'  && digit > pred)  { lastEntrySpot = quote; executeContract(quote); }
+            if (botDirection === 'under' && digit < pred)  { lastEntrySpot = quote; executeContract(quote); }
             break;
 
         case 'even_odd':
-            // FIX: Trade on EVERY tick — contract handles even/odd condition
-            // No need to filter by digit, Deriv decides win/loss
-            shouldTrade = true;
-            break;
-
         case 'rise_fall':
         case 'only_ups_downs':
-            // FIX: Trade on every tick immediately
-            shouldTrade = true;
+            // Trade on EVERY tick — maximum speed, same as Deriv
+            lastEntrySpot = quote;
+            executeContract(quote);
             break;
-    }
-
-    if (shouldTrade) {
-        lastEntrySpot = quote;
-        executeContract(quote);
     }
 }
 
@@ -946,11 +937,19 @@ function startProposalTimeout() {
     clearProposalTimeout();
     proposalTimeout = setTimeout(() => {
         if (pendingContract && lastContractId === "pending") {
-            log("⏱ Proposal timed out — resetting for next tick", 'x');
+            log("⏱ Proposal timed out — resetting", 'x');
             pendingContract = false;
             lastContractId  = null;
+            // Retry immediately
+            const mkt = document.getElementById('bot-market')?.value || 'R_10';
+            const mm  = marketMemory[mkt];
+            if (isBotRunning && mm && mm.prices.length > 0) {
+                const lastPrice = mm.prices[mm.prices.length - 1];
+                const lastDig   = mm.digits[mm.digits.length - 1];
+                runBotLogic(lastDig, lastPrice);
+            }
         }
-    }, 5000);
+    }, 3000);
 }
 
 function clearProposalTimeout() {
@@ -974,7 +973,17 @@ function executeContract(entrySpot) {
     const contractType = typeMap?.[botDirection];
 
     if (!contractType) {
-        log(`❌ Invalid direction "${botDirection}" for type "${type}"`, 'x');
+        log(`❌ Invalid direction "${botDirection}" for type "${type}" — auto-fixing...`, 'x');
+        // Auto-fix: pick first valid direction for this type
+        const validDirs = Object.keys(typeMap || {});
+        if (validDirs.length > 0) {
+            botDirection = validDirs[0];
+            log(`🔧 Auto-corrected direction to: ${botDirection}`, 'i');
+            renderDirButtons();
+            updateInfoBar();
+            // Retry with fixed direction
+            setTimeout(() => { if (isBotRunning && !pendingContract) executeContract(entrySpot); }, 200);
+        }
         return;
     }
 
@@ -1113,17 +1122,38 @@ function handleContractResult(c) {
     updateAllStats();
     checkThresholds();
 
-    // AI auto-update after result
-    if (aiAutoEnabled) {
+    // IMMEDIATELY fire next trade after result — no delay
+    // This matches Deriv's own bot speed
+    if (isBotRunning && !pendingContract) {
         const mkt = document.getElementById('bot-market')?.value || 'R_10';
-        const sig = generateSignal(mkt);
-        if (sig && sig.confidence >= 70) {
-            const oldDir = botDirection;
-            botDirection = sig.botDirection;
-            if (botDirection !== oldDir) {
-                log(`🧠 AI updated direction: ${oldDir.toUpperCase()} → ${botDirection.toUpperCase()} (${sig.confidence}% confidence)`, 'i');
-                renderDirButtons();
-                updateInfoBar();
+        const mm  = marketMemory[mkt];
+        if (mm && mm.prices.length > 0) {
+            const lastPrice = mm.prices[mm.prices.length - 1];
+            const lastDig   = mm.digits[mm.digits.length - 1];
+            // Small 100ms delay to let Deriv breathe, then fire
+            setTimeout(() => {
+                if (isBotRunning && !pendingContract) {
+                    runBotLogic(lastDig, lastPrice);
+                }
+            }, 100);
+        }
+    }
+
+    // AI auto-update after result — only if type matches
+    if (aiAutoEnabled) {
+        const mkt         = document.getElementById('bot-market')?.value || 'R_10';
+        const currentType = document.getElementById('bot-type')?.value || 'over_under';
+        const sig         = generateSignal(mkt);
+        if (sig && sig.confidence >= 70 && sig.type === currentType) {
+            const validDirs = Object.keys(CONTRACT_MAP[currentType] || {});
+            if (validDirs.includes(sig.botDirection)) {
+                const oldDir = botDirection;
+                botDirection = sig.botDirection;
+                if (botDirection !== oldDir) {
+                    log(`🧠 AI updated direction: ${oldDir.toUpperCase()} → ${botDirection.toUpperCase()} (${sig.confidence}% confidence)`, 'i');
+                    renderDirButtons();
+                    updateInfoBar();
+                }
             }
         }
     }
@@ -1819,14 +1849,23 @@ function startAILoop() {
         const sig = generateSignal(mkt);
         updateAIPanel(sig, mkt);
 
-        // If AI auto-update is on and bot is running, update direction
+        // AI auto-update — only update if direction is VALID for current trade type
         if (aiAutoEnabled && isBotRunning && sig && sig.confidence >= 75) {
-            const oldDir = botDirection;
-            botDirection = sig.botDirection;
-            if (botDirection !== oldDir) {
-                log(`🧠 AI updated direction: ${oldDir.toUpperCase()} → ${botDirection.toUpperCase()} (${sig.confidence}% confidence)`, 'i');
-                renderDirButtons();
-                updateInfoBar();
+            const currentType = document.getElementById('bot-type')?.value || 'over_under';
+            const validDirs   = Object.keys(CONTRACT_MAP[currentType] || {});
+            // Only update if the AI signal matches the current trade type
+            if (sig.type === currentType && validDirs.includes(sig.botDirection)) {
+                const oldDir = botDirection;
+                botDirection = sig.botDirection;
+                if (botDirection !== oldDir) {
+                    log(`🧠 AI updated direction: ${oldDir.toUpperCase()} → ${botDirection.toUpperCase()} (${sig.confidence}% confidence)`, 'i');
+                    renderDirButtons();
+                    updateInfoBar();
+                }
+            }
+            // If AI suggests different trade type, just log — don't change
+            else if (sig.type !== currentType) {
+                log(`🧠 AI signal: ${sig.direction} (${sig.confidence}%) — keeping current type ${currentType}`, 'd');
             }
         }
 
