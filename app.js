@@ -1490,6 +1490,233 @@ function generateSignal(symbol) {
     return best;
 }
 
+// ================================================================
+// PROFESSIONAL TRADING STRATEGIES
+// Based on digit bar analysis (Red/Yellow/Green/Blue)
+// ================================================================
+
+function analyzeStrategies(symbol) {
+    const data = digitData[symbol];
+    const mm   = marketMemory[symbol];
+    if (!data || data.ticks < 100) return [];
+
+    const counts = data.counts;
+    const total  = Math.max(data.ticks, 1);
+
+    // Calculate percentages for each digit
+    const pcts = counts.map(c => parseFloat(((c/total)*100).toFixed(2)));
+
+    // Sort digits by frequency to get bar colors
+    const ranked = pcts.map((p,d) => ({d, p})).sort((a,b) => b.p - a.p);
+    const green  = ranked[0];  // Most appearing
+    const blue   = ranked[1];  // 2nd most appearing
+    const yellow = ranked[ranked.length-2]; // 2nd least appearing
+    const red    = ranked[ranked.length-1]; // Least appearing
+
+    const signals = [];
+    const recentDigits = mm?.digits?.slice(-10) || [];
+    const lastDigit    = recentDigits[recentDigits.length - 1];
+
+    // ════════════════════════════════════════════════════
+    // STRATEGY 1: OVER 1,2,3
+    // ════════════════════════════════════════════════════
+    (() => {
+        const lowDigits  = [0,1,2,3];
+        const highDigits = [4,5,6,7,8,9];
+
+        // Check if digits 0,1,2,3 all below 10%
+        const allLow = lowDigits.every(d => pcts[d] < 10);
+        // Check if at least 2 of digits 4-9 are above 11%
+        const highAbove11 = highDigits.filter(d => pcts[d] >= 11);
+        // Green and blue should be in high range
+        const greenInHigh = highDigits.includes(green.d);
+        const blueInHigh  = highDigits.includes(blue.d);
+        // Red or yellow should be in low digits
+        const redOrYellowLow = lowDigits.includes(red.d) || lowDigits.includes(yellow.d);
+
+        if (allLow && highAbove11.length >= 2 && greenInHigh && blueInHigh && redOrYellowLow) {
+            // Full conditions met — Over 3
+            const conf = Math.round(65 + (highAbove11.length * 3) + (10 - Math.max(...lowDigits.map(d=>pcts[d]))));
+            signals.push({
+                strategy: 'OVER 1,2,3',
+                direction: 'Over 3',
+                type: 'over_under', botDirection: 'over', pred: 3,
+                confidence: Math.min(90, conf),
+                color: 'var(--blue)',
+                reason: `Digits 0-3 all below 10% | ${highAbove11.length} digits 4-9 above 11% | G:${green.d}(${green.p}%) B:${blue.d}(${blue.p}%)`,
+                entryHint: `Wait for digit ${Math.min(...[1,2,3].filter(d=>pcts[d] === Math.min(...[1,2,3].map(d=>pcts[d]))))} to appear, then next tick enter if digit 4-9 appears`,
+                priority: true
+            });
+        } else {
+            // Partial — check if only 0,1,2 are below 10%
+            const partialLow = [0,1,2].every(d => pcts[d] < 10);
+            if (partialLow && highAbove11.length >= 2 && greenInHigh) {
+                // Can trade Over 0,1 or 2
+                const bestBarrier = [0,1,2].reduce((a,b) => pcts[a] < pcts[b] ? a : b);
+                signals.push({
+                    strategy: 'OVER 1,2,3 (Partial)',
+                    direction: `Over ${bestBarrier}`,
+                    type: 'over_under', botDirection: 'over', pred: bestBarrier,
+                    confidence: Math.min(82, 60 + highAbove11.length * 3),
+                    color: 'var(--blue)',
+                    reason: `Digits 0-2 below 10% | Over ${bestBarrier} recommended | G:${green.d}(${green.p}%) B:${blue.d}(${blue.p}%)`,
+                    entryHint: `Wait for digit ${bestBarrier} to appear, next tick enter if digit 4-9 appears`,
+                    priority: false
+                });
+            }
+        }
+    })();
+
+    // ════════════════════════════════════════════════════
+    // STRATEGY 2: UNDER 8,7,6
+    // ════════════════════════════════════════════════════
+    (() => {
+        const highDigits = [6,7,8,9];
+        const lowDigits  = [0,1,2,3,4,5];
+
+        // Check if digits 6,7,8,9 all below 10%
+        const allLow = highDigits.every(d => pcts[d] < 10);
+        // Check if at least 2 of digits 0-5 are above 11%
+        const lowAbove11 = lowDigits.filter(d => pcts[d] >= 11);
+        // Green and blue should be in low range (0-5)
+        const greenInLow = lowDigits.includes(green.d);
+        const blueInLow  = lowDigits.includes(blue.d);
+        // Red or yellow should be in high digits
+        const redOrYellowHigh = highDigits.includes(red.d) || highDigits.includes(yellow.d);
+
+        if (allLow && lowAbove11.length >= 2 && greenInLow && blueInLow && redOrYellowHigh) {
+            // Full conditions — Under 6
+            const conf = Math.round(65 + (lowAbove11.length * 3) + (10 - Math.max(...highDigits.map(d=>pcts[d]))));
+            signals.push({
+                strategy: 'UNDER 8,7,6',
+                direction: 'Under 6',
+                type: 'over_under', botDirection: 'under', pred: 6,
+                confidence: Math.min(90, conf),
+                color: 'var(--purple)',
+                reason: `Digits 6-9 all below 10% | ${lowAbove11.length} digits 0-5 above 11% | G:${green.d}(${green.p}%) B:${blue.d}(${blue.p}%)`,
+                entryHint: `Wait for digit ${Math.min(...[6,7,8].filter(d=>pcts[d] === Math.min(...[6,7,8].map(d=>pcts[d]))))} to appear, next tick enter if digit 0-4 appears`,
+                priority: true
+            });
+        } else {
+            // Partial — only 9,8,7 below 10%
+            const partialHigh = [7,8,9].every(d => pcts[d] < 10);
+            if (partialHigh && lowAbove11.length >= 2 && greenInLow) {
+                const bestBarrier = [7,8,9].reduce((a,b) => pcts[a] < pcts[b] ? a : b);
+                signals.push({
+                    strategy: 'UNDER 8,7,6 (Partial)',
+                    direction: `Under ${bestBarrier}`,
+                    type: 'over_under', botDirection: 'under', pred: bestBarrier,
+                    confidence: Math.min(82, 60 + lowAbove11.length * 3),
+                    color: 'var(--purple)',
+                    reason: `Digits 7-9 below 10% | Under ${bestBarrier} recommended | G:${green.d}(${green.p}%) B:${blue.d}(${blue.p}%)`,
+                    entryHint: `Wait for digit ${bestBarrier} to appear, next tick enter if digit 0-4 appears`,
+                    priority: false
+                });
+            }
+        }
+    })();
+
+    // ════════════════════════════════════════════════════
+    // STRATEGY 3: ODD STRATEGY
+    // ════════════════════════════════════════════════════
+    (() => {
+        const oddDigits  = [1,3,5,7,9];
+        const evenDigits = [0,2,4,6,8];
+
+        // Green and blue must be on odd digits with 11%+
+        const greenOnOdd = oddDigits.includes(green.d) && green.p >= 11;
+        const blueOnOdd  = oddDigits.includes(blue.d)  && blue.p  >= 11;
+        // Red and yellow must be on even digits
+        const redOnEven    = evenDigits.includes(red.d)    && red.p    <= 8.6;
+        const yellowOnEven = evenDigits.includes(yellow.d) && yellow.p <= 9.5;
+
+        if (greenOnOdd && blueOnOdd && redOnEven && yellowOnEven) {
+            // Check recent ticks for trigger — 2 consecutive odds in last 5 ticks
+            const last5     = recentDigits.slice(-5);
+            let consecOdds  = 0;
+            let maxConsec   = 0;
+            last5.forEach(d => {
+                if (oddDigits.includes(d)) { consecOdds++; maxConsec = Math.max(maxConsec, consecOdds); }
+                else consecOdds = 0;
+            });
+
+            const triggered = maxConsec >= 2;
+            const conf      = Math.min(88, 68 + (triggered ? 10 : 0) + Math.round((green.p + blue.p - 22) / 2));
+
+            signals.push({
+                strategy: 'ODD STRATEGY',
+                direction: 'Odd Only',
+                type: 'even_odd', botDirection: 'odd', pred: null,
+                confidence: conf,
+                color: 'var(--teal)',
+                reason: `G:${green.d}(${green.p}%) B:${blue.d}(${blue.p}%) both ODD 11%+ | R:${red.d}(${red.p}%) Y:${yellow.d}(${yellow.p}%) both EVEN | ${triggered ? '✅ 2 consecutive odds seen' : '⏳ Wait for 2 consecutive odds in next 5 ticks'}`,
+                entryHint: triggered
+                    ? '✅ ENTER NOW — 2 consecutive odds detected in last 5 ticks'
+                    : `Wait for least appearing even digit (${red.d} or ${yellow.d}), then 2 consecutive odds in next 5 ticks`,
+                priority: triggered,
+                warning: 'Stop after 3-7 wins and re-check market conditions'
+            });
+        }
+    })();
+
+    // ════════════════════════════════════════════════════
+    // STRATEGY 4: EVEN STRATEGY
+    // ════════════════════════════════════════════════════
+    (() => {
+        const oddDigits  = [1,3,5,7,9];
+        const evenDigits = [0,2,4,6,8];
+
+        // Green and blue must be on EVEN digits with 11%+
+        const greenOnEven = evenDigits.includes(green.d) && green.p >= 11;
+        const blueOnEven  = evenDigits.includes(blue.d)  && blue.p  >= 11;
+        // Red below 8.6%, yellow below 9.5%
+        const redLow    = red.p    <= 8.6;
+        const yellowLow = yellow.p <= 9.5;
+        // Red and yellow can be on odd or mixed
+        const redYellowOddOrMixed = oddDigits.includes(red.d) || oddDigits.includes(yellow.d);
+
+        if (greenOnEven && blueOnEven && redLow && yellowLow && redYellowOddOrMixed) {
+            // Check trigger — odd digit among R&Y appeared, then even within 3 ticks
+            const leastOdd = [red, yellow].find(b => oddDigits.includes(b.d));
+            const last5    = recentDigits.slice(-5);
+            let triggered  = false;
+
+            // Look for odd (from least pair) then even within 3 ticks
+            for (let i = 0; i < last5.length - 1; i++) {
+                if (oddDigits.includes(last5[i])) {
+                    const next3 = last5.slice(i+1, i+4);
+                    if (next3.some(d => evenDigits.includes(d))) { triggered = true; break; }
+                }
+            }
+
+            const conf = Math.min(88, 66 + (triggered ? 12 : 0) + Math.round((green.p + blue.p - 22) / 2));
+
+            signals.push({
+                strategy: 'EVEN STRATEGY',
+                direction: 'Even Only',
+                type: 'even_odd', botDirection: 'even', pred: null,
+                confidence: conf,
+                color: 'var(--green)',
+                reason: `G:${green.d}(${green.p}%) B:${blue.d}(${blue.p}%) both EVEN 11%+ | R:${red.d}(${red.p}%) Y:${yellow.d}(${yellow.p}%) | ${triggered ? '✅ Entry trigger detected' : '⏳ Wait for odd digit then even within 3 ticks'}`,
+                entryHint: triggered
+                    ? '✅ ENTER NOW — Odd appeared, even followed within 3 ticks'
+                    : `Wait for odd digit (${leastOdd?.d ?? 'R/Y'}) to appear, then even digit within next 3 ticks`,
+                priority: triggered,
+                warning: 'Stop after 3-7 wins and re-check market conditions'
+            });
+        }
+    })();
+
+    // Sort — priority (triggered) signals first, then by confidence
+    signals.sort((a,b) => {
+        if (a.priority && !b.priority) return -1;
+        if (!a.priority && b.priority) return 1;
+        return b.confidence - a.confidence;
+    });
+
+    return signals;
+}
+
 // Return top N signals for a symbol (used by scanner tab)
 function getTopSignals(symbol, n = 5) {
     const data = digitData[symbol];
@@ -1766,6 +1993,51 @@ function runFullScan() {
         data:       digitData[sym] || { ticks: 0 },
         state:      classifyMarket(sym)
     })).sort((a,b) => (b.signal?.confidence||0) - (a.signal?.confidence||0));
+
+    // ── Strategy signals box (priority) ──
+    // Scan all markets for professional strategy conditions
+    const allStrategySignals = [];
+    ALL_MKTS.forEach(sym => {
+        const strats = analyzeStrategies(sym);
+        strats.forEach(s => { s.symbol = sym; s.label = MKT[sym]||sym; allStrategySignals.push(s); });
+    });
+    allStrategySignals.sort((a,b) => {
+        if (a.priority && !b.priority) return -1;
+        if (!a.priority && b.priority) return 1;
+        return b.confidence - a.confidence;
+    });
+
+    // Show strategy signals panel if any found
+    const stratBox = document.getElementById('best-signal-box');
+    if (stratBox && allStrategySignals.length > 0) {
+        const topStrat = allStrategySignals[0];
+        const stratHtml = allStrategySignals.slice(0,4).map(s => `
+            <div style="background:var(--bg3);border:1px solid ${s.priority?'var(--teal)':'var(--border)'};border-radius:8px;padding:10px;margin-bottom:6px;">
+                <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:4px;">
+                    <div>
+                        <span style="font-size:11px;font-weight:900;color:${s.color};">${s.strategy}</span>
+                        ${s.priority ? '<span style="background:#00d2c822;color:var(--teal);font-size:9px;font-weight:700;padding:2px 6px;border-radius:4px;margin-left:6px;">✅ TRIGGERED</span>' : '<span style="background:#f59e0b22;color:#f59e0b;font-size:9px;font-weight:700;padding:2px 6px;border-radius:4px;margin-left:6px;">⏳ WATCHING</span>'}
+                    </div>
+                    <span style="font-size:11px;font-weight:900;color:var(--teal);">${s.confidence}%</span>
+                </div>
+                <div style="font-size:12px;font-weight:900;color:${s.color};margin-bottom:3px;">${s.direction} — ${s.label}</div>
+                <div style="font-size:10px;color:var(--muted);margin-bottom:4px;">${s.reason}</div>
+                <div style="font-size:10px;color:var(--teal);font-style:italic;margin-bottom:6px;">💡 ${s.entryHint}</div>
+                ${s.warning ? `<div style="font-size:9px;color:#f59e0b;">⚠️ ${s.warning}</div>` : ''}
+                <button onclick="applySignalToBot(${JSON.stringify(s).replace(/"/g,'&quot;')})"
+                    style="background:var(--teal);color:#000;border:none;border-radius:6px;padding:5px 12px;font-size:10px;font-weight:700;cursor:pointer;margin-top:4px;width:100%;">
+                    ✅ Apply to Bot
+                </button>
+            </div>`).join('');
+
+        stratBox.innerHTML = `
+            <div style="font-size:10px;font-weight:900;color:var(--teal);text-transform:uppercase;margin-bottom:10px;">🎯 Professional Strategy Signals</div>
+            ${stratHtml}
+            ${allStrategySignals.length === 0 ? '<div style="color:var(--muted);font-size:12px;">No strategy conditions met yet. Markets need more data.</div>' : ''}`;
+    } else if (stratBox) {
+        stratBox.innerHTML = `<div style="font-size:10px;font-weight:900;color:var(--teal);text-transform:uppercase;margin-bottom:8px;">🎯 Professional Strategy Signals</div>
+            <div style="color:var(--muted);font-size:12px;padding:10px 0;">Analyzing market conditions... Strategies need 100+ ticks per market.</div>`;
+    }
 
     // ── Best opportunity box ──
     const best = results[0];
