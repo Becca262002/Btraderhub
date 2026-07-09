@@ -1121,16 +1121,16 @@ function handleContractResult(c) {
     const buyPrice   = parseFloat(c.buy_price || currentStake);
     const payout     = buyPrice + profit;
 
-    // Extract entry and exit spots — check all possible fields Deriv sends
-    const entrySpot2 = c.entry_tick_display_value
+    // Deriv sends entry_spot and exit_spot (confirmed from debug log)
+    const entrySpot2 = c.entry_spot
+                    || c.entry_tick_display_value
                     || c.entry_spot_display_value
-                    || c.entry_tick
                     || lastEntrySpot
                     || '—';
-    const exitSpot   = c.exit_tick_display_value
+    const exitSpot   = c.exit_spot
+                    || c.exit_tick_display_value
                     || c.exit_spot_display_value
-                    || c.exit_tick
-                    || c.sell_spot_display_value
+                    || c.sell_spot
                     || '—';
 
     totalStake  += buyPrice;
