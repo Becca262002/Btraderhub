@@ -1,14 +1,14 @@
 // /api/oauth-start — PKCE encoded in state (no shared storage needed)
 import { createCipheriv, randomBytes } from 'crypto';
 
-const SECRET = process.env.PKCE_SECRET || "btraderhub-pkce-secret-key-32chr!";
+const SECRET = process.env.PKCE_SECRET || "monehunt ai-pkce-secret-key-32chr!";
 const KEY    = Buffer.from(SECRET.padEnd(32).slice(0,32));
 
 export default async function handler(req, res) {
     if (req.method !== 'POST') return res.status(405).end();
 
     const clientId    = process.env.DERIV_CLIENT_ID || "33ByqD0GecGTE5whirko8";
-    const redirectUri = 'https://btraderhub.com/callback';
+    const redirectUri = 'https://monehunt ai.com/callback';
 
     function base64url(buf) {
         return Buffer.from(buf).toString('base64')

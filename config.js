@@ -1,5 +1,5 @@
 // ========================================================
-// ⚙️ BTRADERHUB GLOBAL CONFIGURATION
+// ⚙️ MONEHUNT AI GLOBAL CONFIGURATION
 // ========================================================
 
 const DERIV_APP_ID = "33ByqD0GecGTE5whirko8"; // Your App ID from the URL we saw earlier

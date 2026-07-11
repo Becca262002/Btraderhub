@@ -1,16 +1,16 @@
 // ================================================================
-// BTRADERHUB app.js — Clean Focused Build
+// MONEHUNT AI app.js — Clean Focused Build
 // Auth: Amy-verified PKCE (DO NOT CHANGE)
 // ================================================================
 
 const DERIV_CLIENT_ID = "33ByqD0GecGTE5whirko8";
 const DERIV_APP_ID    = "33ByqD0GecGTE5whirko8";
-// Auto-detect domain — works for both btraderhub.com AND btraderhub.vercel.app
+// Auto-detect domain — works for both monehunt ai.com AND monehunt ai.vercel.app
 // Both must be registered as redirect URIs in your Deriv app dashboard
 const DERIV_REDIRECT = (
-    window.location.hostname === 'btraderhub.com' ||
-    window.location.hostname === 'www.btraderhub.com'
-) ? 'https://btraderhub.com/' : 'https://btraderhub.vercel.app/';
+    window.location.hostname === 'monehunt ai.com' ||
+    window.location.hostname === 'www.monehunt ai.com'
+) ? 'https://monehunt ai.com/' : 'https://monehunt ai.vercel.app/';
 
 // ── State ──────────────────────────────────────────────────────
 let derivWS          = null;
@@ -203,7 +203,7 @@ function toggleMobileBotSettings() {
         if (btn) btn.textContent = '⚙️ Bot Settings';
     } else {
         sidebar.classList.add('mobile-open');
-        if (btn) btn.textContent = '✕ Close Settings';
+        if (btn) btn.textContent = '✕ Close MONEHUNT AI Settings';
         // Scroll to top of settings
         sidebar.scrollTop = 0;
     }
@@ -268,8 +268,7 @@ function switchPanel(name, el) {
 async function loginWithDeriv() {
     const loginBtn = document.getElementById('btn-login');
     if (loginBtn) { loginBtn.textContent = 'Connecting...'; loginBtn.disabled = true; }
-    showStatus("Starting secure login...", 'info');
-
+   showStatus("MONEHUNT AI is securely connecting to your Deriv account...", 'info');
     try {
         // Call server to generate PKCE — no browser storage needed (Amy's fix)
         const resp = await fetch('/api/oauth-start', {
@@ -279,7 +278,7 @@ async function loginWithDeriv() {
 
         if (!resp.ok) {
             const err = await resp.text();
-            showStatus("Login server error. Please try again.", 'err');
+            showStatus("Unable to connect to the authentication service. Please try again.", 'err');
             console.error('oauth-start failed:', resp.status, err);
             if (loginBtn) { loginBtn.textContent = 'Log in'; loginBtn.disabled = false; }
             return;
@@ -288,7 +287,7 @@ async function loginWithDeriv() {
         const cfg = await resp.json();
 
         if (!cfg.state || !cfg.code_challenge) {
-            showStatus("Invalid server response. Please try again.", 'err');
+            showStatus("Unable to verify the authentication response. Please try again.", 'err');
             if (loginBtn) { loginBtn.textContent = 'Log in'; loginBtn.disabled = false; }
             return;
         }
@@ -305,7 +304,8 @@ async function loginWithDeriv() {
         });
 
         const authUrl = `${cfg.authorization_endpoint}?${params.toString()}`;
-        console.log('Redirecting to:', authUrl.substring(0, 80) + '...');
+        console.log('[MONEHUNT AI] Initiating secure Deriv authentication...');
+console.log(authUrl.substring(0, 80) + '...');
 
         // Force open in browser tab — prevents Deriv app from intercepting on mobile
         // Using window.open with _blank forces browser, not installed app
@@ -1290,7 +1290,7 @@ function downloadTransactions() {
     });
     const a = document.createElement('a');
     a.href = URL.createObjectURL(new Blob([csv], { type:'text/csv' }));
-    a.download = `btraderhub_transactions_${new Date().toISOString().slice(0,10)}.csv`;
+    a.download = `monehunt ai_transactions_${new Date().toISOString().slice(0,10)}.csv`;
     a.click();
 }
 
@@ -2582,16 +2582,16 @@ const LEGAL_CONTENT = {
 <p style="margin-bottom:10px;"><b style="color:#e2e8f0;">Effective Date:</b> 1 January 2026</p>
 
 <h4 style="color:#00d2c8;margin:14px 0 6px;">1. Acceptance of Terms</h4>
-<p>By accessing or using Btraderhub ("the Platform"), you agree to be bound by these Terms of Service. If you do not agree, do not use the Platform.</p>
+<p>By accessing or using MONEHUNT AI ("the Platform"), you agree to be bound by these Terms of Service. If you do not agree, do not use the Platform.</p>
 
 <h4 style="color:#00d2c8;margin:14px 0 6px;">2. Description of Service</h4>
-<p>Btraderhub is a third-party trading interface that connects to the Deriv API. We provide automated trading tools, market analysis, and AI-powered signals. We are not affiliated with, endorsed by, or part of Deriv Ltd.</p>
+<p>MONEHUNT AI is a third-party trading interface that connects to the Deriv API. We provide automated trading tools, market analysis, and AI-powered signals. We are not affiliated with, endorsed by, or part of Deriv Ltd.</p>
 
 <h4 style="color:#00d2c8;margin:14px 0 6px;">3. Eligibility</h4>
 <p>You must be at least 18 years old and legally permitted to trade financial instruments in your jurisdiction to use this Platform. It is your responsibility to verify local laws before trading.</p>
 
 <h4 style="color:#00d2c8;margin:14px 0 6px;">4. No Financial Advice</h4>
-<p>Nothing on Btraderhub constitutes financial, investment, or trading advice. All AI signals, market analysis, and bot strategies are for informational purposes only. You trade at your own risk.</p>
+<p>Nothing on MONEHUNT AI constitutes financial, investment, or trading advice. All AI signals, market analysis, and bot strategies are for informational purposes only. You trade at your own risk.</p>
 
 <h4 style="color:#00d2c8;margin:14px 0 6px;">5. User Responsibilities</h4>
 <p>You are solely responsible for:</p>
@@ -2603,7 +2603,7 @@ const LEGAL_CONTENT = {
 </ul>
 
 <h4 style="color:#00d2c8;margin:14px 0 6px;">6. Limitation of Liability</h4>
-<p>Btraderhub, its owners, developers, and affiliates shall not be liable for any trading losses, lost profits, or damages arising from the use of this Platform, including but not limited to losses caused by bot malfunction, API errors, connectivity issues, or market conditions.</p>
+<p>MONEHUNT AI, its owners, developers, and affiliates shall not be liable for any trading losses, lost profits, or damages arising from the use of this Platform, including but not limited to losses caused by bot malfunction, API errors, connectivity issues, or market conditions.</p>
 
 <h4 style="color:#00d2c8;margin:14px 0 6px;">7. Modifications</h4>
 <p>We reserve the right to modify these Terms at any time. Continued use of the Platform constitutes acceptance of updated Terms.</p>
@@ -2614,7 +2614,7 @@ const LEGAL_CONTENT = {
 <h4 style="color:#00d2c8;margin:14px 0 6px;">9. Governing Law</h4>
 <p>These Terms are governed by applicable international law. Any disputes shall be resolved through binding arbitration.</p>
 
-<p style="margin-top:16px;color:#4a5568;font-size:11px;">For questions: support@btraderhub.com</p>`
+<p style="margin-top:16px;color:#4a5568;font-size:11px;">For questions: support@monehunt ai.com</p>`
     },
 
     privacy: {
@@ -2624,7 +2624,7 @@ const LEGAL_CONTENT = {
 <p style="margin-bottom:10px;"><b style="color:#e2e8f0;">Effective Date:</b> 1 January 2026</p>
 
 <h4 style="color:#00d2c8;margin:14px 0 6px;">1. Information We Collect</h4>
-<p>Btraderhub does <b style="color:#e2e8f0;">not</b> collect, store, or process your personal data on our servers. All authentication is handled directly between your browser and Deriv's servers via OAuth 2.0 PKCE.</p>
+<p>MONEHUNT AI does <b style="color:#e2e8f0;">not</b> collect, store, or process your personal data on our servers. All authentication is handled directly between your browser and Deriv's servers via OAuth 2.0 PKCE.</p>
 <p style="margin-top:8px;">We do not store:</p>
 <ul style="margin:6px 0 6px 20px;">
     <li>Your Deriv account credentials</li>
@@ -2645,7 +2645,7 @@ const LEGAL_CONTENT = {
 <p>Your trading data is processed directly by Deriv Ltd. through their API. Please review <a href="https://deriv.com/privacy/" target="_blank" style="color:var(--teal);">Deriv's Privacy Policy</a> for information on how they handle your data.</p>
 
 <h4 style="color:#00d2c8;margin:14px 0 6px;">4. Cookies</h4>
-<p>Btraderhub does not use cookies or tracking technologies.</p>
+<p>MONEHUNT AI does not use cookies or tracking technologies.</p>
 
 <h4 style="color:#00d2c8;margin:14px 0 6px;">5. Third-Party Services</h4>
 <p>We use the following third-party services:</p>
@@ -2656,10 +2656,10 @@ const LEGAL_CONTENT = {
 </ul>
 
 <h4 style="color:#00d2c8;margin:14px 0 6px;">6. Affiliate Disclosure</h4>
-<p>Btraderhub participates in the Deriv affiliate program. When you create a new Deriv account through our platform, we may receive a commission. This does not affect your trading costs or experience.</p>
+<p>MONEHUNT AI participates in the Deriv affiliate program. When you create a new Deriv account through our platform, we may receive a commission. This does not affect your trading costs or experience.</p>
 
 <h4 style="color:#00d2c8;margin:14px 0 6px;">7. Contact</h4>
-<p>For privacy concerns: <a href="mailto:support@btraderhub.com" style="color:var(--teal);">support@btraderhub.com</a></p>`
+<p>For privacy concerns: <a href="mailto:support@monehunt ai.com" style="color:var(--teal);">support@monehunt ai.com</a></p>`
     },
 
     risk: {
@@ -2674,7 +2674,7 @@ const LEGAL_CONTENT = {
 <p>Binary options and CFDs are complex instruments. The majority of retail traders lose money when trading these products. You should consider whether you understand how these instruments work and whether you can afford to take the high risk of losing your money.</p>
 
 <h4 style="color:#00d2c8;margin:14px 0 6px;">2. Automated Trading Risk</h4>
-<p>Automated trading bots, including those provided or configured on Btraderhub, carry additional risks:</p>
+<p>Automated trading bots, including those provided or configured on MONEHUNT AI, carry additional risks:</p>
 <ul style="margin:6px 0 6px 20px;">
     <li>Past performance of a bot does NOT guarantee future results</li>
     <li>Bots can malfunction due to connectivity issues, API changes, or software bugs</li>
@@ -2696,13 +2696,13 @@ const LEGAL_CONTENT = {
 </ul>
 
 <h4 style="color:#00d2c8;margin:14px 0 6px;">5. Regulatory Notice</h4>
-<p>Btraderhub is a third-party tool and is not regulated by any financial authority. Trading through Deriv is subject to Deriv's own regulatory framework. Please ensure trading is legal in your jurisdiction.</p>
+<p>MONEHUNT AI is a third-party tool and is not regulated by any financial authority. Trading through Deriv is subject to Deriv's own regulatory framework. Please ensure trading is legal in your jurisdiction.</p>
 
 <h4 style="color:#00d2c8;margin:14px 0 6px;">6. No Guarantee of Profit</h4>
-<p>Btraderhub makes no representation or warranty that use of the platform will result in profits. All trading results depend on market conditions, your settings, and factors beyond our control.</p>
+<p>MONEHUNT AI makes no representation or warranty that use of the platform will result in profits. All trading results depend on market conditions, your settings, and factors beyond our control.</p>
 
 <div style="background:#00d2c814;border:1px solid #00d2c844;border-radius:8px;padding:14px;margin-top:16px;">
-    <p style="color:#00d2c8;font-weight:700;">✅ By using Btraderhub, you confirm that:</p>
+    <p style="color:#00d2c8;font-weight:700;">✅ By using MONEHUNT AI, you confirm that:</p>
     <ul style="margin:8px 0 0 20px;color:#a0aec0;">
         <li>You are 18 years or older</li>
         <li>You understand the risks of binary options trading</li>

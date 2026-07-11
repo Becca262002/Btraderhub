@@ -1,7 +1,7 @@
 // /api/oauth-callback — decrypts code_verifier from state token
 import { createDecipheriv } from 'crypto';
 
-const SECRET = process.env.PKCE_SECRET || "btraderhub-pkce-secret-key-32chr!";
+const SECRET = process.env.PKCE_SECRET || "monehunt ai-pkce-secret-key-32chr!";
 const KEY    = Buffer.from(SECRET.padEnd(32).slice(0,32));
 
 export default async function handler(req, res) {
