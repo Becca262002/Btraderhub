@@ -263,6 +263,7 @@ function switchTab(id) {
     }
     if (id === 'scanner') runFullScan();
     if (id === 'mt5')     { connectMT5Feed(); setTimeout(renderMT5Signals, 800); }
+    if (id === 'chart')   { setTimeout(() => updateChartIndicators(), 500); }
 }
 
 function switchPanel(name, el) {
@@ -1812,6 +1813,119 @@ function generateSignal(symbol) {
 }
 
 // ================================================================
+// BOLLINGER BANDS + RSI ENGINE
+// For Only Ups / Only Downs 3-tick signal generation
+// ================================================================
+
+function calcRSI(prices, period = 14) {
+    if (prices.length < period + 1) return null;
+    const recent = prices.slice(-period - 1);
+    let gains = 0, losses = 0;
+    for (let i = 1; i < recent.length; i++) {
+        const diff = recent[i] - recent[i-1];
+        if (diff > 0) gains  += diff;
+        else          losses -= diff;
+    }
+    const avgGain = gains  / period;
+    const avgLoss = losses / period;
+    if (avgLoss === 0) return 100;
+    const rs  = avgGain / avgLoss;
+    return parseFloat((100 - (100 / (1 + rs))).toFixed(2));
+}
+
+function calcBollingerBands(prices, period = 20, multiplier = 2) {
+    if (prices.length < period) return null;
+    const recent = prices.slice(-period);
+    const sma    = recent.reduce((a,b) => a+b, 0) / period;
+    const variance = recent.reduce((sum, p) => sum + Math.pow(p - sma, 2), 0) / period;
+    const stdDev   = Math.sqrt(variance);
+    return {
+        upper:  parseFloat((sma + multiplier * stdDev).toFixed(5)),
+        middle: parseFloat(sma.toFixed(5)),
+        lower:  parseFloat((sma - multiplier * stdDev).toFixed(5)),
+        stdDev: parseFloat(stdDev.toFixed(5)),
+        bandwidth: parseFloat(((multiplier * 2 * stdDev / sma) * 100).toFixed(2))
+    };
+}
+
+function generateOnlyUpsDownsSignal(symbol) {
+    const mm = marketMemory[symbol];
+    if (!mm || mm.prices.length < 25) return null;
+
+    const prices = mm.prices;
+    const last   = prices[prices.length - 1];
+
+    const rsi = calcRSI(prices, 14);
+    const bb  = calcBollingerBands(prices, 20, 2);
+    if (!rsi || !bb) return null;
+
+    const aboveMiddle = last > bb.middle;
+    const belowMiddle = last < bb.middle;
+    const nearUpper   = last >= bb.upper * 0.999;
+    const nearLower   = last <= bb.lower * 1.001;
+    const expanding   = bb.bandwidth > 0.1; // bands expanding = good momentum
+
+    // Recent momentum — last 5 ticks
+    const last5   = prices.slice(-5);
+    const rising5 = last5.filter((p,i) => i > 0 && p > last5[i-1]).length;
+    const momentum = rising5 / 4; // 0 to 1
+
+    let signal = null;
+
+    // ── ONLY UPS signal ──
+    // RSI 50-65 (rising, not overbought) + price above middle BB + expanding bands
+    if (rsi >= 48 && rsi <= 68 && aboveMiddle && !nearUpper && expanding && momentum >= 0.6) {
+        const conf = Math.min(88, Math.round(
+            50 +
+            (rsi - 48) * 0.8 +         // RSI contribution
+            momentum * 15 +             // momentum contribution
+            (expanding ? 8 : 0) +       // expanding bands bonus
+            (!nearUpper ? 5 : 0)        // not overbought bonus
+        ));
+        signal = {
+            direction:    'Only Ups',
+            botDirection: 'ups',
+            type:         'only_ups_downs',
+            confidence:   conf,
+            ticks:        momentum >= 0.75 ? 2 : 3,
+            rsi:          rsi,
+            bb:           bb,
+            lastPrice:    last,
+            reason:       `RSI ${rsi} (bullish zone) | Price above BB middle | ${(momentum*100).toFixed(0)}% upward momentum | Bands ${expanding?'expanding':'stable'}`,
+            color:        'var(--green)',
+            pred:         null
+        };
+    }
+
+    // ── ONLY DOWNS signal ──
+    // RSI 32-50 (falling, not oversold) + price below middle BB + expanding bands
+    if (rsi >= 32 && rsi <= 52 && belowMiddle && !nearLower && expanding && momentum <= 0.4) {
+        const conf = Math.min(88, Math.round(
+            50 +
+            (52 - rsi) * 0.8 +
+            (1 - momentum) * 15 +
+            (expanding ? 8 : 0) +
+            (!nearLower ? 5 : 0)
+        ));
+        signal = {
+            direction:    'Only Downs',
+            botDirection: 'downs',
+            type:         'only_ups_downs',
+            confidence:   conf,
+            ticks:        momentum <= 0.25 ? 2 : 3,
+            rsi:          rsi,
+            bb:           bb,
+            lastPrice:    last,
+            reason:       `RSI ${rsi} (bearish zone) | Price below BB middle | ${((1-momentum)*100).toFixed(0)}% downward momentum | Bands ${expanding?'expanding':'stable'}`,
+            color:        'var(--red)',
+            pred:         null
+        };
+    }
+
+    return signal;
+}
+
+// ================================================================
 // PROFESSIONAL TRADING STRATEGIES
 // Based on digit bar analysis (Red/Yellow/Green/Blue)
 // ================================================================
@@ -2096,14 +2210,29 @@ function getTopSignals(symbol, n = 5) {
         if (fallPct > 50) signals.push({ direction:'Fall Only', confidence:riseConf, type:'rise_fall', botDirection:'fall', color:'var(--red)',   pred:null, reason:`Bearish momentum — ${fallPct.toFixed(0)}% of last ${recent.length} ticks` });
     }
 
-    // ── ONLY UPS / ONLY DOWNS — show if above 50% ──
-    if (mm && mm.prices.length >= 10) {
+    // ── ONLY UPS / ONLY DOWNS — BB + RSI powered ──
+    const bbRsiSig = generateOnlyUpsDownsSignal(symbol);
+    if (bbRsiSig) {
+        signals.push({
+            direction:    bbRsiSig.direction,
+            confidence:   bbRsiSig.confidence,
+            type:         bbRsiSig.type,
+            botDirection: bbRsiSig.botDirection,
+            color:        bbRsiSig.color,
+            pred:         null,
+            ticks:        bbRsiSig.ticks,
+            reason:       bbRsiSig.reason,
+            rsi:          bbRsiSig.rsi,
+            bb:           bbRsiSig.bb
+        });
+    } else if (mm && mm.prices.length >= 10) {
+        // Fallback to basic momentum if not enough data for BB/RSI
         const recent  = mm.prices.slice(-20);
         const rising  = recent.filter((p,i) => i>0 && p>recent[i-1]).length;
         const risePct = (rising / Math.max(recent.length-1,1)) * 100;
-        const upsConf = Math.min(85, Math.round(50 + Math.abs(risePct - 50)));
-        if (risePct > 50) signals.push({ direction:'Only Ups',   confidence:upsConf, type:'only_ups_downs', botDirection:'ups',   color:'var(--teal)',  pred:null, reason:`Upward trend — ${risePct.toFixed(0)}% momentum` });
-        if (risePct < 50) signals.push({ direction:'Only Downs', confidence:upsConf, type:'only_ups_downs', botDirection:'downs', color:'var(--amber)', pred:null, reason:`Downward trend — ${(100-risePct).toFixed(0)}% momentum` });
+        const upsConf = Math.min(75, Math.round(50 + Math.abs(risePct - 50)));
+        if (risePct > 55) signals.push({ direction:'Only Ups',   confidence:upsConf, type:'only_ups_downs', botDirection:'ups',   color:'var(--teal)',  pred:null, ticks:3, reason:`Momentum ${risePct.toFixed(0)}% upward (collecting BB/RSI data)` });
+        if (risePct < 45) signals.push({ direction:'Only Downs', confidence:upsConf, type:'only_ups_downs', botDirection:'downs', color:'var(--amber)', pred:null, ticks:3, reason:`Momentum ${(100-risePct).toFixed(0)}% downward (collecting BB/RSI data)` });
     }
 
     // ── MATCHES — only show at 95%+ confidence ──
@@ -2394,7 +2523,26 @@ function runFullScan() {
                     <span class="badge badge-teal" style="font-size:12px;padding:4px 10px;">${best.signal.confidence}%</span>
                 </div>
                 <div style="font-size:15px;font-weight:900;color:${best.signal.color};margin-bottom:6px;">${best.signal.direction}</div>
-                <div style="font-size:11px;color:var(--muted);margin-bottom:10px;">${best.signal.reason} | Hot: <b style="color:var(--green);">${best.signal.hotDigit}</b> Cold: <b style="color:var(--red);">${best.signal.coldDigit}</b></div>
+                <div style="font-size:11px;color:var(--muted);margin-bottom:6px;">${best.signal.reason}${best.signal.hotDigit !== undefined ? ` | Hot: <b style="color:var(--green);">${best.signal.hotDigit}</b> Cold: <b style="color:var(--red);">${best.signal.coldDigit}</b>` : ''}</div>
+                ${best.signal.rsi ? `
+                <div style="display:flex;gap:8px;margin-bottom:10px;flex-wrap:wrap;">
+                    <div style="background:#4299e122;border:1px solid #4299e144;border-radius:8px;padding:8px 12px;text-align:center;">
+                        <div style="font-size:9px;color:#60a5fa;font-weight:700;margin-bottom:2px;">RSI</div>
+                        <div style="font-size:18px;font-weight:900;color:#60a5fa;">${best.signal.rsi}</div>
+                        <div style="font-size:9px;color:var(--muted);">${best.signal.rsi > 70 ? 'Overbought' : best.signal.rsi < 30 ? 'Oversold' : best.signal.rsi > 50 ? 'Bullish' : 'Bearish'}</div>
+                    </div>
+                    ${best.signal.bb ? `
+                    <div style="background:#9f7aea22;border:1px solid #9f7aea44;border-radius:8px;padding:8px 12px;text-align:center;">
+                        <div style="font-size:9px;color:#c4b5fd;font-weight:700;margin-bottom:2px;">BB Width</div>
+                        <div style="font-size:18px;font-weight:900;color:#c4b5fd;">${best.signal.bb.bandwidth}%</div>
+                        <div style="font-size:9px;color:var(--muted);">${best.signal.bb.bandwidth > 0.2 ? 'Expanding' : 'Squeezing'}</div>
+                    </div>
+                    <div style="background:#00d2c822;border:1px solid #00d2c844;border-radius:8px;padding:8px 12px;text-align:center;">
+                        <div style="font-size:9px;color:var(--teal);font-weight:700;margin-bottom:2px;">Duration</div>
+                        <div style="font-size:18px;font-weight:900;color:var(--teal);">${best.signal.ticks || 3}</div>
+                        <div style="font-size:9px;color:var(--muted);">Ticks</div>
+                    </div>` : ''}
+                </div>` : ''}
                 ${topSigs.length > 1 ? `<div style="font-size:10px;font-weight:700;color:var(--muted);text-transform:uppercase;margin-bottom:6px;">All Signals for this market:</div><div style="display:flex;flex-direction:column;gap:4px;">${sigsHtml}</div>` : ''}
                 <button onclick="applyBestSignal()" class="btn btn-teal" style="margin-top:12px;padding:8px 20px;font-size:12px;width:100%;">✅ Apply Best Signal to Bot</button>`;
         } else {
@@ -2463,6 +2611,7 @@ function applySignalToBot(sig) {
     const mktSel  = document.getElementById('bot-market');
     const typeSel = document.getElementById('bot-type');
     const predEl  = document.getElementById('bot-pred');
+    const durEl   = document.getElementById('bot-dur');
 
     // Apply market if signal has one
     if (sig.symbol && mktSel) mktSel.value = sig.symbol;
@@ -2476,6 +2625,12 @@ function applySignalToBot(sig) {
     // Apply prediction/barrier value for over_under
     if (sig.pred !== null && sig.pred !== undefined && predEl) {
         predEl.value = sig.pred;
+    }
+
+    // Apply ticks from signal (BB/RSI sets 2 or 3 for Only Ups/Downs)
+    if (sig.ticks && durEl) {
+        durEl.value = sig.ticks;
+        log(`⏱ Duration set to ${sig.ticks} ticks from signal`, 'i');
     }
 
     updateInfoBar();
@@ -3083,3 +3238,65 @@ setInterval(() => {
         renderMT5Signals();
     }
 }, 30000);
+
+// ================================================================
+// CHART TAB — BB + RSI Live Indicator Bar
+// ================================================================
+
+function updateChartIndicators(symbol) {
+    const sym = symbol || document.getElementById('chart-market-sel')?.value || 'R_10';
+    const mm  = marketMemory[sym];
+    if (!mm || mm.prices.length < 20) {
+        document.getElementById('chart-signal')?.setAttribute('style','font-size:12px;font-weight:900;color:var(--muted)');
+        const s = document.getElementById('chart-signal');
+        if (s) s.textContent = 'Collecting data...';
+        return;
+    }
+
+    const rsi = calcRSI(mm.prices, 14);
+    const bb  = calcBollingerBands(mm.prices, 20, 2);
+
+    if (rsi !== null) {
+        const rsiEl    = document.getElementById('chart-rsi');
+        const rsiLabel = document.getElementById('chart-rsi-label');
+        if (rsiEl) {
+            rsiEl.textContent = rsi;
+            rsiEl.style.color = rsi > 70 ? '#f87171' : rsi < 30 ? '#34d399' : rsi > 50 ? '#60a5fa' : '#fbbf24';
+        }
+        if (rsiLabel) {
+            const label = rsi > 70 ? 'Overbought' : rsi < 30 ? 'Oversold' : rsi > 60 ? 'Bullish' : rsi < 40 ? 'Bearish' : 'Neutral';
+            rsiLabel.textContent = label;
+        }
+    }
+
+    if (bb !== null) {
+        const set = (id, val) => { const el = document.getElementById(id); if (el) el.textContent = val; };
+        set('chart-bb-upper', bb.upper.toFixed(4));
+        set('chart-bb-mid',   bb.middle.toFixed(4));
+        set('chart-bb-lower', bb.lower.toFixed(4));
+        set('chart-bb-width', bb.bandwidth.toFixed(2) + '%');
+        const bbLabel = document.getElementById('chart-bb-label');
+        if (bbLabel) bbLabel.textContent = bb.bandwidth > 0.2 ? 'Expanding 📈' : bb.bandwidth < 0.05 ? 'Squeezing ⚠️' : 'Normal';
+    }
+
+    // Show BB+RSI signal for Only Ups/Downs
+    const sig     = generateOnlyUpsDownsSignal(sym);
+    const sigEl   = document.getElementById('chart-signal');
+    if (sigEl) {
+        if (sig) {
+            sigEl.textContent  = `${sig.direction} ${sig.confidence}% — ${sig.ticks} ticks`;
+            sigEl.style.color  = sig.color;
+        } else {
+            sigEl.textContent  = 'No clear signal';
+            sigEl.style.color  = 'var(--muted)';
+        }
+    }
+}
+
+// Auto-update chart indicators every 5 seconds when chart tab is active
+setInterval(() => {
+    if (document.getElementById('chart-pane')?.classList.contains('active')) {
+        const sym = document.getElementById('chart-market-sel')?.value || 'R_10';
+        updateChartIndicators(sym);
+    }
+}, 5000);
