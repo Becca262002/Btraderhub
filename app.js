@@ -1,4 +1,5 @@
 // ================================================================
+// ================================================================
 // BTRADERHUB app.js — Clean Focused Build
 // Auth: Amy-verified PKCE (DO NOT CHANGE)
 // ================================================================
@@ -147,6 +148,9 @@ function nextReqId() { return ++reqIdCounter; }
 // Pip sizes per symbol — populated from active_symbols
 let activePipSizes = {};
 
+// Session tracking — resets on each "Reset & Continue"
+let sessionBasePL = 0; // PL at the start of current session
+
 // Smart Recovery System
 // Tracks consecutive losses and switches to high-probability recovery trade
 let consecutiveLosses  = 0;
@@ -264,6 +268,7 @@ function switchTab(id) {
     if (id === 'scanner') runFullScan();
     if (id === 'mt5')     { connectMT5Feed(); setTimeout(renderMT5Signals, 800); }
     if (id === 'chart')   { setTimeout(() => updateChartIndicators(), 500); }
+    if (id === 'accu')    { onAccuMarketChange(document.getElementById('accu-market')?.value || 'R_10'); updateAccuProfitCalc(); }
 }
 
 function switchPanel(name, el) {
@@ -601,22 +606,42 @@ function routeMsg(r) {
 
     // STEP 2: Proposal response — extract ID and ask_price, then buy
     if (r.msg_type === 'proposal') {
-        clearProposalTimeout(); // clear timeout — proposal arrived
+        clearProposalTimeout();
         if (r.error) {
             pendingContract = false;
             lastContractId  = null;
             log(`❌ Proposal rejected: ${r.error.message}`, 'x');
             log(`   Code: ${r.error.code} | Check market symbol and contract params`, 'x');
-        } else if (r.proposal && isBotRunning) {
-            const proposalId = r.proposal.id;
-            const askPrice   = r.proposal.ask_price;
-            log(`✅ Proposal: ${proposalId} | Ask: $${askPrice}`, 'i');
-            buyFromProposal(proposalId, parseFloat(askPrice));
+            // If accumulator proposal failed
+            if (accuRunning) { notify("Accumulator Error", r.error.message, 'err'); resetAccuUI(); }
+        } else if (r.proposal) {
+            // Accumulator proposal — buy immediately
+            if (r.proposal.contract_type === 'ACCU' || accuRunning) {
+                const proposalId = r.proposal.id;
+                const askPrice   = r.proposal.ask_price;
+                log(`📈 Accumulator proposal: ${proposalId} | Ask: $${askPrice}`, 'i');
+                derivWS.send(JSON.stringify({ buy: proposalId, price: parseFloat(askPrice), req_id: nextReqId() }));
+            } else if (isBotRunning) {
+                // Regular bot proposal
+                const proposalId = r.proposal.id;
+                const askPrice   = r.proposal.ask_price;
+                log(`✅ Proposal: ${proposalId} | Ask: $${askPrice}`, 'i');
+                buyFromProposal(proposalId, parseFloat(askPrice));
+            }
         }
     }
 
     // STEP 3: Buy response
     if (r.msg_type === 'buy') handleBuyResponse(r);
+
+    // Sell response (for accumulator manual sell)
+    if (r.msg_type === 'sell') {
+        if (r.error) {
+            log(`❌ Sell error: ${r.error.message}`, 'x');
+        } else {
+            log(`✅ Contract sold | Price: $${r.sell?.sold_for || '—'}`, 'w');
+        }
+    }
 
     // Contract update/settlement
     if (r.msg_type === 'proposal_open_contract' && r.proposal_open_contract) {
@@ -643,7 +668,13 @@ function routeMsg(r) {
                 .join(' | ');
             log(`📋 Spots: ${found || 'NO SPOT FIELDS FOUND'}`, 'd');
         }
-        handleContractResult(c);
+        // Route to accumulator handler or bot handler
+        if (c.contract_type === 'ACCU' || (accuContractId && c.contract_id === accuContractId)) {
+            accuContractId = c.contract_id;
+            handleAccuContractUpdate(c);
+        } else {
+            handleContractResult(c);
+        }
     }
 }
 
@@ -836,11 +867,20 @@ function connectPublicWS() {
                 updateAIMini(sym);
             }
 
-            // Bot engine still uses authenticated WS for trading
-            // but reads digit from public WS tick
+            // Bot engine
             const botMkt = document.getElementById('bot-market')?.value;
             if (isBotRunning && sym === botMkt) {
                 runBotLogic(d, data.tick.quote);
+            }
+
+            // Update accumulator live price display
+            if (sym === accuMarket) {
+                const priceEl = document.getElementById('accu-price');
+                const digitEl = document.getElementById('accu-last-digit');
+                if (priceEl) priceEl.textContent = data.tick.quote;
+                if (digitEl) digitEl.textContent = `Last digit: ${d}`;
+                // Update analysis every 10 ticks
+                if (st.ticks % 10 === 0) updateAccuAnalysis(sym);
             }
         }
     };
@@ -1112,7 +1152,16 @@ function buyFromProposal(proposalId, askPrice) {
 }
 
 function handleBuyResponse(r) {
-    clearProposalTimeout(); // clear any pending timeouts
+    clearProposalTimeout();
+    // Handle accumulator buy separately
+    if (accuRunning && r.buy && !r.error) {
+        accuContractId = r.buy.contract_id;
+        log(`✅ Accumulator #${accuContractId} started | Buy price: $${r.buy.buy_price}`, 'w');
+        notify('📈 Accumulator Running!', `Contract started. Growth: ${(accuGrowthRate*100)}% per tick. Sell anytime!`, 'ok');
+        // Subscribe to contract updates
+        derivWS.send(JSON.stringify({ proposal_open_contract: 1, contract_id: accuContractId, subscribe: 1 }));
+        return;
+    }
     if (r.error) {
         pendingContract = false;
         lastContractId  = null;
@@ -1426,32 +1475,33 @@ function checkThresholds() {
     const tp = parseFloat(document.getElementById('bot-tp')?.value || 0);
     const sl = parseFloat(document.getElementById('bot-sl')?.value || 0);
 
-    if (tp > 0 && totalPL >= tp) {
-        log(`🏆 TAKE PROFIT $${tp} HIT! Stopping bot.`, 'w');
-        // Stop the bot
-        isBotRunning   = false;
-        pendingContract = false;
-        lastContractId  = null;
-        const btn = document.getElementById('run-btn');
-        if (btn) { btn.textContent = '▶ Run'; btn.classList.remove('btn-stop'); btn.classList.add('btn-run'); }
-        updateBotBar();
-        // Show big target hit modal
-        showTargetModal('tp', tp);
+    // Use session PL — measured from last reset, not all-time total
+    const sessionPL = totalPL - sessionBasePL;
 
-    } else if (sl > 0 && totalPL <= -sl) {
-        log(`⛔ STOP LOSS $${sl} HIT! Stopping bot.`, 'x');
+    if (tp > 0 && sessionPL >= tp) {
+        log(`🏆 TAKE PROFIT $${tp} HIT! Session P/L: $${sessionPL.toFixed(2)}`, 'w');
         isBotRunning   = false;
         pendingContract = false;
         lastContractId  = null;
         const btn = document.getElementById('run-btn');
         if (btn) { btn.textContent = '▶ Run'; btn.classList.remove('btn-stop'); btn.classList.add('btn-run'); }
         updateBotBar();
-        // Show big stop loss modal
-        showTargetModal('sl', sl);
+        showTargetModal('tp', tp, sessionPL);
+
+    } else if (sl > 0 && sessionPL <= -sl) {
+        log(`⛔ STOP LOSS $${sl} HIT! Session P/L: $${sessionPL.toFixed(2)}`, 'x');
+        isBotRunning   = false;
+        pendingContract = false;
+        lastContractId  = null;
+        const btn = document.getElementById('run-btn');
+        if (btn) { btn.textContent = '▶ Run'; btn.classList.remove('btn-stop'); btn.classList.add('btn-run'); }
+        updateBotBar();
+        showTargetModal('sl', sl, sessionPL);
     }
 }
 
-function showTargetModal(type, amount) {
+function showTargetModal(type, amount, sessionPL) {
+    sessionPL = sessionPL || totalPL;
     // Remove existing modal if any
     const existing = document.getElementById('target-modal');
     if (existing) existing.remove();
@@ -1499,8 +1549,8 @@ function showTargetModal(type, amount) {
                     <div style="font-size:18px;font-weight:900;color:${color};">${totalRuns>0?((totalWins/totalRuns)*100).toFixed(1):0}%</div>
                 </div>
                 <div>
-                    <div style="font-size:9px;color:#718096;text-transform:uppercase;margin-bottom:4px;">P/L</div>
-                    <div style="font-size:18px;font-weight:900;color:${color};">$${totalPL.toFixed(2)}</div>
+                    <div style="font-size:9px;color:#718096;text-transform:uppercase;margin-bottom:4px;">Session P/L</div>
+                    <div style="font-size:18px;font-weight:900;color:${color};">$${sessionPL.toFixed(2)}</div>
                 </div>
             </div>
 
@@ -1531,8 +1581,9 @@ function resetAndContinue() {
     // Remove modal
     document.getElementById('target-modal')?.remove();
 
-    // Reset ALL trading stats but keep bot settings
-    totalPL           = 0;
+    // Reset session tracking — totalPL keeps accumulating but session resets
+    // TP/SL checks against sessionPL (profit since last reset) not totalPL
+    sessionBasePL     = totalPL; // new session starts from current PL
     totalRuns         = 0;
     totalWins         = 0;
     totalLosses       = 0;
@@ -1544,6 +1595,7 @@ function resetAndContinue() {
     baseStake         = currentStake;
     lastContractId    = null;
     pendingContract   = false;
+    log(`🔄 New session started. TP/SL reset. Cumulative P/L: $${totalPL.toFixed(2)}`, 'i');
 
     // Reset recovery state
     if (isInRecoveryMode && originalDirection !== null) {
@@ -3300,3 +3352,271 @@ setInterval(() => {
         updateChartIndicators(sym);
     }
 }, 5000);
+
+// ================================================================
+// ACCUMULATOR ENGINE
+// Full accumulator trading directly on btraderhub.com
+// ================================================================
+
+let accuRunning      = false;
+let accuContractId   = null;
+let accuGrowthRate   = 0.02; // default 2%
+let accuTickCount    = 0;
+let accuCurrentProfit = 0;
+let accuMarket       = 'R_10';
+let accuAnalysisTimer = null;
+
+function onAccuMarketChange(sym) {
+    accuMarket = sym;
+    updateAccuAnalysis(sym);
+    updateAccuProfitCalc();
+    // Subscribe to ticks for analysis
+    subscribeDigitFeed(sym);
+}
+
+function selectAccuGrowth(rate, btn) {
+    accuGrowthRate = rate;
+    document.querySelectorAll('#accu-pane .btn').forEach(b => {
+        if (['1%','2%','3%','4%','5%'].includes(b.textContent)) {
+            b.classList.remove('btn-teal');
+            b.classList.add('btn-ghost');
+        }
+    });
+    if (btn) { btn.classList.remove('btn-ghost'); btn.classList.add('btn-teal'); }
+    updateAccuProfitCalc();
+}
+
+function updateAccuAnalysis(sym) {
+    const mm  = marketMemory[sym] || { prices: [] };
+    const rsi = mm.prices.length >= 15 ? calcRSI(mm.prices, 14) : null;
+    const bb  = mm.prices.length >= 20 ? calcBollingerBands(mm.prices, 20, 2) : null;
+
+    // Volatility score based on BB width and market type
+    const volMap = { R_10:15, R_25:30, R_50:50, R_75:75, R_100:90, '1HZ10V':35, '1HZ25V':50, '1HZ50V':65, '1HZ75V':80, '1HZ100V':95 };
+    let volScore = volMap[sym] || 50;
+
+    // Adjust based on BB width
+    if (bb) volScore = Math.min(100, Math.round(volScore + bb.bandwidth * 20));
+
+    // Volatility bar
+    const volBar   = document.getElementById('accu-vol-bar');
+    const volLabel = document.getElementById('accu-vol-label');
+    if (volBar)   volBar.style.width = volScore + '%';
+    if (volBar)   volBar.style.background = volScore < 30 ? 'var(--green)' : volScore < 60 ? 'var(--amber)' : 'var(--red)';
+    if (volLabel) { volLabel.textContent = volScore < 30 ? 'Low ✅' : volScore < 60 ? 'Medium ⚠️' : 'High ❌'; volLabel.style.color = volScore < 30 ? 'var(--green)' : volScore < 60 ? 'var(--amber)' : 'var(--red)'; }
+
+    // RSI display
+    const rsiEl    = document.getElementById('accu-rsi');
+    const rsiLabel = document.getElementById('accu-rsi-label');
+    if (rsi !== null && rsiEl) {
+        rsiEl.textContent  = rsi;
+        rsiEl.style.color  = rsi > 70 ? 'var(--red)' : rsi < 30 ? 'var(--green)' : '#60a5fa';
+        if (rsiLabel) rsiLabel.textContent = rsi > 70 ? 'Overbought' : rsi < 30 ? 'Oversold' : rsi > 50 ? 'Bullish' : 'Bearish';
+    }
+
+    // BB display
+    const bbWidthEl = document.getElementById('accu-bb-width');
+    const bbLabel   = document.getElementById('accu-bb-label');
+    if (bb && bbWidthEl) {
+        bbWidthEl.textContent = bb.bandwidth.toFixed(2) + '%';
+        bbWidthEl.style.color = bb.bandwidth < 0.1 ? 'var(--green)' : bb.bandwidth < 0.3 ? 'var(--amber)' : 'var(--red)';
+        if (bbLabel) bbLabel.textContent = bb.bandwidth < 0.1 ? 'Squeezing ✅' : bb.bandwidth < 0.3 ? 'Normal ⚠️' : 'Wide ❌';
+    }
+
+    // Safe ticks in a row
+    const safeTicks = document.getElementById('accu-safe-ticks');
+    if (safeTicks && mm.prices.length >= 5) {
+        const recent = mm.prices.slice(-20);
+        let consecutive = 0;
+        for (let i = recent.length-1; i > 0; i--) {
+            const change = Math.abs((recent[i] - recent[i-1]) / recent[i-1]) * 100;
+            if (change < 0.5) consecutive++;
+            else break;
+        }
+        safeTicks.textContent = consecutive;
+        safeTicks.style.color = consecutive > 10 ? 'var(--green)' : consecutive > 5 ? 'var(--amber)' : 'var(--red)';
+    }
+
+    // Entry signal
+    const sigBox  = document.getElementById('accu-signal-box');
+    const growthRec = document.getElementById('accu-growth-rec');
+    if (sigBox) {
+        if (!rsi || !bb) {
+            sigBox.innerHTML = '<div style="font-size:11px;color:var(--muted);">Collecting data... need 20+ ticks</div>';
+            return;
+        }
+        const goodEntry = rsi > 40 && rsi < 60 && bb.bandwidth < 0.2 && volScore < 50;
+        const okEntry   = rsi > 35 && rsi < 65 && bb.bandwidth < 0.35 && volScore < 70;
+        const color     = goodEntry ? 'var(--green)' : okEntry ? 'var(--amber)' : 'var(--red)';
+        const label     = goodEntry ? '✅ GREAT ENTRY' : okEntry ? '⚠️ OKAY ENTRY' : '❌ AVOID NOW';
+        const reason    = goodEntry
+            ? `RSI neutral (${rsi}) + Low BB width (${bb.bandwidth.toFixed(2)}%) + Low volatility`
+            : okEntry
+            ? `Conditions acceptable but monitor closely`
+            : `RSI ${rsi > 65 ? 'overbought' : 'oversold'} or volatility too high (${volScore}%)`;
+
+        sigBox.innerHTML = `
+            <div style="font-size:16px;font-weight:900;color:${color};margin-bottom:6px;">${label}</div>
+            <div style="font-size:10px;color:var(--muted);">${reason}</div>`;
+
+        // Recommend growth rate
+        const recRate = volScore < 25 ? '3%' : volScore < 40 ? '2%' : '1%';
+        if (growthRec) growthRec.textContent = `AI recommends: ${recRate} for this market`;
+    }
+}
+
+function updateAccuProfitCalc() {
+    const stake  = parseFloat(document.getElementById('accu-stake')?.value || 1);
+    const table  = document.getElementById('accu-profit-table');
+    if (!table) return;
+
+    const milestones = [5, 10, 15, 20, 25, 30, 50];
+    table.innerHTML = milestones.map(ticks => {
+        const profit = stake * (Math.pow(1 + accuGrowthRate, ticks) - 1);
+        const total  = stake + profit;
+        return `<div style="display:flex;justify-content:space-between;padding:3px 0;border-bottom:1px solid var(--border);">
+            <span style="color:var(--muted);">${ticks} ticks</span>
+            <span style="color:var(--green);font-weight:700;font-family:monospace;">+$${profit.toFixed(2)}</span>
+            <span style="color:var(--text);font-family:monospace;">= $${total.toFixed(2)}</span>
+        </div>`;
+    }).join('');
+}
+
+function toggleAccumulator() {
+    if (!derivWS || derivWS.readyState !== WebSocket.OPEN) {
+        notify("Not Connected", "Please log in to your Deriv account first.", 'err');
+        return;
+    }
+
+    const btn = document.getElementById('accu-run-btn');
+    const sellBtn = document.getElementById('accu-sell-btn');
+
+    if (!accuRunning) {
+        const stake = parseFloat(document.getElementById('accu-stake')?.value || 1);
+        const tp    = parseFloat(document.getElementById('accu-tp')?.value || 10);
+        if (stake < 1) { notify("Invalid Stake", "Minimum accumulator stake is $1.", 'err'); return; }
+
+        accuRunning       = true;
+        accuTickCount     = 0;
+        accuCurrentProfit = 0;
+
+        if (btn)     { btn.textContent = '⬛ Stop Accumulator'; btn.classList.remove('btn-teal'); btn.classList.add('btn-red'); }
+        if (sellBtn)  sellBtn.style.display = 'block';
+
+        // Send accumulator proposal
+        const proposal = {
+            proposal:          1,
+            amount:            stake,
+            basis:             "stake",
+            contract_type:     "ACCU",
+            currency:          "USD",
+            underlying_symbol: accuMarket,
+            growth_rate:       accuGrowthRate,
+            limit_order:       { take_profit: tp },
+            req_id:            nextReqId()
+        };
+
+        log(`📈 Accumulator proposal: ${MKT[accuMarket]||accuMarket} | Growth: ${(accuGrowthRate*100)}% | Stake: $${stake} | TP: $${tp}`, 'i');
+        derivWS.send(JSON.stringify(proposal));
+
+    } else {
+        // Stop — sell the contract
+        sellAccumulator();
+    }
+}
+
+function sellAccumulator() {
+    if (!accuContractId) {
+        accuRunning = false;
+        resetAccuUI();
+        return;
+    }
+    // Sell contract to take profit
+    derivWS.send(JSON.stringify({ sell: accuContractId, price: 0, req_id: nextReqId() }));
+    log(`💰 Selling accumulator contract #${accuContractId}`, 'i');
+}
+
+function resetAccuUI() {
+    const btn     = document.getElementById('accu-run-btn');
+    const sellBtn = document.getElementById('accu-sell-btn');
+    accuRunning    = false;
+    accuContractId = null;
+    if (btn)     { btn.textContent = '▶ Start Accumulator'; btn.classList.remove('btn-red'); btn.classList.add('btn-teal'); }
+    if (sellBtn)  sellBtn.style.display = 'none';
+    const info = document.getElementById('accu-contract-info');
+    if (info) info.textContent = 'No active contract';
+}
+
+function handleAccuContractUpdate(c) {
+    if (!c) return;
+
+    // Update tick count and current profit
+    const tickEl   = document.getElementById('accu-tick-count');
+    const profitEl = document.getElementById('accu-current-profit');
+    const infoEl   = document.getElementById('accu-contract-info');
+
+    if (c.tick_count !== undefined && tickEl) {
+        accuTickCount = c.tick_count;
+        tickEl.textContent = accuTickCount;
+        tickEl.style.color = accuTickCount > 15 ? 'var(--green)' : accuTickCount > 5 ? 'var(--amber)' : 'var(--teal)';
+    }
+
+    if (c.profit !== undefined) {
+        accuCurrentProfit = parseFloat(c.profit);
+        if (profitEl) {
+            profitEl.textContent = `$${accuCurrentProfit.toFixed(2)}`;
+            profitEl.style.color = accuCurrentProfit >= 0 ? 'var(--green)' : 'var(--red)';
+        }
+    }
+
+    if (infoEl) {
+        infoEl.innerHTML = `
+            <div style="font-size:11px;">Contract: <b style="color:var(--teal);">#${c.contract_id||'—'}</b></div>
+            <div style="font-size:11px;">Growth Rate: <b style="color:var(--teal);">${((accuGrowthRate||0.02)*100)}%</b></div>
+            <div style="font-size:11px;">Ticks: <b style="color:var(--green);">${accuTickCount}</b></div>`;
+    }
+
+    // Contract settled
+    if (c.is_sold || c.is_expired) {
+        const profit   = parseFloat(c.profit || 0);
+        const stake    = parseFloat(document.getElementById('accu-stake')?.value || 1);
+        const isWin    = profit > 0;
+
+        // Add to history
+        addAccuHistory(accuMarket, accuGrowthRate, stake, accuTickCount, profit, isWin);
+
+        log(`${isWin ? '✅' : '❌'} Accumulator ${isWin ? 'sold' : 'knocked out'} | ${accuTickCount} ticks | P/L: $${profit.toFixed(2)}`, isWin ? 'w' : 'l');
+
+        if (isWin) { try { playWin(); } catch(e) {} }
+        else       { try { playLoss(); } catch(e) {} }
+
+        notify(
+            isWin ? '💰 Accumulator Profit!' : '💥 Accumulator Knocked Out!',
+            `${accuTickCount} ticks | P/L: ${isWin?'+':''}$${profit.toFixed(2)}`,
+            isWin ? 'ok' : 'err'
+        );
+
+        resetAccuUI();
+        if (profitEl) { profitEl.textContent = `$${profit.toFixed(2)}`; profitEl.style.color = isWin ? 'var(--green)' : 'var(--red)'; }
+    }
+}
+
+function addAccuHistory(market, growth, stake, ticks, profit, isWin) {
+    const container = document.getElementById('accu-history');
+    if (!container) return;
+    const empty = container.querySelector('[style*="text-align:center"]');
+    if (empty) empty.remove();
+
+    const row = document.createElement('div');
+    row.style.cssText = `display:flex;align-items:center;padding:6px 0;border-bottom:1px solid var(--border);font-size:11px;`;
+    row.innerHTML = `
+        <div style="width:80px;color:var(--muted);">${MKT[market]?.replace('Volatility','V')||market}</div>
+        <div style="flex:1;color:var(--muted);">${(growth*100)}%</div>
+        <div style="width:80px;font-family:monospace;">$${stake.toFixed(2)}</div>
+        <div style="width:80px;color:var(--teal);">${ticks} ticks</div>
+        <div style="width:100px;text-align:right;font-weight:700;font-family:monospace;color:${isWin?'var(--green)':'var(--red)'};">${isWin?'+':''}$${profit.toFixed(2)}</div>`;
+    container.insertBefore(row, container.firstChild);
+}
+
+// Wire into routeMsg for accumulator proposal + contract updates
+// handled in existing proposal and proposal_open_contract handlers

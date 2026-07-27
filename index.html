@@ -287,6 +287,7 @@ body{padding-bottom:60px;}
     <button id="tab-btn-digits"    onclick="switchTab('digits')"    class="tab-btn">0️⃣ D-Stats</button>
     <button id="tab-btn-scanner"   onclick="switchTab('scanner')"   class="tab-btn">🧠 AI Scanner</button>
     <button id="tab-btn-mt5"       onclick="switchTab('mt5')"       class="tab-btn">📊 MT5 Signals</button>
+    <button id="tab-btn-accu"      onclick="switchTab('accu')"      class="tab-btn">📈 Accumulators</button>
 </nav>
 
 <!-- ═══ MAIN ═══ -->
@@ -536,7 +537,7 @@ body{padding-bottom:60px;}
 
             <div>
                 <div style="font-size:9px;font-weight:700;color:var(--muted);text-transform:uppercase;margin-bottom:4px;">Martingale ×</div>
-                <input type="number" id="bot-mg" value="2.1" step="0.1" min="1">
+                <input type="number" id="bot-mg" value="1.5" step="0.1" min="1">
             </div>
 
             <div style="display:grid;grid-template-columns:1fr 1fr;gap:8px;">
@@ -846,6 +847,174 @@ body{padding-bottom:60px;}
 
         <!-- All market results -->
         <div id="scan-results" style="display:grid;grid-template-columns:repeat(auto-fill,minmax(220px,1fr));gap:10px;"></div>
+    </div>
+</div>
+
+<!-- ── ACCUMULATORS ── -->
+<div id="accu-pane" class="tab-pane scroll" style="padding:16px;">
+    <div style="max-width:900px;margin:0 auto;">
+
+        <!-- Header -->
+        <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:16px;flex-wrap:wrap;gap:10px;">
+            <div>
+                <h2 style="font-size:18px;font-weight:900;">📈 Accumulator Trading</h2>
+                <p style="font-size:11px;color:var(--muted);margin-top:3px;">Grow your stake tick by tick. AI analyzes volatility to find the safest entry.</p>
+            </div>
+            <div class="badge badge-teal" style="font-size:11px;padding:6px 12px;">🔴 LIVE on Deriv API</div>
+        </div>
+
+        <!-- Market + Settings row -->
+        <div style="display:grid;grid-template-columns:1fr 1fr;gap:12px;margin-bottom:14px;">
+
+            <!-- Left: Market selector + Analysis -->
+            <div class="card" style="padding:16px;">
+                <div style="font-size:10px;font-weight:700;color:var(--muted);text-transform:uppercase;margin-bottom:10px;">📊 Market Analysis</div>
+
+                <div style="margin-bottom:10px;">
+                    <div style="font-size:9px;color:var(--muted);font-weight:700;text-transform:uppercase;margin-bottom:4px;">Select Market</div>
+                    <select id="accu-market" onchange="onAccuMarketChange(this.value)" style="font-size:12px;">
+                        <optgroup label="Recommended (Low Volatility)">
+                            <option value="R_10">✅ Volatility 10 Index</option>
+                            <option value="R_25">✅ Volatility 25 Index</option>
+                            <option value="R_50">⚠️ Volatility 50 Index</option>
+                        </optgroup>
+                        <optgroup label="High Risk">
+                            <option value="R_75">❌ Volatility 75 Index</option>
+                            <option value="R_100">❌ Volatility 100 Index</option>
+                            <option value="1HZ10V">⚠️ Volatility 10 (1s)</option>
+                            <option value="1HZ25V">⚠️ Volatility 25 (1s)</option>
+                            <option value="1HZ50V">❌ Volatility 50 (1s)</option>
+                            <option value="1HZ75V">❌ Volatility 75 (1s)</option>
+                            <option value="1HZ100V">❌ Volatility 100 (1s)</option>
+                        </optgroup>
+                    </select>
+                </div>
+
+                <!-- Volatility meter -->
+                <div style="margin-bottom:10px;">
+                    <div style="display:flex;justify-content:space-between;margin-bottom:4px;">
+                        <span style="font-size:10px;color:var(--muted);">Volatility Level</span>
+                        <span id="accu-vol-label" style="font-size:10px;font-weight:700;color:var(--green);">Low ✅</span>
+                    </div>
+                    <div style="height:6px;background:var(--border);border-radius:3px;overflow:hidden;">
+                        <div id="accu-vol-bar" style="height:100%;border-radius:3px;width:20%;background:var(--green);transition:width .5s;"></div>
+                    </div>
+                </div>
+
+                <!-- BB + RSI indicators -->
+                <div style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:8px;margin-bottom:10px;">
+                    <div class="card-sm" style="padding:8px;text-align:center;">
+                        <div style="font-size:9px;color:var(--muted);margin-bottom:3px;">RSI(14)</div>
+                        <div id="accu-rsi" style="font-size:18px;font-weight:900;color:#60a5fa;">—</div>
+                        <div id="accu-rsi-label" style="font-size:9px;color:var(--muted);">—</div>
+                    </div>
+                    <div class="card-sm" style="padding:8px;text-align:center;">
+                        <div style="font-size:9px;color:var(--muted);margin-bottom:3px;">BB Width</div>
+                        <div id="accu-bb-width" style="font-size:18px;font-weight:900;color:#c4b5fd;">—</div>
+                        <div id="accu-bb-label" style="font-size:9px;color:var(--muted);">—</div>
+                    </div>
+                    <div class="card-sm" style="padding:8px;text-align:center;">
+                        <div style="font-size:9px;color:var(--muted);margin-bottom:3px;">Safe Ticks</div>
+                        <div id="accu-safe-ticks" style="font-size:18px;font-weight:900;color:var(--green);">—</div>
+                        <div style="font-size:9px;color:var(--muted);">in a row</div>
+                    </div>
+                </div>
+
+                <!-- Entry signal -->
+                <div id="accu-signal-box" style="background:var(--bg);border:1px solid var(--border);border-radius:8px;padding:12px;text-align:center;">
+                    <div style="font-size:11px;color:var(--muted);">Analyzing market...</div>
+                </div>
+            </div>
+
+            <!-- Right: Trade settings -->
+            <div class="card" style="padding:16px;">
+                <div style="font-size:10px;font-weight:700;color:var(--muted);text-transform:uppercase;margin-bottom:10px;">⚙️ Trade Settings</div>
+
+                <div style="margin-bottom:10px;">
+                    <div style="font-size:9px;color:var(--muted);font-weight:700;text-transform:uppercase;margin-bottom:4px;">Growth Rate</div>
+                    <div style="display:flex;gap:6px;flex-wrap:wrap;">
+                        <button onclick="selectAccuGrowth(0.01,this)" class="btn btn-ghost" style="font-size:11px;padding:5px 10px;">1%</button>
+                        <button onclick="selectAccuGrowth(0.02,this)" class="btn btn-teal"  style="font-size:11px;padding:5px 10px;">2%</button>
+                        <button onclick="selectAccuGrowth(0.03,this)" class="btn btn-ghost" style="font-size:11px;padding:5px 10px;">3%</button>
+                        <button onclick="selectAccuGrowth(0.04,this)" class="btn btn-ghost" style="font-size:11px;padding:5px 10px;">4%</button>
+                        <button onclick="selectAccuGrowth(0.05,this)" class="btn btn-ghost" style="font-size:11px;padding:5px 10px;">5%</button>
+                    </div>
+                    <div id="accu-growth-rec" style="font-size:10px;color:var(--teal);margin-top:5px;">AI recommends: 2% for this market</div>
+                </div>
+
+                <div style="margin-bottom:10px;">
+                    <div style="font-size:9px;color:var(--muted);font-weight:700;text-transform:uppercase;margin-bottom:4px;">Stake (USD)</div>
+                    <input type="number" id="accu-stake" value="1.00" min="1" step="0.50" style="font-size:14px;font-weight:900;text-align:center;color:var(--teal);">
+                </div>
+
+                <div style="margin-bottom:10px;">
+                    <div style="font-size:9px;color:var(--green);font-weight:700;text-transform:uppercase;margin-bottom:4px;">Take Profit (USD)</div>
+                    <input type="number" id="accu-tp" value="10.00" step="1" style="color:var(--green);">
+                </div>
+
+                <!-- Profit calculator -->
+                <div class="card-sm" style="padding:10px;">
+                    <div style="font-size:9px;color:var(--muted);text-transform:uppercase;font-weight:700;margin-bottom:8px;">💰 Profit Calculator</div>
+                    <div id="accu-profit-table" style="display:flex;flex-direction:column;gap:4px;font-size:10px;"></div>
+                </div>
+            </div>
+        </div>
+
+        <!-- Live price + current contract -->
+        <div style="display:grid;grid-template-columns:1fr 1fr;gap:12px;margin-bottom:14px;">
+            <div class="card" style="padding:14px;">
+                <div style="font-size:10px;font-weight:700;color:var(--muted);text-transform:uppercase;margin-bottom:8px;">📡 Live Price</div>
+                <div style="display:flex;align-items:center;justify-content:space-between;">
+                    <div>
+                        <div id="accu-price" style="font-size:24px;font-weight:900;font-family:monospace;color:var(--teal);">—</div>
+                        <div id="accu-last-digit" style="font-size:11px;color:var(--muted);">Last digit: —</div>
+                    </div>
+                    <div style="text-align:right;">
+                        <div id="accu-tick-count" style="font-size:28px;font-weight:900;color:var(--green);">0</div>
+                        <div style="font-size:10px;color:var(--muted);">ticks in range</div>
+                    </div>
+                </div>
+            </div>
+
+            <div class="card" style="padding:14px;">
+                <div style="font-size:10px;font-weight:700;color:var(--muted);text-transform:uppercase;margin-bottom:8px;">📋 Current Contract</div>
+                <div id="accu-contract-info" style="font-size:12px;color:var(--muted);">No active contract</div>
+                <div style="margin-top:8px;">
+                    <div style="font-size:10px;color:var(--muted);margin-bottom:4px;">Current Profit</div>
+                    <div id="accu-current-profit" style="font-size:22px;font-weight:900;color:var(--green);">$0.00</div>
+                </div>
+            </div>
+        </div>
+
+        <!-- Run/Stop button -->
+        <div style="display:grid;grid-template-columns:1fr 1fr;gap:12px;margin-bottom:14px;">
+            <button id="accu-run-btn" onclick="toggleAccumulator()" class="btn btn-teal" style="padding:16px;font-size:16px;font-weight:900;border-radius:10px;box-shadow:0 4px 20px #00d2c844;">
+                ▶ Start Accumulator
+            </button>
+            <button onclick="sellAccumulator()" id="accu-sell-btn" class="btn btn-ghost" style="padding:16px;font-size:14px;font-weight:900;border-radius:10px;display:none;">
+                💰 Sell Now (Take Profit)
+            </button>
+        </div>
+
+        <!-- Transaction history -->
+        <div class="card" style="padding:14px;">
+            <div style="font-size:10px;font-weight:700;color:var(--muted);text-transform:uppercase;margin-bottom:10px;">📋 Accumulator History</div>
+            <div style="display:flex;padding:6px 0;border-bottom:1px solid var(--border);font-size:10px;font-weight:700;color:var(--muted);">
+                <div style="width:80px;">Market</div>
+                <div style="flex:1;">Growth</div>
+                <div style="width:80px;">Stake</div>
+                <div style="width:80px;">Ticks</div>
+                <div style="width:100px;text-align:right;">Profit/Loss</div>
+            </div>
+            <div id="accu-history" style="display:flex;flex-direction:column;gap:2px;max-height:200px;overflow-y:auto;">
+                <div style="font-size:11px;color:var(--dim);text-align:center;padding:16px;">No accumulator trades yet</div>
+            </div>
+        </div>
+
+        <!-- Risk warning -->
+        <div style="margin-top:12px;padding:12px;background:#ff444f14;border:1px solid #ff444f44;border-radius:8px;">
+            <p style="font-size:10px;color:#f87171;line-height:1.6;">⚠️ <b>Accumulator Risk:</b> Your entire stake is lost if the price moves outside the barrier on ANY tick. The longer you hold, the higher the risk. Always use Take Profit and never hold indefinitely.</p>
+        </div>
     </div>
 </div>
 
