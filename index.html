@@ -949,7 +949,26 @@ body{padding-bottom:60px;}
 
                 <div style="margin-bottom:10px;">
                     <div style="font-size:9px;color:var(--green);font-weight:700;text-transform:uppercase;margin-bottom:4px;">Take Profit (USD)</div>
-                    <input type="number" id="accu-tp" value="10.00" step="1" style="color:var(--green);">
+                    <input type="number" id="accu-tp" value="0.10" step="0.10" min="0.10" style="color:var(--green);">
+                </div>
+
+                <!-- Auto mode toggle -->
+                <div style="background:var(--bg);border:1px solid var(--teal);border-radius:8px;padding:10px;margin-bottom:10px;">
+                    <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:6px;">
+                        <div>
+                            <div style="font-size:11px;font-weight:900;color:var(--teal);">🤖 Auto Mode</div>
+                            <div style="font-size:9px;color:var(--muted);">Auto-restarts after every TP hit</div>
+                        </div>
+                        <div onclick="toggleAccuAuto()" id="accu-auto-track"
+                             style="width:44px;height:24px;border-radius:20px;background:var(--border);cursor:pointer;position:relative;transition:.3s;flex-shrink:0;">
+                            <div id="accu-auto-thumb"
+                                 style="position:absolute;left:3px;top:3px;width:18px;height:18px;background:#fff;border-radius:50%;transition:.3s;"></div>
+                        </div>
+                    </div>
+                    <div id="accu-auto-stats" style="display:none;font-size:10px;color:var(--muted);">
+                        Sessions: <b id="accu-sessions" style="color:var(--teal);">0</b> &nbsp;|&nbsp;
+                        Total P/L: <b id="accu-total-pl" style="color:var(--green);">$0.00</b>
+                    </div>
                 </div>
 
                 <!-- Profit calculator -->
@@ -992,9 +1011,25 @@ body{padding-bottom:60px;}
                 ▶ Start Accumulator
             </button>
             <button onclick="sellAccumulator()" id="accu-sell-btn" class="btn btn-ghost" style="padding:16px;font-size:14px;font-weight:900;border-radius:10px;display:none;">
-                💰 Sell Now (Take Profit)
+                💰 Sell Now
             </button>
         </div>
+        <!-- Auto mode status bar -->
+        <div id="accu-auto-bar" style="display:none;background:#00d2c818;border:1px solid #00d2c844;border-radius:8px;padding:10px 14px;margin-bottom:14px;display:none;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:8px;">
+            <div style="display:flex;align-items:center;gap:8px;">
+                <span style="width:8px;height:8px;border-radius:50%;background:var(--teal);display:inline-block;animation:pulse-dot 1s infinite;"></span>
+                <span style="font-size:12px;font-weight:700;color:var(--teal);">🤖 AUTO MODE RUNNING</span>
+            </div>
+            <div style="display:flex;gap:14px;font-size:11px;color:var(--muted);">
+                <span>Sessions: <b id="accu-auto-sessions" style="color:var(--teal);">0</b></span>
+                <span>TP Hits: <b id="accu-tp-hits" style="color:var(--green);">0</b></span>
+                <span>Total P/L: <b id="accu-auto-pl" style="color:var(--green);">$0.00</b></span>
+            </div>
+            <button onclick="stopAccuAuto()" class="btn btn-red" style="font-size:11px;padding:5px 14px;">⬛ Stop Auto</button>
+        </div>
+        <style>
+            @keyframes pulse-dot { 0%,100%{opacity:1;} 50%{opacity:.4;} }
+        </style>
 
         <!-- Transaction history -->
         <div class="card" style="padding:14px;">

@@ -1,5 +1,4 @@
 // ================================================================
-// ================================================================
 // BTRADERHUB app.js — Clean Focused Build
 // Auth: Amy-verified PKCE (DO NOT CHANGE)
 // ================================================================
@@ -3497,7 +3496,7 @@ function toggleAccumulator() {
         if (stake < 1) { notify("Invalid Stake", "Minimum accumulator stake is $1.", 'err'); return; }
 
         accuRunning       = true;
-        accuTickCount     = 0;
+        accuTickCount     = 0;  // reset to 0 for this contract
         accuCurrentProfit = 0;
 
         if (btn)     { btn.textContent = '⬛ Stop Accumulator'; btn.classList.remove('btn-teal'); btn.classList.add('btn-red'); }
@@ -3620,3 +3619,164 @@ function addAccuHistory(market, growth, stake, ticks, profit, isWin) {
 
 // Wire into routeMsg for accumulator proposal + contract updates
 // handled in existing proposal and proposal_open_contract handlers
+
+// ================================================================
+// ACCUMULATOR AUTO MODE
+// Auto-restarts after every TP hit — keeps compounding
+// ================================================================
+
+let accuAutoEnabled  = false;
+let accuSessions     = 0;
+let accuTpHits       = 0;
+let accuTotalPL      = 0;
+let accuAutoRunning  = false;
+
+function toggleAccuAuto() {
+    accuAutoEnabled = !accuAutoEnabled;
+    const track = document.getElementById('accu-auto-track');
+    const thumb = document.getElementById('accu-auto-thumb');
+    const stats = document.getElementById('accu-auto-stats');
+    const bar   = document.getElementById('accu-auto-bar');
+
+    if (track) track.style.background = accuAutoEnabled ? 'var(--teal)' : 'var(--border)';
+    if (thumb) thumb.style.left       = accuAutoEnabled ? '23px' : '3px';
+    if (stats) stats.style.display    = accuAutoEnabled ? 'block' : 'none';
+    if (bar)   bar.style.display      = accuAutoEnabled && accuAutoRunning ? 'flex' : 'none';
+
+    log(`🤖 Accumulator Auto Mode: ${accuAutoEnabled ? 'ON' : 'OFF'}`, 'i');
+    if (accuAutoEnabled) {
+        notify('🤖 Auto Mode ON', `Bot will auto-restart after every TP hit.\nTP: $${document.getElementById('accu-tp')?.value || 0.10} per session`, 'ok');
+    }
+}
+
+function stopAccuAuto() {
+    accuAutoEnabled  = false;
+    accuAutoRunning  = false;
+    const track = document.getElementById('accu-auto-track');
+    const thumb = document.getElementById('accu-auto-thumb');
+    const bar   = document.getElementById('accu-auto-bar');
+    if (track) track.style.background = 'var(--border)';
+    if (thumb) thumb.style.left       = '3px';
+    if (bar)   bar.style.display      = 'none';
+
+    // Stop current contract if running
+    if (accuRunning) sellAccumulator();
+    log(`🤖 Auto Mode stopped. Sessions: ${accuSessions} | TP Hits: ${accuTpHits} | Total P/L: $${accuTotalPL.toFixed(2)}`, 'i');
+    notify('🤖 Auto Mode Stopped', `Sessions: ${accuSessions} | TP Hits: ${accuTpHits} | Total P/L: $${accuTotalPL.toFixed(2)}`, 'ok');
+}
+
+function updateAccuAutoStats() {
+    const set = (id, val, col) => {
+        const el = document.getElementById(id);
+        if (el) { el.textContent = val; if (col) el.style.color = col; }
+    };
+    set('accu-sessions',      accuSessions);
+    set('accu-auto-sessions', accuSessions);
+    set('accu-tp-hits',       accuTpHits);
+    set('accu-total-pl',      `$${accuTotalPL.toFixed(2)}`, accuTotalPL >= 0 ? 'var(--green)' : 'var(--red)');
+    set('accu-auto-pl',       `$${accuTotalPL.toFixed(2)}`, accuTotalPL >= 0 ? 'var(--green)' : 'var(--red)');
+}
+
+// Override handleAccuContractUpdate to support auto mode
+const _origHandleAccu = handleAccuContractUpdate;
+handleAccuContractUpdate = function(c) {
+    if (!c) return;
+
+    // Update tick count and profit display
+    const tickEl   = document.getElementById('accu-tick-count');
+    const profitEl = document.getElementById('accu-current-profit');
+    const infoEl   = document.getElementById('accu-contract-info');
+
+    // Use current_spot_count (ticks since contract started) not tick_count (market window)
+    const myTicks = c.current_spot_count
+                 || c.audit_details?.contract_start?.length
+                 || (c.entry_tick && c.exit_tick ? Math.abs(c.exit_tick - c.entry_tick) : null)
+                 || accuTickCount;
+
+    if (tickEl && myTicks !== undefined && myTicks !== null) {
+        accuTickCount = parseInt(myTicks) || accuTickCount;
+        tickEl.textContent = accuTickCount;
+        tickEl.style.color = accuTickCount > 15 ? 'var(--green)' : accuTickCount > 5 ? 'var(--amber)' : 'var(--teal)';
+    }
+    if (c.profit !== undefined) {
+        accuCurrentProfit = parseFloat(c.profit);
+        if (profitEl) {
+            profitEl.textContent = `$${accuCurrentProfit.toFixed(2)}`;
+            profitEl.style.color = accuCurrentProfit >= 0 ? 'var(--green)' : 'var(--red)';
+        }
+    }
+    if (infoEl && c.contract_id) {
+        infoEl.innerHTML = `
+            <div style="font-size:11px;">Contract: <b style="color:var(--teal);">#${c.contract_id}</b></div>
+            <div style="font-size:11px;">Growth Rate: <b style="color:var(--teal);">${((accuGrowthRate||0.02)*100)}%</b></div>
+            <div style="font-size:11px;">Ticks: <b style="color:var(--green);">${accuTickCount}</b></div>`;
+    }
+
+    // Contract settled (sold or knocked out)
+    if (c.is_sold || c.is_expired) {
+        const profit = parseFloat(c.profit || 0);
+        const stake  = parseFloat(document.getElementById('accu-stake')?.value || 1);
+        const isWin  = profit > 0;
+        const tp     = parseFloat(document.getElementById('accu-tp')?.value || 0.10);
+
+        // Get final tick count from contract — check all possible fields
+        const finalTicks = c.current_spot_count
+                        || c.number_of_ticks
+                        || accuTickCount
+                        || 0;
+        accuTickCount = parseInt(finalTicks) || accuTickCount;
+        log(`📊 Accu settled: ticks=${accuTickCount} | current_spot_count=${c.current_spot_count} | number_of_ticks=${c.number_of_ticks}`, 'd');
+
+        // Update auto stats
+        accuSessions++;
+        accuTotalPL += profit;
+        if (isWin && profit >= tp) accuTpHits++;
+        updateAccuAutoStats();
+
+        // Add to history
+        addAccuHistory(accuMarket, accuGrowthRate, stake, accuTickCount, profit, isWin);
+
+        log(`${isWin ? '✅' : '❌'} Accumulator ${isWin?'sold':'knocked out'} | ${accuTickCount} ticks | P/L: $${profit.toFixed(2)} | Total: $${accuTotalPL.toFixed(2)}`, isWin ? 'w' : 'l');
+
+        if (isWin) { try { playWin(); } catch(e) {} }
+        else       { try { playLoss(); } catch(e) {} }
+
+        // Reset UI
+        resetAccuUI();
+        if (profitEl) { profitEl.textContent = `$${profit.toFixed(2)}`; profitEl.style.color = isWin ? 'var(--green)' : 'var(--red)'; }
+
+        // AUTO MODE — restart after TP hit or after any settled contract
+        if (accuAutoEnabled) {
+            if (isWin) {
+                notify('✅ TP Hit — Auto Restarting!', `+$${profit.toFixed(2)} | Session ${accuSessions} | Total: $${accuTotalPL.toFixed(2)}`, 'ok');
+                log(`🤖 Auto restart in 1 second... (Session ${accuSessions + 1})`, 'i');
+                // Auto restart after short delay
+                setTimeout(() => {
+                    if (accuAutoEnabled && derivWS && derivWS.readyState === WebSocket.OPEN) {
+                        accuAutoRunning = true;
+                        const bar = document.getElementById('accu-auto-bar');
+                        if (bar) bar.style.display = 'flex';
+                        toggleAccumulator();
+                    }
+                }, 1500);
+            } else {
+                // Knocked out — notify but also auto restart if still enabled
+                notify('💥 Knocked Out — Auto Restarting!', `Lost $${Math.abs(profit).toFixed(2)} | Total: $${accuTotalPL.toFixed(2)}`, 'warn');
+                log(`🤖 Knocked out! Auto restarting in 2 seconds...`, 'x');
+                setTimeout(() => {
+                    if (accuAutoEnabled && derivWS && derivWS.readyState === WebSocket.OPEN) {
+                        accuAutoRunning = true;
+                        toggleAccumulator();
+                    }
+                }, 2000);
+            }
+        } else {
+            // Manual mode notification
+            notify(
+                isWin ? '💰 Accumulator Profit!' : '💥 Accumulator Knocked Out!',
+                `${accuTickCount} ticks | P/L: ${isWin?'+':''}$${profit.toFixed(2)}`,
+                isWin ? 'ok' : 'err'
+            );
+        }
+    }
+};
