@@ -3687,14 +3687,22 @@ handleAccuContractUpdate = function(c) {
     const profitEl = document.getElementById('accu-current-profit');
     const infoEl   = document.getElementById('accu-contract-info');
 
-    // Use current_spot_count (ticks since contract started) not tick_count (market window)
-    const myTicks = c.current_spot_count
-                 || c.audit_details?.contract_start?.length
-                 || (c.entry_tick && c.exit_tick ? Math.abs(c.exit_tick - c.entry_tick) : null)
-                 || accuTickCount;
+    // Count ticks ourselves — increment on every contract update message
+    // Deriv sends proposal_open_contract on every tick while contract is active
+    if (!c.is_sold && !c.is_expired && accuContractId && c.contract_id === accuContractId) {
+        accuTickCount++;
+    }
 
-    if (tickEl && myTicks !== undefined && myTicks !== null) {
-        accuTickCount = parseInt(myTicks) || accuTickCount;
+    // On settlement, use the most reliable source available
+    if (c.is_sold || c.is_expired) {
+        accuTickCount = c.current_spot_count
+                     || c.number_of_ticks
+                     || c.tick_count_remaining !== undefined ? (c.tick_count - (c.tick_count_remaining||0)) : null
+                     || accuTickCount;
+        accuTickCount = parseInt(accuTickCount) || accuTickCount;
+    }
+
+    if (tickEl) {
         tickEl.textContent = accuTickCount;
         tickEl.style.color = accuTickCount > 15 ? 'var(--green)' : accuTickCount > 5 ? 'var(--amber)' : 'var(--teal)';
     }
