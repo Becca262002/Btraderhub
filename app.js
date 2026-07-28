@@ -3589,12 +3589,6 @@ function handleAccuContractUpdate(c) {
         if (isWin) { try { playWin(); } catch(e) {} }
         else       { try { playLoss(); } catch(e) {} }
 
-        notify(
-            isWin ? '💰 Accumulator Profit!' : '💥 Accumulator Knocked Out!',
-            `${accuTickCount} ticks | P/L: ${isWin?'+':''}$${profit.toFixed(2)}`,
-            isWin ? 'ok' : 'err'
-        );
-
         resetAccuUI();
         if (profitEl) { profitEl.textContent = `$${profit.toFixed(2)}`; profitEl.style.color = isWin ? 'var(--green)' : 'var(--red)'; }
     }
