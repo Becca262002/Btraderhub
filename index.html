@@ -595,6 +595,9 @@ body{padding-bottom:60px;}
 
         <!-- SUMMARY panel -->
         <div id="panel-summary" style="flex:1;overflow-y:auto;padding:16px;">
+            <div style="display:flex;justify-content:flex-end;margin-bottom:10px;">
+                <button onclick="resetBotStats()" class="btn btn-ghost" style="font-size:11px;padding:5px 14px;">🔄 Reset Stats</button>
+            </div>
             <div style="display:grid;grid-template-columns:1fr 1fr;gap:10px;margin-bottom:14px;">
                 <div class="card-sm" style="padding:12px;">
                     <div style="font-size:9px;color:var(--muted);text-transform:uppercase;font-weight:700;margin-bottom:6px;">Win Rate</div>
@@ -795,22 +798,46 @@ body{padding-bottom:60px;}
         </div>
 
         <!-- Stats pills -->
-        <div style="display:grid;grid-template-columns:repeat(4,1fr);gap:8px;margin-bottom:16px;">
+        <div style="display:grid;grid-template-columns:repeat(2,1fr);gap:8px;margin-bottom:12px;">
             <div class="card-sm" style="padding:10px;text-align:center;">
-                <div style="font-size:9px;color:var(--muted);margin-bottom:4px;">Hot Digit</div>
+                <div style="font-size:9px;color:var(--muted);margin-bottom:4px;">🔥 Hot Digit</div>
                 <div id="d-hot" style="font-size:22px;font-weight:900;color:var(--green);">—</div>
             </div>
             <div class="card-sm" style="padding:10px;text-align:center;">
-                <div style="font-size:9px;color:var(--muted);margin-bottom:4px;">Cold Digit</div>
+                <div style="font-size:9px;color:var(--muted);margin-bottom:4px;">❄️ Cold Digit</div>
                 <div id="d-cold" style="font-size:22px;font-weight:900;color:var(--red);">—</div>
             </div>
-            <div class="card-sm" style="padding:10px;text-align:center;">
-                <div style="font-size:9px;color:var(--green);margin-bottom:4px;">Even %</div>
-                <div id="d-even" style="font-size:18px;font-weight:900;">—</div>
+        </div>
+
+        <!-- Even/Odd bar -->
+        <div class="card-sm" style="padding:12px;margin-bottom:10px;">
+            <div style="display:flex;justify-content:space-between;margin-bottom:6px;">
+                <span style="font-size:11px;font-weight:900;color:var(--green);">Even <span id="d-even">—</span></span>
+                <span style="font-size:11px;font-weight:900;color:var(--red);">Odd <span id="d-odd">—</span></span>
             </div>
-            <div class="card-sm" style="padding:10px;text-align:center;">
-                <div style="font-size:9px;color:var(--teal);margin-bottom:4px;">Over 4 %</div>
-                <div id="d-over" style="font-size:18px;font-weight:900;">—</div>
+            <div style="height:10px;border-radius:5px;overflow:hidden;display:flex;">
+                <div id="d-even-bar" style="height:100%;background:var(--green);transition:width .5s;width:50%;border-radius:5px 0 0 5px;"></div>
+                <div id="d-odd-bar"  style="height:100%;background:var(--red);transition:width .5s;width:50%;border-radius:0 5px 5px 0;"></div>
+            </div>
+            <div style="display:flex;justify-content:space-between;margin-top:4px;">
+                <span style="font-size:9px;color:var(--muted);">Even digits: 0,2,4,6,8</span>
+                <span style="font-size:9px;color:var(--muted);">Odd digits: 1,3,5,7,9</span>
+            </div>
+        </div>
+
+        <!-- Over/Under bar -->
+        <div class="card-sm" style="padding:12px;margin-bottom:16px;">
+            <div style="display:flex;justify-content:space-between;margin-bottom:6px;">
+                <span style="font-size:11px;font-weight:900;color:var(--teal);">Over 4 <span id="d-over">—</span></span>
+                <span style="font-size:11px;font-weight:900;color:var(--purple-light);">Under 5 <span id="d-under">—</span></span>
+            </div>
+            <div style="height:10px;border-radius:5px;overflow:hidden;display:flex;">
+                <div id="d-over-bar"  style="height:100%;background:var(--teal);transition:width .5s;width:50%;border-radius:5px 0 0 5px;"></div>
+                <div id="d-under-bar" style="height:100%;background:#9f7aea;transition:width .5s;width:50%;border-radius:0 5px 5px 0;"></div>
+            </div>
+            <div style="display:flex;justify-content:space-between;margin-top:4px;">
+                <span style="font-size:9px;color:var(--muted);">Digits 5,6,7,8,9</span>
+                <span style="font-size:9px;color:var(--muted);">Digits 0,1,2,3,4</span>
             </div>
         </div>
 
@@ -830,7 +857,10 @@ body{padding-bottom:60px;}
                 <h2 style="font-size:16px;font-weight:900;">🧠 AI Market Scanner</h2>
                 <p style="font-size:11px;color:var(--muted);margin-top:2px;">Real-time market analysis. Signals based on actual Deriv tick data — no guessing.</p>
             </div>
-            <button onclick="runFullScan()" class="btn btn-amber" style="font-size:12px;padding:8px 20px;">🔍 Scan All Markets</button>
+            <div style="display:flex;gap:8px;">
+                <button onclick="showStrategyGuide()" class="btn btn-ghost" style="font-size:12px;padding:8px 16px;">📖 Strategy Guide</button>
+                <button onclick="runFullScan()" class="btn btn-amber" style="font-size:12px;padding:8px 20px;">🔍 Scan All Markets</button>
+            </div>
         </div>
 
         <!-- Professional Strategy Signals — PRIORITY -->
@@ -1086,8 +1116,25 @@ body{padding-bottom:60px;}
             <button onclick="filterMT5('volatility',this)" class="btn btn-ghost" style="font-size:11px;padding:5px 14px;">📊 Volatility</button>
         </div>
 
-        <!-- Signals grid -->
-        <div id="mt5-signals-grid" style="display:grid;grid-template-columns:repeat(auto-fill,minmax(260px,1fr));gap:12px;"></div>
+        <!-- COMING SOON banner -->
+        <div style="background:linear-gradient(135deg,#00d2c818,#9f7aea18);border:2px dashed #00d2c844;border-radius:14px;padding:40px;text-align:center;margin-bottom:16px;">
+            <div style="font-size:40px;margin-bottom:12px;">🚀</div>
+            <div style="font-size:22px;font-weight:900;color:var(--teal);margin-bottom:8px;">MT5 Direct Trading — Coming Soon!</div>
+            <div style="font-size:13px;color:var(--muted);margin-bottom:16px;max-width:500px;margin-left:auto;margin-right:auto;">We are building full MT5 integration so you can trade CFDs, Forex, Crypto and Commodities directly on Btraderhub without leaving the platform.</div>
+            <div style="display:flex;gap:10px;justify-content:center;flex-wrap:wrap;margin-bottom:16px;">
+                <span class="badge badge-teal">💱 Forex</span>
+                <span class="badge badge-purple">₿ Crypto</span>
+                <span class="badge badge-amber">🥇 Commodities</span>
+                <span class="badge badge-blue">📈 Indices</span>
+                <span class="badge badge-green">🚀 Boom &amp; Crash</span>
+            </div>
+            <button class="btn btn-teal" style="padding:12px 32px;font-size:14px;font-weight:900;border-radius:10px;" onclick="notify('🔔 Coming Soon!','We will notify you when MT5 direct trading is live on Btraderhub!','ok')">
+                🔔 Notify Me When Live
+            </button>
+        </div>
+
+        <!-- Signals grid (hidden until MT5 ready) -->
+        <div id="mt5-signals-grid" style="display:grid;grid-template-columns:repeat(auto-fill,minmax(260px,1fr));gap:12px;opacity:0.4;pointer-events:none;"></div>
 
         <!-- Disclaimer -->
         <div style="margin-top:20px;padding:12px;background:var(--bg2);border:1px solid var(--border);border-radius:8px;">
@@ -1111,6 +1158,86 @@ body{padding-bottom:60px;}
         </div>
     </div>
     <button id="run-btn" onclick="toggleBot()" class="btn btn-run" style="font-size:13px;font-weight:900;padding:10px 28px;">▶ Run</button>
+</div>
+
+<!-- Strategy Guide Modal -->
+<div id="strategy-modal" style="display:none;position:fixed;inset:0;z-index:99999;background:#000000cc;align-items:center;justify-content:center;padding:16px;">
+    <div style="background:var(--bg2);border:1px solid var(--border);border-radius:14px;width:100%;max-width:720px;max-height:88vh;display:flex;flex-direction:column;overflow:hidden;">
+        <div style="padding:16px 20px;border-bottom:1px solid var(--border);display:flex;align-items:center;justify-content:space-between;flex-shrink:0;">
+            <h2 style="font-size:16px;font-weight:900;">📖 AI Scanner Strategy Guide</h2>
+            <button onclick="closeStrategyGuide()" style="background:none;border:none;color:var(--muted);cursor:pointer;font-size:20px;">✕</button>
+        </div>
+        <div style="flex:1;overflow-y:auto;padding:20px;font-size:12px;line-height:1.7;color:var(--muted);">
+
+            <h3 style="color:var(--teal);font-size:14px;margin-bottom:8px;">🧠 How the AI Scanner Works</h3>
+            <p style="margin-bottom:12px;">The AI Scanner analyses real Deriv tick data (last 1000 ticks per market) and calculates probabilities for each trade type. It uses Bollinger Bands, RSI, digit frequency analysis and price momentum to generate signals.</p>
+
+            <div style="background:var(--bg);border-radius:8px;padding:14px;margin-bottom:14px;">
+                <h4 style="color:var(--blue);margin-bottom:6px;">📊 OVER/UNDER STRATEGIES</h4>
+
+                <p style="color:#e2e8f0;font-weight:700;margin-bottom:4px;">Over 1,2,3 Strategy:</p>
+                <ul style="margin:0 0 10px 16px;">
+                    <li>Digits 0,1,2,3 should all be below 10% (red/yellow bars among them)</li>
+                    <li>At least 2 of digits 4-9 should be above 11% (green/blue bars)</li>
+                    <li><b style="color:var(--teal);">Entry:</b> Wait for the least appearing digit among 1,2,3 to appear → next tick enters if digit 4-9 appears</li>
+                </ul>
+
+                <p style="color:#e2e8f0;font-weight:700;margin-bottom:4px;">Under 8,7,6 Strategy:</p>
+                <ul style="margin:0 0 10px 16px;">
+                    <li>Digits 6,7,8,9 should all be below 10% (red/yellow bars among them)</li>
+                    <li>At least 2 of digits 0-5 should be above 11% (green/blue bars)</li>
+                    <li><b style="color:var(--teal);">Entry:</b> Wait for the least appearing among 6,7,8 → next tick enter if digit 0-4 appears</li>
+                </ul>
+            </div>
+
+            <div style="background:var(--bg);border-radius:8px;padding:14px;margin-bottom:14px;">
+                <h4 style="color:var(--purple);margin-bottom:6px;">🔵 EVEN/ODD STRATEGIES</h4>
+
+                <p style="color:#e2e8f0;font-weight:700;margin-bottom:4px;">Odd Strategy:</p>
+                <ul style="margin:0 0 10px 16px;">
+                    <li>🟢 Green bar + 🔵 Blue bar both on ODD digits (1,3,5,7,9) at 11%+</li>
+                    <li>🔴 Red bar ≤ 8.6% + 🟡 Yellow bar ≤ 9.5% both on EVEN digits</li>
+                    <li><b style="color:var(--teal);">Entry:</b> Wait for least even digit (R/Y) to appear → then 2 consecutive odds in next 5 ticks → enter</li>
+                    <li>⚠️ Stop after 3-7 wins and re-check market conditions</li>
+                </ul>
+
+                <p style="color:#e2e8f0;font-weight:700;margin-bottom:4px;">Even Strategy:</p>
+                <ul style="margin:0 0 10px 16px;">
+                    <li>🟢 Green bar + 🔵 Blue bar both on EVEN digits (0,2,4,6,8) at 11%+</li>
+                    <li>🔴 Red bar ≤ 8.6% + 🟡 Yellow bar ≤ 9.5%</li>
+                    <li><b style="color:var(--teal);">Entry:</b> Wait for odd digit among R/Y to appear → even digit within next 3 ticks → enter</li>
+                    <li>⚠️ Stop after 3-7 wins and re-check market conditions</li>
+                </ul>
+            </div>
+
+            <div style="background:var(--bg);border-radius:8px;padding:14px;margin-bottom:14px;">
+                <h4 style="color:var(--green);margin-bottom:6px;">📈 ONLY UPS / ONLY DOWNS (BB + RSI)</h4>
+                <ul style="margin:0 0 8px 16px;">
+                    <li><b style="color:var(--green);">Only Ups:</b> RSI 48-68 + price above BB middle + bands expanding + 60%+ upward momentum → 2-3 ticks</li>
+                    <li><b style="color:var(--red);">Only Downs:</b> RSI 32-52 + price below BB middle + bands expanding + 60%+ downward momentum → 2-3 ticks</li>
+                </ul>
+            </div>
+
+            <div style="background:var(--bg);border-radius:8px;padding:14px;margin-bottom:14px;">
+                <h4 style="color:var(--amber);margin-bottom:6px;">🎨 BAR COLOR KEY</h4>
+                <div style="display:grid;grid-template-columns:1fr 1fr;gap:6px;">
+                    <div style="display:flex;align-items:center;gap:8px;"><span style="width:12px;height:12px;border-radius:50%;background:var(--green);display:inline-block;"></span> <span>GREEN = Most appearing digit</span></div>
+                    <div style="display:flex;align-items:center;gap:8px;"><span style="width:12px;height:12px;border-radius:50%;background:var(--blue);display:inline-block;"></span> <span>BLUE = 2nd most appearing</span></div>
+                    <div style="display:flex;align-items:center;gap:8px;"><span style="width:12px;height:12px;border-radius:50%;background:var(--amber);display:inline-block;"></span> <span>YELLOW = 2nd least appearing</span></div>
+                    <div style="display:flex;align-items:center;gap:8px;"><span style="width:12px;height:12px;border-radius:50%;background:var(--red);display:inline-block;"></span> <span>RED = Least appearing digit</span></div>
+                </div>
+            </div>
+
+            <div style="background:var(--bg);border-radius:8px;padding:14px;">
+                <h4 style="color:var(--teal);margin-bottom:6px;">⚠️ DIFFERS &amp; MATCHES (Coming from AI)</h4>
+                <p style="margin-bottom:6px;"><b style="color:var(--red);">Differs [Red Bar]:</b> Trade when the last digit DIFFERS from your prediction. Best when red bar digit is consistently appearing — fade it by choosing Differs.</p>
+                <p><b style="color:var(--green);">Matches [Green Bar]:</b> Trade when the last digit MATCHES your prediction. Best when green bar digit is appearing 14%+ (well above expected 10%) — ride the hot digit.</p>
+            </div>
+        </div>
+        <div style="padding:14px 20px;border-top:1px solid var(--border);flex-shrink:0;">
+            <button onclick="closeStrategyGuide()" class="btn btn-teal" style="width:100%;padding:10px;font-size:13px;font-weight:700;">Got it! ✅</button>
+        </div>
+    </div>
 </div>
 
 <script src="app.js"></script>

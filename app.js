@@ -2286,18 +2286,35 @@ function getTopSignals(symbol, n = 5) {
         if (risePct < 45) signals.push({ direction:'Only Downs', confidence:upsConf, type:'only_ups_downs', botDirection:'downs', color:'var(--amber)', pred:null, ticks:3, reason:`Momentum ${(100-risePct).toFixed(0)}% downward (collecting BB/RSI data)` });
     }
 
-    // ── MATCHES — only show at 95%+ confidence ──
+    // ── MATCHES [Green Bar] — digit appearing far above 10% ──
     const ranked = counts.map((c,d)=>({d,c})).sort((a,b)=>b.c-a.c);
     ranked.slice(0,3).forEach(({d,c}) => {
         const pct  = (c/total)*100;
-        const conf = Math.round(pct * 6.5); // 95% conf needs ~14.6% frequency
+        const conf = Math.round(pct * 6.5);
         if (conf >= 95) {
             signals.push({
                 direction:`Matches ${d}`,
                 confidence: Math.min(99, conf),
                 type:'over_under', botDirection:'over',
-                color:'var(--amber)', pred:d,
-                reason:`🔥 Digit ${d} at ${pct.toFixed(1)}% — far above expected 10%`
+                color:'var(--green)', pred:d,
+                reason:`🟢 [Matches] Hot digit ${d} at ${pct.toFixed(1)}% — ride the green bar`
+            });
+        }
+    });
+
+    // ── DIFFERS [Red Bar] — least appearing digit, fade it ──
+    // Differs wins when last digit ≠ prediction
+    // Best when red bar digit is consistently cold (below 7%)
+    ranked.slice(-2).forEach(({d,c}) => {
+        const pct  = (c/total)*100;
+        const conf = Math.round((10 - pct) * 9); // lower % = higher differs confidence
+        if (conf >= 75 && pct < 8) {
+            signals.push({
+                direction:`Differs ${d}`,
+                confidence: Math.min(92, conf),
+                type:'over_under', botDirection:'over',
+                color:'var(--red)', pred:d,
+                reason:`🔴 [Differs] Cold digit ${d} at ${pct.toFixed(1)}% — fade the red bar`
             });
         }
     });
@@ -2806,11 +2823,57 @@ function updateDigitStats(symbol) {
     const data   = digitData[symbol] || { counts: new Array(10).fill(0), ticks: 0 };
     const counts = data.counts;
     const total  = Math.max(data.ticks, 1);
-    const even   = counts.filter((_,i) => i%2===0).reduce((a,b)=>a+b,0);
-    const over   = counts.slice(5).reduce((a,b)=>a+b,0);
-    const set    = (id,v) => { const el=document.getElementById(id); if(el) el.textContent=v; };
-    set('d-even', `${((even/total)*100).toFixed(1)}%`);
-    set('d-over', `${((over/total)*100).toFixed(1)}%`);
+
+    const even     = counts.filter((_,i) => i%2===0).reduce((a,b)=>a+b,0);
+    const odd      = total - even;
+    const over     = counts.slice(5).reduce((a,b)=>a+b,0);
+    const under    = total - over;
+
+    const evenPct  = parseFloat(((even/total)*100).toFixed(1));
+    const oddPct   = parseFloat(((odd/total)*100).toFixed(1));
+    const overPct  = parseFloat(((over/total)*100).toFixed(1));
+    const underPct = parseFloat(((under/total)*100).toFixed(1));
+
+    const set = (id,v) => { const el=document.getElementById(id); if(el) el.textContent=v; };
+
+    // Update text values
+    set('d-even',  `${evenPct}%`);
+    set('d-odd',   `${oddPct}%`);
+    set('d-over',  `${overPct}%`);
+    set('d-under', `${underPct}%`);
+
+    // Update Even/Odd bar widths
+    const evenBar  = document.getElementById('d-even-bar');
+    const oddBar   = document.getElementById('d-odd-bar');
+    if (evenBar) evenBar.style.width = `${evenPct}%`;
+    if (oddBar)  oddBar.style.width  = `${oddPct}%`;
+
+    // Color the higher side green, lower side red
+    if (evenBar && oddBar) {
+        if (evenPct > oddPct) {
+            evenBar.style.background = 'var(--green)';
+            oddBar.style.background  = 'var(--red)';
+        } else {
+            evenBar.style.background = 'var(--red)';
+            oddBar.style.background  = 'var(--green)';
+        }
+    }
+
+    // Update Over/Under bar widths
+    const overBar  = document.getElementById('d-over-bar');
+    const underBar = document.getElementById('d-under-bar');
+    if (overBar)  overBar.style.width  = `${overPct}%`;
+    if (underBar) underBar.style.width = `${underPct}%`;
+
+    if (overBar && underBar) {
+        if (overPct > underPct) {
+            overBar.style.background  = 'var(--green)';
+            underBar.style.background = 'var(--red)';
+        } else {
+            overBar.style.background  = 'var(--red)';
+            underBar.style.background = 'var(--green)';
+        }
+    }
 }
 
 // ================================================================
@@ -2881,6 +2944,48 @@ function log(text, type='d') {
 function clearJournal() {
     const el = document.getElementById('journal-log');
     if (el) el.innerHTML = '<div class="jline d">[Cleared]</div>';
+}
+
+function resetBotStats() {
+    totalPL       = 0;
+    totalRuns     = 0;
+    totalWins     = 0;
+    totalLosses   = 0;
+    totalStake    = 0;
+    totalPayout   = 0;
+    currentStreak = 0;
+    consecutiveLosses = 0;
+    sessionBasePL = 0;
+    currentStake  = parseFloat(document.getElementById('bot-stake')?.value || 1);
+    baseStake     = currentStake;
+
+    // Clear transaction list
+    const txList = document.getElementById('tx-list');
+    if (txList) txList.innerHTML = '<div style="font-size:11px;color:var(--dim);text-align:center;padding:30px;">No transactions yet.</div>';
+
+    updateAllStats();
+    log('🔄 Stats reset by user', 'i');
+    notify('🔄 Stats Reset', 'All trading stats have been cleared.', 'ok');
+}
+
+function resetAccuHistory() {
+    accuSessions  = 0;
+    accuTpHits    = 0;
+    accuTotalPL   = 0;
+    updateAccuAutoStats();
+    const h = document.getElementById('accu-history');
+    if (h) h.innerHTML = '<div style="font-size:11px;color:var(--dim);text-align:center;padding:16px;">No accumulator trades yet</div>';
+    notify('🔄 Accumulator History Reset', 'History cleared.', 'ok');
+}
+
+function showStrategyGuide() {
+    const modal = document.getElementById('strategy-modal');
+    if (modal) { modal.style.display = 'flex'; document.body.style.overflow = 'hidden'; }
+}
+
+function closeStrategyGuide() {
+    const modal = document.getElementById('strategy-modal');
+    if (modal) { modal.style.display = 'none'; document.body.style.overflow = ''; }
 }
 
 // ================================================================
