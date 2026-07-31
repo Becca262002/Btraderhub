@@ -187,20 +187,46 @@ window.addEventListener('load', async () => {
     onTypeChange();
     updateInfoBar();
 
-    // Start public WebSocket immediately for digit stats (no auth needed)
+    // Start public WebSocket for digit stats
     connectPublicWS();
 
-    // Check for access token set by callback.html after server-side exchange
-    const savedToken = sessionStorage.getItem('deriv_access_token');
-    if (savedToken) {
-        sessionStorage.removeItem('deriv_access_token');
-        sessionStorage.removeItem('deriv_token_expiry');
-        accessToken = savedToken;
-        showStatus("Token received. Loading accounts...", 'info');
-        await loadAccounts();
+    const params     = new URLSearchParams(window.location.search);
+    const code       = params.get('code');
+    const oauthState = params.get('state');
+
+    if (code && oauthState) {
+        // Fresh OAuth callback
+        try { window.history.replaceState({}, document.title, window.location.pathname); } catch(e) {}
+        await handleOAuthCallback(code, oauthState);
+
+    } else {
+        // Check for token set by callback.html
+        const cbToken = sessionStorage.getItem('deriv_access_token');
+        if (cbToken) {
+            sessionStorage.removeItem('deriv_access_token');
+            sessionStorage.removeItem('deriv_token_expiry');
+            accessToken = cbToken;
+            showStatus("Connecting...", 'info');
+            await loadAccounts();
+
+        } else {
+            // Auto-reconnect from saved token (stays logged in for 30 days)
+            const savedToken     = localStorage.getItem('bth_access_token');
+            const savedAccountId = localStorage.getItem('bth_account_id');
+            const connectedAt    = parseInt(localStorage.getItem('bth_connected_at') || '0');
+            const ageHours       = (Date.now() - connectedAt) / 3600000;
+
+            if (savedToken && ageHours < 720) {
+                accessToken = savedToken;
+                if (savedAccountId) accountId = savedAccountId;
+                showStatus("Reconnecting to your account...", 'info');
+                log("🔄 Auto-reconnecting from saved session...", 'i');
+                await loadAccounts();
+            }
+        }
     }
 
-    // Show risk disclaimer on first visit (merged here to avoid duplicate load events)
+    // Show risk disclaimer on first visit
     if (!localStorage.getItem('risk-accepted')) {
         setTimeout(() => {
             showLegal('risk');
@@ -212,7 +238,7 @@ window.addEventListener('load', async () => {
             };
         }, 1500);
     }
-});
+});;
 
 // ================================================================
 // TAB & PANEL NAVIGATION
@@ -458,6 +484,7 @@ async function loadAccounts() {
 async function switchAccount(newId) {
     if (newId === accountId) return;
     accountId = newId;
+    localStorage.setItem('bth_account_id', newId);
     log("Switching account...", 'i');
     if (derivWS) { derivWS.close(); derivWS = null; }
     activeTickSubs.clear();
@@ -523,6 +550,13 @@ function scheduleReconnect() {
 }
 
 function onConnected() {
+    // Save token to localStorage so user stays logged in
+    if (accessToken) {
+        localStorage.setItem('bth_access_token', accessToken);
+        localStorage.setItem('bth_account_id',   accountId || '');
+        localStorage.setItem('bth_connected_at',  Date.now().toString());
+    }
+
     // Hide login/signup buttons, show account UI
     const btnLogin  = document.getElementById('btn-login');
     const btnSignup = document.getElementById('btn-signup');
@@ -2939,6 +2973,43 @@ function log(text, type='d') {
     container.appendChild(line);
     container.scrollTop = container.scrollHeight;
     if (container.children.length > 500) container.removeChild(container.firstChild);
+}
+
+function revokeAccess() {
+    // Clear all saved tokens and disconnect
+    localStorage.removeItem('bth_access_token');
+    localStorage.removeItem('bth_account_id');
+    localStorage.removeItem('bth_connected_at');
+    sessionStorage.clear();
+
+    // Close WebSocket
+    if (derivWS) { derivWS.close(); derivWS = null; }
+    if (publicWS) { publicWS.close(); publicWS = null; }
+
+    accessToken = null;
+    accountId   = null;
+    allAccounts = [];
+
+    // Reset UI
+    const btnLogin  = document.getElementById('btn-login');
+    const btnSignup = document.getElementById('btn-signup');
+    if (btnLogin)  btnLogin.style.display  = 'block';
+    if (btnSignup) btnSignup.style.display = 'block';
+
+    const aw = document.getElementById('acct-wrap');
+    if (aw) aw.style.display = 'none';
+
+    const authCard = document.getElementById('auth-card');
+    if (authCard) authCard.style.display = 'block';
+
+    const ds = document.getElementById('dash-stats');
+    if (ds) ds.style.display = 'none';
+
+    updateConnStatus(false);
+    switchTab('dashboard');
+
+    notify('✅ Disconnected', 'Your Deriv account has been disconnected. You can reconnect anytime.', 'ok');
+    log('🔓 Access revoked — token cleared', 'i');
 }
 
 function clearJournal() {
