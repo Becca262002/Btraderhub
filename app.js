@@ -470,11 +470,8 @@ async function loadAccounts() {
             });
         }
 
-        // Real account appears first — then demo
-        const real = allAccounts.find(a => a.account_type === 'real');
-        const demo = allAccounts.find(a => a.account_type === 'demo');
-        const preferred = real || demo || allAccounts[0];
-        accountId  = preferred.account_id;
+        const demo = allAccounts.find(a => a.account_type === 'demo') || allAccounts[0];
+        accountId  = demo.account_id;
         if (sw) sw.value = accountId;
 
         await openWS();
@@ -3666,30 +3663,16 @@ function toggleAccumulator() {
         return;
     }
 
-    // If waiting for great entry, cancel
-    if (accuWaiting) { cancelWaiting(); return; }
-
     const btn = document.getElementById('accu-run-btn');
     const sellBtn = document.getElementById('accu-sell-btn');
 
     if (!accuRunning) {
         const stake = parseFloat(document.getElementById('accu-stake')?.value || 1);
-        const tp    = parseFloat(document.getElementById('accu-tp')?.value || 0.10);
+        const tp    = parseFloat(document.getElementById('accu-tp')?.value || 10);
         if (stake < 1) { notify("Invalid Stake", "Minimum accumulator stake is $1.", 'err'); return; }
 
-        // Check if entry signal is good before starting
-        const entrySignal = getAccuEntryQuality(accuMarket);
-        if (entrySignal === 'bad') {
-            notify('⚠️ Poor Entry Conditions', 'Market volatility is too high right now.
-Waiting for GREAT ENTRY signal...', 'warn');
-            log('⏳ Waiting for great entry conditions...', 'x');
-            // Start watching for great entry
-            startWatchingForGreatEntry(stake, tp);
-            return;
-        }
-
         accuRunning       = true;
-        accuTickCount     = 0;
+        accuTickCount     = 0;  // reset to 0 for this contract
         accuCurrentProfit = 0;
 
         if (btn)     { btn.textContent = '⬛ Stop Accumulator'; btn.classList.remove('btn-teal'); btn.classList.add('btn-red'); }
@@ -3808,78 +3791,15 @@ function addAccuHistory(market, growth, stake, ticks, profit, isWin) {
 // handled in existing proposal and proposal_open_contract handlers
 
 // ================================================================
-// ACCUMULATOR ENTRY QUALITY CHECK
-// ================================================================
-
-function getAccuEntryQuality(sym) {
-    const mm  = marketMemory[sym] || { prices: [] };
-    const rsi = mm.prices.length >= 15 ? calcRSI(mm.prices, 14) : null;
-    const bb  = mm.prices.length >= 20 ? calcBollingerBands(mm.prices, 20, 2) : null;
-    const volMap = { R_10:15, R_25:30, R_50:50, R_75:75, R_100:90, '1HZ10V':35, '1HZ25V':50, '1HZ50V':65, '1HZ75V':80, '1HZ100V':95 };
-    const volScore = volMap[sym] || 50;
-
-    if (!rsi || !bb) return 'loading';
-
-    const goodEntry = rsi > 40 && rsi < 60 && bb.bandwidth < 0.2 && volScore < 50;
-    const okEntry   = rsi > 35 && rsi < 65 && bb.bandwidth < 0.35 && volScore < 70;
-
-    if (goodEntry) return 'great';
-    if (okEntry)   return 'ok';
-    return 'bad';
-}
-
-let accuWatchInterval = null;
-let accuWaiting       = false;
-
-function startWatchingForGreatEntry(stake, tp) {
-    if (accuWatchInterval) clearInterval(accuWatchInterval);
-    accuWaiting = true;
-
-    // Update run button to show waiting state
-    const btn = document.getElementById('accu-run-btn');
-    if (btn) { btn.textContent = '⏳ Waiting for Great Entry...'; btn.style.opacity = '0.7'; }
-
-    log('⏳ Watching for GREAT ENTRY signal...', 'i');
-
-    accuWatchInterval = setInterval(() => {
-        if (!accuWaiting) { clearInterval(accuWatchInterval); return; }
-
-        const quality = getAccuEntryQuality(accuMarket);
-        log(`📊 Entry quality: ${quality.toUpperCase()}`, 'd');
-
-        if (quality === 'great') {
-            clearInterval(accuWatchInterval);
-            accuWaiting = false;
-            const btn = document.getElementById('accu-run-btn');
-            if (btn) { btn.textContent = '▶ Start Accumulator'; btn.style.opacity = '1'; }
-            notify('✅ Great Entry Found!', 'Market conditions are perfect. Starting accumulator now!', 'ok');
-            log('✅ GREAT ENTRY detected — starting accumulator!', 'w');
-            // Auto start
-            toggleAccumulator();
-        }
-    }, 3000); // check every 3 seconds
-}
-
-// Stop watching if user clicks run button again
-function cancelWaiting() {
-    if (accuWatchInterval) clearInterval(accuWatchInterval);
-    accuWaiting = false;
-    const btn = document.getElementById('accu-run-btn');
-    if (btn) { btn.textContent = '▶ Start Accumulator'; btn.style.opacity = '1'; }
-    log('❌ Entry watch cancelled', 'x');
-}
-
-// ================================================================
 // ACCUMULATOR AUTO MODE
 // Auto-restarts after every TP hit — keeps compounding
 // ================================================================
 
-let accuAutoEnabled    = false;
-let accuSessions       = 0;
-let accuTpHits         = 0;
-let accuTotalPL        = 0;
-let accuAutoRunning    = false;
-let accuNotifFired     = false; // prevents duplicate notifications
+let accuAutoEnabled  = false;
+let accuSessions     = 0;
+let accuTpHits       = 0;
+let accuTotalPL      = 0;
+let accuAutoRunning  = false;
 
 function toggleAccuAuto() {
     accuAutoEnabled = !accuAutoEnabled;
@@ -4000,14 +3920,13 @@ handleAccuContractUpdate = function(c) {
         else       { try { playLoss(); } catch(e) {} }
 
         // Reset UI
-        // Note: notifications handled by auto mode override below
         resetAccuUI();
         if (profitEl) { profitEl.textContent = `$${profit.toFixed(2)}`; profitEl.style.color = isWin ? 'var(--green)' : 'var(--red)'; }
 
         // AUTO MODE — restart after TP hit or after any settled contract
         if (accuAutoEnabled) {
             if (isWin) {
-                if (!accuNotifFired) { accuNotifFired = true; notify('✅ TP Hit — Auto Restarting!', `+$${profit.toFixed(2)} | Session ${accuSessions} | Total: $${accuTotalPL.toFixed(2)}`, 'ok'); setTimeout(()=>{accuNotifFired=false;},3000); }
+                notify('✅ TP Hit — Auto Restarting!', `+$${profit.toFixed(2)} | Session ${accuSessions} | Total: $${accuTotalPL.toFixed(2)}`, 'ok');
                 log(`🤖 Auto restart in 1 second... (Session ${accuSessions + 1})`, 'i');
                 // Auto restart after short delay
                 setTimeout(() => {
@@ -4015,25 +3934,12 @@ handleAccuContractUpdate = function(c) {
                         accuAutoRunning = true;
                         const bar = document.getElementById('accu-auto-bar');
                         if (bar) bar.style.display = 'flex';
-                        // In auto mode, wait for great entry before restarting
-                        const quality = getAccuEntryQuality(accuMarket);
-                        if (quality === 'great' || quality === 'ok') {
-                            toggleAccumulator();
-                        } else {
-                            log('⏳ Auto mode: waiting for great entry before next session...', 'i');
-                            const stake = parseFloat(document.getElementById('accu-stake')?.value || 1);
-                            const tp    = parseFloat(document.getElementById('accu-tp')?.value || 0.10);
-                            startWatchingForGreatEntry(stake, tp);
-                        }
+                        toggleAccumulator();
                     }
                 }, 1500);
             } else {
                 // Knocked out — notify but also auto restart if still enabled
-                if (!accuNotifFired) {
-                accuNotifFired = true;
                 notify('💥 Knocked Out — Auto Restarting!', `Lost $${Math.abs(profit).toFixed(2)} | Total: $${accuTotalPL.toFixed(2)}`, 'warn');
-                setTimeout(() => { accuNotifFired = false; }, 3000);
-            }
                 log(`🤖 Knocked out! Auto restarting in 2 seconds...`, 'x');
                 setTimeout(() => {
                     if (accuAutoEnabled && derivWS && derivWS.readyState === WebSocket.OPEN) {
