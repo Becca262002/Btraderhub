@@ -528,6 +528,11 @@ async function openWS() {
             updateConnStatus(false);
             clearInterval(pingInterval);
             log("WS closed. Will reconnect...", 'x');
+            // If Auto Mode was running, pause it (do not lose settings) and notify —
+            // per spec, connection loss should stop Auto Mode automatically.
+            if (accuAutoEnabled) {
+                stopAccuAuto('connection_lost');
+            }
             scheduleReconnect();
         };
 
@@ -649,7 +654,14 @@ function routeMsg(r) {
             log(`❌ Proposal rejected: ${r.error.message}`, 'x');
             log(`   Code: ${r.error.code} | Check market symbol and contract params`, 'x');
             // If accumulator proposal failed
-            if (accuRunning) { notify("Accumulator Error", r.error.message, 'err'); resetAccuUI(); }
+            if (accuRunning) {
+                accuRunning = false;
+                notify("Accumulator Error", r.error.message, 'err');
+                resetAccuUI();
+                // Don't silently keep retrying auto mode against a rejected proposal —
+                // stop it and surface the error instead of looping forever.
+                if (accuAutoEnabled) stopAccuAuto('api_error');
+            }
         } else if (r.proposal) {
             // Accumulator proposal — buy immediately
             if (r.proposal.contract_type === 'ACCU' || accuRunning) {
@@ -909,14 +921,14 @@ function connectPublicWS() {
                 runBotLogic(d, data.tick.quote);
             }
 
-            // Update accumulator live price display
+            // Update accumulator live price display + drive multi-factor analysis
             if (sym === accuMarket) {
                 const priceEl = document.getElementById('accu-price');
                 const digitEl = document.getElementById('accu-last-digit');
                 if (priceEl) priceEl.textContent = data.tick.quote;
                 if (digitEl) digitEl.textContent = `Last digit: ${d}`;
-                // Update analysis every 10 ticks
-                if (st.ticks % 10 === 0) updateAccuAnalysis(sym);
+                // Update analysis every 5 ticks — more responsive multi-factor engine
+                if (st.ticks % 5 === 0) updateAccuAnalysis(sym);
             }
         }
     };
@@ -1192,6 +1204,9 @@ function handleBuyResponse(r) {
     // Handle accumulator buy separately
     if (accuRunning && r.buy && !r.error) {
         accuContractId = r.buy.contract_id;
+        // Reset the per-contract settlement guard for this brand-new contract
+        accuSettledContractIds.delete(accuContractId);
+        accuTickCount = 0;
         log(`✅ Accumulator #${accuContractId} started | Buy price: $${r.buy.buy_price}`, 'w');
         notify('📈 Accumulator Running!', `Contract started. Growth: ${(accuGrowthRate*100)}% per tick. Sell anytime!`, 'ok');
         // Subscribe to contract updates
@@ -1934,6 +1949,91 @@ function calcBollingerBands(prices, period = 20, multiplier = 2) {
         stdDev: parseFloat(stdDev.toFixed(5)),
         bandwidth: parseFloat(((multiplier * 2 * stdDev / sma) * 100).toFixed(2))
     };
+}
+
+// ── EMA (Exponential Moving Average) — used by the accumulator trend filter ──
+function calcEMA(prices, period) {
+    if (!prices || prices.length < period) return null;
+    const k = 2 / (period + 1);
+    // Seed with SMA of the first `period` values
+    let ema = prices.slice(0, period).reduce((a,b) => a+b, 0) / period;
+    for (let i = period; i < prices.length; i++) {
+        ema = prices[i] * k + ema * (1 - k);
+    }
+    return ema;
+}
+
+// ── ATR (Average True Range) approximation from tick data ──
+// Real ATR needs OHLC bars. Ticks only give us a price stream, so we
+// approximate "true range" per tick as the absolute price change from the
+// previous tick — this is a reasonable proxy for short-horizon volatility
+// on synthetic indices, which move on every tick rather than in bars.
+function calcATR(prices, period = 14) {
+    if (!prices || prices.length < period + 1) return null;
+    const recent = prices.slice(-(period + 1));
+    let sum = 0;
+    for (let i = 1; i < recent.length; i++) sum += Math.abs(recent[i] - recent[i-1]);
+    return sum / period;
+}
+
+// ── ADX (Average Directional Index) approximation from tick data ──
+// Standard ADX needs high/low/close bars. We approximate directional
+// movement using consecutive tick-to-tick price changes as a simplified
+// +DM/-DM proxy, smoothed with Wilder's method. This gives a workable
+// 0-100 trend-strength reading for a continuous tick stream.
+function calcADX(prices, period = 14) {
+    if (!prices || prices.length < period * 2) return null;
+    const plusDM = [], minusDM = [], tr = [];
+    for (let i = 1; i < prices.length; i++) {
+        const change = prices[i] - prices[i-1];
+        plusDM.push(change > 0 ? change : 0);
+        minusDM.push(change < 0 ? Math.abs(change) : 0);
+        tr.push(Math.abs(change) || 1e-9);
+    }
+    const smooth = (arr, p) => {
+        const out = [];
+        let sum = arr.slice(0, p).reduce((a,b)=>a+b, 0);
+        out.push(sum);
+        for (let i = p; i < arr.length; i++) {
+            sum = sum - (sum / p) + arr[i];
+            out.push(sum);
+        }
+        return out;
+    };
+    const smTR    = smooth(tr, period);
+    const smPlus  = smooth(plusDM, period);
+    const smMinus = smooth(minusDM, period);
+    const dx = [];
+    for (let i = 0; i < smTR.length; i++) {
+        const plusDI  = (smPlus[i]  / smTR[i]) * 100;
+        const minusDI = (smMinus[i] / smTR[i]) * 100;
+        const sumDI   = plusDI + minusDI;
+        dx.push(sumDI === 0 ? 0 : (Math.abs(plusDI - minusDI) / sumDI) * 100);
+    }
+    if (dx.length < period) return null;
+    const adxSeries = dx.slice(-period);
+    const adx = adxSeries.reduce((a,b)=>a+b, 0) / adxSeries.length;
+    return parseFloat(adx.toFixed(1));
+}
+
+// ── Tick stability — analyse the last 100 ticks for smoothness ──
+function calcTickStability(prices) {
+    if (!prices || prices.length < 10) return null;
+    const recent = prices.slice(-100);
+    const moves  = [];
+    for (let i = 1; i < recent.length; i++) moves.push(Math.abs(recent[i] - recent[i-1]));
+    if (moves.length === 0) return null;
+    const avgMove = moves.reduce((a,b)=>a+b, 0) / moves.length;
+    const variance = moves.reduce((s,m) => s + Math.pow(m - avgMove, 2), 0) / moves.length;
+    const stdDev   = Math.sqrt(variance);
+    // A "jump" is a move more than 3x the average tick move
+    const jumpThreshold = avgMove * 3;
+    const jumps    = moves.filter(m => m > jumpThreshold).length;
+    const jumpFreq = jumps / moves.length; // 0..1
+    // Stability score: lower relative std dev + fewer jumps = higher score
+    const relStd   = avgMove > 0 ? stdDev / avgMove : 0;
+    const score    = Math.max(0, Math.min(100, 100 - (relStd * 40) - (jumpFreq * 300)));
+    return { avgMove, stdDev, jumpFreq, jumps, sampleSize: moves.length, score: Math.round(score) };
 }
 
 function generateOnlyUpsDownsSignal(symbol) {
@@ -3042,16 +3142,6 @@ function resetBotStats() {
     notify('🔄 Stats Reset', 'All trading stats have been cleared.', 'ok');
 }
 
-function resetAccuHistory() {
-    accuSessions  = 0;
-    accuTpHits    = 0;
-    accuTotalPL   = 0;
-    updateAccuAutoStats();
-    const h = document.getElementById('accu-history');
-    if (h) h.innerHTML = '<div style="font-size:11px;color:var(--dim);text-align:center;padding:16px;">No accumulator trades yet</div>';
-    notify('🔄 Accumulator History Reset', 'History cleared.', 'ok');
-}
-
 function showStrategyGuide() {
     const modal = document.getElementById('strategy-modal');
     if (modal) { modal.style.display = 'flex'; document.body.style.overflow = 'hidden'; }
@@ -3544,6 +3634,25 @@ let accuCurrentProfit = 0;
 let accuMarket       = 'R_10';
 let accuAnalysisTimer = null;
 
+// Idempotency guard — Deriv can (and does) send more than one
+// proposal_open_contract update for the same settled contract. Without this
+// guard the settlement branch below would run twice for one trade, which is
+// what caused duplicate TP/Loss notifications and double-counted stats, and
+// could also knock Auto Mode into an inconsistent state (looking like it
+// "stopped unexpectedly"). We only ever process a given contract_id's
+// settlement once.
+let accuSettledContractIds = new Set();
+
+// Rolling bandwidth history per market — used to detect a BB squeeze
+// followed by a healthy expansion (the "compression → breakout" filter).
+let accuBandwidthHistory = {};
+
+// Cache of the latest confidence breakdown per market so the history table
+// and any future "trade analytics" view can reference exactly what the
+// engine saw when a trade was opened.
+let accuLastConfidence = {};
+let accuTradeAnalytics = []; // log of factors for every completed trade
+
 function onAccuMarketChange(sym) {
     accuMarket = sym;
     updateAccuAnalysis(sym);
@@ -3564,46 +3673,187 @@ function selectAccuGrowth(rate, btn) {
     updateAccuProfitCalc();
 }
 
+// ================================================================
+// MULTI-FACTOR ACCUMULATOR CONFIDENCE ENGINE
+// Combines Trend (EMA/ADX), Volatility, Bollinger Bands, RSI, ATR and
+// Tick Stability into a single weighted confidence score (0-100%).
+// Weighting: Trend 25% | Volatility 20% | RSI 15% | BB 15% | ATR 15% | Tick Stability 10%
+// ================================================================
+function calcAccuConfidence(sym) {
+    const mm = marketMemory[sym] || { prices: [] };
+    const prices = mm.prices || [];
+
+    if (prices.length < 30) {
+        return { ready: false, ticksNeeded: 30 - prices.length };
+    }
+
+    const last  = prices[prices.length - 1];
+    const ema20 = calcEMA(prices, 20);
+    const ema50 = calcEMA(prices, Math.min(50, prices.length - 1));
+    const adx   = calcADX(prices, 14);
+    const rsi   = calcRSI(prices, 14);
+    const bb    = calcBollingerBands(prices, 20, 2);
+    const atr   = calcATR(prices, 14);
+    const stab  = calcTickStability(prices);
+
+    // ── 1) TREND FILTER (25%) — EMA20 > EMA50, price above both, ADX 20-25+ ──
+    let trendScore = 0;
+    let emaTrendLabel = '—';
+    if (ema20 !== null && ema50 !== null) {
+        const emaAligned   = ema20 > ema50;
+        const priceAboveBoth = last > ema20 && last > ema50;
+        emaTrendLabel = emaAligned ? '📈 Bullish (EMA20>50)' : '📉 Bearish (EMA20<50)';
+        if (emaAligned && priceAboveBoth) trendScore += 60;
+        else if (emaAligned || priceAboveBoth) trendScore += 25;
+        if (adx !== null) {
+            if (adx >= 25) trendScore += 40;
+            else if (adx >= 20) trendScore += 28;
+            else if (adx >= 15) trendScore += 12;
+        }
+    }
+    trendScore = Math.min(100, trendScore);
+
+    // ── 2) VOLATILITY FILTER (20%) — stable, smooth ticks, no spikes ──
+    let volScore = 0;
+    if (stab) {
+        // Reuse tick-stability score as the volatility-smoothness proxy —
+        // "stable, smooth, no sudden spikes" is exactly what that measures.
+        volScore = stab.score;
+    }
+
+    // ── 3) RSI FILTER (15%) — high-probability zone 52-65, avoid >70 or <45 ──
+    let rsiScore = 0;
+    if (rsi !== null) {
+        if (rsi > 70 || rsi < 45) rsiScore = 0;
+        else if (rsi >= 52 && rsi <= 65) rsiScore = 100;
+        else if (rsi > 45 && rsi < 52) rsiScore = 55; // approaching the zone
+        else if (rsi > 65 && rsi <= 70) rsiScore = 40; // leaving the zone
+    }
+
+    // ── 4) BOLLINGER BAND FILTER (15%) — squeeze then healthy expansion, aligned with trend ──
+    let bbScore = 0;
+    if (bb) {
+        if (!accuBandwidthHistory[sym]) accuBandwidthHistory[sym] = [];
+        const hist = accuBandwidthHistory[sym];
+        hist.push(bb.bandwidth);
+        if (hist.length > 30) hist.shift();
+
+        const recentMin = Math.min(...hist);
+        const wasSqueezed = recentMin < 0.15; // saw a compression recently
+        const nowExpanding = bb.bandwidth > recentMin * 1.3 && bb.bandwidth > 0.15;
+        const trendUp = ema20 !== null && ema50 !== null && ema20 > ema50;
+        const alignedWithTrend = (trendUp && last > bb.middle) || (!trendUp && last < bb.middle);
+
+        if (wasSqueezed && nowExpanding && alignedWithTrend) bbScore = 100;
+        else if (wasSqueezed && nowExpanding) bbScore = 70;
+        else if (bb.bandwidth > 0.1 && bb.bandwidth < 0.4) bbScore = 45; // healthy, not extreme
+        else bbScore = 15;
+    }
+
+    // ── 5) ATR FILTER (15%) — avoid sudden spikes / abnormal highs / extreme lows ──
+    let atrScore = 0;
+    let atrLabel = '—';
+    if (atr !== null) {
+        if (!accuBandwidthHistory[sym + '_atr']) accuBandwidthHistory[sym + '_atr'] = [];
+        const atrHist = accuBandwidthHistory[sym + '_atr'];
+        atrHist.push(atr);
+        if (atrHist.length > 30) atrHist.shift();
+        const atrAvg = atrHist.reduce((a,b)=>a+b,0) / atrHist.length;
+        const ratio  = atrAvg > 0 ? atr / atrAvg : 1;
+        if (ratio >= 0.5 && ratio <= 2) { atrScore = 100; atrLabel = 'Normal range'; }
+        else if (ratio > 2 && ratio <= 3) { atrScore = 45; atrLabel = 'Elevated — caution'; }
+        else if (ratio > 3) { atrScore = 0; atrLabel = '⚠️ Spike — avoid'; }
+        else { atrScore = 30; atrLabel = 'Abnormally low'; }
+    }
+
+    // ── 6) TICK STABILITY FILTER (10%) — last 100 ticks smoothness ──
+    let stabilityScore = stab ? stab.score : 0;
+
+    // ── WEIGHTED CONFIDENCE SCORE ──
+    const weights = { trend: 0.25, vol: 0.20, rsi: 0.15, bb: 0.15, atr: 0.15, stability: 0.10 };
+    const score = Math.round(
+        trendScore      * weights.trend +
+        volScore        * weights.vol   +
+        rsiScore        * weights.rsi   +
+        bbScore         * weights.bb    +
+        atrScore        * weights.atr   +
+        stabilityScore  * weights.stability
+    );
+
+    let label, color, tradeOk;
+    if (score >= 90)      { label = '🟢 Excellent Entry'; color = 'var(--green)'; tradeOk = true;  }
+    else if (score >= 80) { label = '🟢 Great Entry';     color = 'var(--green)'; tradeOk = true;  }
+    else if (score >= 70) { label = '🟡 Good Entry';      color = 'var(--amber)'; tradeOk = true;  }
+    else                  { label = '🔴 No Trade';        color = 'var(--red)';   tradeOk = false; }
+
+    return {
+        ready: true, score, label, color, tradeOk,
+        ema20, ema50, emaTrendLabel, adx, rsi, bb, atr, atrLabel, stab,
+        breakdown: { trendScore, volScore, rsiScore, bbScore, atrScore, stabilityScore }
+    };
+}
+
 function updateAccuAnalysis(sym) {
-    const mm  = marketMemory[sym] || { prices: [] };
-    const rsi = mm.prices.length >= 15 ? calcRSI(mm.prices, 14) : null;
-    const bb  = mm.prices.length >= 20 ? calcBollingerBands(mm.prices, 20, 2) : null;
+    const conf = calcAccuConfidence(sym);
+    accuLastConfidence[sym] = conf;
 
-    // Volatility score based on BB width and market type
-    const volMap = { R_10:15, R_25:30, R_50:50, R_75:75, R_100:90, '1HZ10V':35, '1HZ25V':50, '1HZ50V':65, '1HZ75V':80, '1HZ100V':95 };
-    let volScore = volMap[sym] || 50;
+    const set = (id,v,col) => { const el=document.getElementById(id); if(el){ el.textContent=v; if(col) el.style.color=col; } };
 
-    // Adjust based on BB width
-    if (bb) volScore = Math.min(100, Math.round(volScore + bb.bandwidth * 20));
+    if (!conf.ready) {
+        set('accu-rsi', '—'); set('accu-rsi-label', 'Collecting...');
+        set('accu-bb-width', '—'); set('accu-bb-label', 'Collecting...');
+        set('accu-adx', '—'); set('accu-adx-label', 'Collecting...');
+        set('accu-ema-trend', '—');
+        set('accu-atr', '—');
+        set('accu-tick-stability', '—');
+        const sigBox = document.getElementById('accu-signal-box');
+        if (sigBox) sigBox.innerHTML = `<div style="font-size:11px;color:var(--muted);">Collecting data... need ${conf.ticksNeeded} more ticks</div>`;
+        // Volatility bar placeholder while collecting
+        const volMap = { R_10:15, R_25:30, R_50:50, R_75:75, R_100:90, '1HZ10V':35, '1HZ25V':50, '1HZ50V':65, '1HZ75V':80, '1HZ100V':95 };
+        const volScore = volMap[sym] || 50;
+        const volBar   = document.getElementById('accu-vol-bar');
+        const volLabel = document.getElementById('accu-vol-label');
+        if (volBar)   { volBar.style.width = volScore + '%'; volBar.style.background = volScore < 30 ? 'var(--green)' : volScore < 60 ? 'var(--amber)' : 'var(--red)'; }
+        if (volLabel) { volLabel.textContent = volScore < 30 ? 'Low ✅' : volScore < 60 ? 'Medium ⚠️' : 'High ❌'; volLabel.style.color = volBar ? volBar.style.background : ''; }
+        return;
+    }
 
-    // Volatility bar
+    // RSI
+    set('accu-rsi', conf.rsi ?? '—', conf.rsi > 70 ? 'var(--red)' : conf.rsi < 30 ? 'var(--green)' : '#60a5fa');
+    set('accu-rsi-label', conf.rsi > 70 ? 'Overbought' : conf.rsi < 30 ? 'Oversold' : (conf.rsi >= 52 && conf.rsi <= 65) ? 'Sweet spot' : 'Neutral');
+
+    // BB
+    if (conf.bb) {
+        set('accu-bb-width', conf.bb.bandwidth.toFixed(2) + '%', conf.bb.bandwidth < 0.1 ? 'var(--green)' : conf.bb.bandwidth < 0.3 ? 'var(--amber)' : 'var(--red)');
+        set('accu-bb-label', conf.bb.bandwidth < 0.1 ? 'Squeezing ✅' : conf.bb.bandwidth < 0.3 ? 'Normal ⚠️' : 'Wide ❌');
+    }
+
+    // ADX
+    set('accu-adx', conf.adx ?? '—', conf.adx >= 25 ? 'var(--green)' : conf.adx >= 20 ? 'var(--amber)' : 'var(--muted)');
+    set('accu-adx-label', conf.adx >= 25 ? 'Strong trend' : conf.adx >= 20 ? 'Building' : 'Weak/sideways');
+
+    // EMA trend
+    set('accu-ema-trend', conf.emaTrendLabel, conf.ema20 > conf.ema50 ? 'var(--green)' : 'var(--red)');
+
+    // ATR
+    set('accu-atr', conf.atr !== null ? conf.atr.toFixed(5) : '—', conf.breakdown.atrScore >= 70 ? 'var(--green)' : conf.breakdown.atrScore >= 40 ? 'var(--amber)' : 'var(--red)');
+
+    // Tick stability
+    if (conf.stab) {
+        set('accu-tick-stability', `${conf.stab.score}/100`, conf.stab.score >= 70 ? 'var(--green)' : conf.stab.score >= 40 ? 'var(--amber)' : 'var(--red)');
+    }
+
+    // Volatility meter — driven by the same volatility sub-score now
     const volBar   = document.getElementById('accu-vol-bar');
     const volLabel = document.getElementById('accu-vol-label');
-    if (volBar)   volBar.style.width = volScore + '%';
-    if (volBar)   volBar.style.background = volScore < 30 ? 'var(--green)' : volScore < 60 ? 'var(--amber)' : 'var(--red)';
-    if (volLabel) { volLabel.textContent = volScore < 30 ? 'Low ✅' : volScore < 60 ? 'Medium ⚠️' : 'High ❌'; volLabel.style.color = volScore < 30 ? 'var(--green)' : volScore < 60 ? 'var(--amber)' : 'var(--red)'; }
+    const volPct   = 100 - conf.breakdown.volScore; // invert: higher instability = higher bar
+    if (volBar)   { volBar.style.width = Math.max(5, volPct) + '%'; volBar.style.background = conf.breakdown.volScore >= 70 ? 'var(--green)' : conf.breakdown.volScore >= 40 ? 'var(--amber)' : 'var(--red)'; }
+    if (volLabel) { volLabel.textContent = conf.breakdown.volScore >= 70 ? 'Low ✅' : conf.breakdown.volScore >= 40 ? 'Medium ⚠️' : 'High ❌'; volLabel.style.color = volBar ? volBar.style.background : ''; }
 
-    // RSI display
-    const rsiEl    = document.getElementById('accu-rsi');
-    const rsiLabel = document.getElementById('accu-rsi-label');
-    if (rsi !== null && rsiEl) {
-        rsiEl.textContent  = rsi;
-        rsiEl.style.color  = rsi > 70 ? 'var(--red)' : rsi < 30 ? 'var(--green)' : '#60a5fa';
-        if (rsiLabel) rsiLabel.textContent = rsi > 70 ? 'Overbought' : rsi < 30 ? 'Oversold' : rsi > 50 ? 'Bullish' : 'Bearish';
-    }
-
-    // BB display
-    const bbWidthEl = document.getElementById('accu-bb-width');
-    const bbLabel   = document.getElementById('accu-bb-label');
-    if (bb && bbWidthEl) {
-        bbWidthEl.textContent = bb.bandwidth.toFixed(2) + '%';
-        bbWidthEl.style.color = bb.bandwidth < 0.1 ? 'var(--green)' : bb.bandwidth < 0.3 ? 'var(--amber)' : 'var(--red)';
-        if (bbLabel) bbLabel.textContent = bb.bandwidth < 0.1 ? 'Squeezing ✅' : bb.bandwidth < 0.3 ? 'Normal ⚠️' : 'Wide ❌';
-    }
-
-    // Safe ticks in a row
+    // Safe ticks in a row (kept for the "Live Price" card context)
     const safeTicks = document.getElementById('accu-safe-ticks');
-    if (safeTicks && mm.prices.length >= 5) {
+    const mm = marketMemory[sym];
+    if (safeTicks && mm && mm.prices.length >= 5) {
         const recent = mm.prices.slice(-20);
         let consecutive = 0;
         for (let i = recent.length-1; i > 0; i--) {
@@ -3615,30 +3865,28 @@ function updateAccuAnalysis(sym) {
         safeTicks.style.color = consecutive > 10 ? 'var(--green)' : consecutive > 5 ? 'var(--amber)' : 'var(--red)';
     }
 
-    // Entry signal
-    const sigBox  = document.getElementById('accu-signal-box');
+    // Entry signal / confidence score box
+    const sigBox    = document.getElementById('accu-signal-box');
     const growthRec = document.getElementById('accu-growth-rec');
     if (sigBox) {
-        if (!rsi || !bb) {
-            sigBox.innerHTML = '<div style="font-size:11px;color:var(--muted);">Collecting data... need 20+ ticks</div>';
-            return;
-        }
-        const goodEntry = rsi > 40 && rsi < 60 && bb.bandwidth < 0.2 && volScore < 50;
-        const okEntry   = rsi > 35 && rsi < 65 && bb.bandwidth < 0.35 && volScore < 70;
-        const color     = goodEntry ? 'var(--green)' : okEntry ? 'var(--amber)' : 'var(--red)';
-        const label     = goodEntry ? '✅ GREAT ENTRY' : okEntry ? '⚠️ OKAY ENTRY' : '❌ AVOID NOW';
-        const reason    = goodEntry
-            ? `RSI neutral (${rsi}) + Low BB width (${bb.bandwidth.toFixed(2)}%) + Low volatility`
-            : okEntry
-            ? `Conditions acceptable but monitor closely`
-            : `RSI ${rsi > 65 ? 'overbought' : 'oversold'} or volatility too high (${volScore}%)`;
-
+        const b = conf.breakdown;
         sigBox.innerHTML = `
-            <div style="font-size:16px;font-weight:900;color:${color};margin-bottom:6px;">${label}</div>
-            <div style="font-size:10px;color:var(--muted);">${reason}</div>`;
+            <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:6px;">
+                <div style="font-size:16px;font-weight:900;color:${conf.color};">${conf.label}</div>
+                <div style="font-size:20px;font-weight:900;color:${conf.color};">${conf.score}%</div>
+            </div>
+            <div class="pbar" style="margin-bottom:8px;"><div class="pbar-fill" style="width:${conf.score}%;background:${conf.color};"></div></div>
+            <div style="display:grid;grid-template-columns:1fr 1fr;gap:4px;font-size:9px;color:var(--muted);text-align:left;">
+                <div>Trend (25%): <b style="color:var(--text);">${Math.round(b.trendScore)}</b></div>
+                <div>Volatility (20%): <b style="color:var(--text);">${Math.round(b.volScore)}</b></div>
+                <div>RSI (15%): <b style="color:var(--text);">${Math.round(b.rsiScore)}</b></div>
+                <div>Bollinger (15%): <b style="color:var(--text);">${Math.round(b.bbScore)}</b></div>
+                <div>ATR (15%): <b style="color:var(--text);">${Math.round(b.atrScore)}</b></div>
+                <div>Tick Stability (10%): <b style="color:var(--text);">${Math.round(b.stabilityScore)}</b></div>
+            </div>`;
 
-        // Recommend growth rate
-        const recRate = volScore < 25 ? '3%' : volScore < 40 ? '2%' : '1%';
+        // Recommend growth rate based on the volatility sub-score
+        const recRate = b.volScore >= 75 ? '3%' : b.volScore >= 50 ? '2%' : '1%';
         if (growthRec) growthRec.textContent = `AI recommends: ${recRate} for this market`;
     }
 }
@@ -3677,12 +3925,11 @@ function toggleAccumulator() {
         const tp    = parseFloat(document.getElementById('accu-tp')?.value || 0.10);
         if (stake < 1) { notify("Invalid Stake", "Minimum accumulator stake is $1.", 'err'); return; }
 
-        // Check if entry signal is good before starting
-        const entrySignal = getAccuEntryQuality(accuMarket);
-        if (entrySignal === 'bad') {
-            notify('⚠️ Poor Entry Conditions', 'Market volatility is too high. Waiting for GREAT ENTRY signal...', 'warn');
-            log('⏳ Waiting for great entry conditions...', 'x');
-            // Start watching for great entry
+        // Check confidence score before starting
+        const conf = calcAccuConfidence(accuMarket);
+        if (conf.ready && !conf.tradeOk) {
+            notify('⚠️ Poor Entry Conditions', `Confidence ${conf.score}% (${conf.label}). Waiting for a better entry...`, 'warn');
+            log(`⏳ Waiting for a qualifying entry (current: ${conf.score}%)...`, 'x');
             startWatchingForGreatEntry(stake, tp);
             return;
         }
@@ -3707,7 +3954,7 @@ function toggleAccumulator() {
             req_id:            nextReqId()
         };
 
-        log(`📈 Accumulator proposal: ${MKT[accuMarket]||accuMarket} | Growth: ${(accuGrowthRate*100)}% | Stake: $${stake} | TP: $${tp}`, 'i');
+        log(`📈 Accumulator proposal: ${MKT[accuMarket]||accuMarket} | Growth: ${(accuGrowthRate*100)}% | Stake: $${stake} | TP: $${tp} | Confidence: ${conf.ready ? conf.score+'%' : 'n/a'}`, 'i');
         derivWS.send(JSON.stringify(proposal));
 
     } else {
@@ -3736,6 +3983,62 @@ function resetAccuUI() {
     if (sellBtn)  sellBtn.style.display = 'none';
     const info = document.getElementById('accu-contract-info');
     if (info) info.textContent = 'No active contract';
+}
+
+// ── FULL RESET — clears everything for a fresh Accumulator session
+// without reloading the page, similar to DBot's Reset button. ──
+function resetAccumulator() {
+    // Stop any running contract / watcher / auto mode first
+    if (accuWatchInterval) { clearInterval(accuWatchInterval); accuWatchInterval = null; }
+    accuWaiting = false;
+    if (accuAutoEnabled) {
+        // Silent stop — we're about to reset everything anyway
+        accuAutoEnabled = false;
+        const track = document.getElementById('accu-auto-track');
+        const thumb = document.getElementById('accu-auto-thumb');
+        const bar   = document.getElementById('accu-auto-bar');
+        if (track) track.style.background = 'var(--border)';
+        if (thumb) thumb.style.left       = '3px';
+        if (bar)   bar.style.display      = 'none';
+    }
+    accuAutoRunning = false;
+    if (accuRunning && accuContractId && derivWS && derivWS.readyState === WebSocket.OPEN) {
+        derivWS.send(JSON.stringify({ sell: accuContractId, price: 0, req_id: nextReqId() }));
+    }
+
+    // Reset session state
+    accuRunning        = false;
+    accuContractId     = null;
+    accuTickCount       = 0;
+    accuCurrentProfit   = 0;
+    accuSessions        = 0;
+    accuTpHits          = 0;
+    accuTotalPL         = 0;
+    accuNotifFired      = false;
+    accuSettledContractIds = new Set();
+    accuTradeAnalytics  = [];
+
+    // Reset UI
+    resetAccuUI();
+    updateAccuAutoStats();
+    const priceEl  = document.getElementById('accu-price');
+    const digitEl  = document.getElementById('accu-last-digit');
+    const tickEl   = document.getElementById('accu-tick-count');
+    const profitEl = document.getElementById('accu-current-profit');
+    if (priceEl)  priceEl.textContent  = '—';
+    if (digitEl)  digitEl.textContent  = 'Last digit: —';
+    if (tickEl)   tickEl.textContent   = '0';
+    if (profitEl) { profitEl.textContent = '$0.00'; profitEl.style.color = 'var(--green)'; }
+
+    const h = document.getElementById('accu-history');
+    if (h) h.innerHTML = '<div style="font-size:11px;color:var(--dim);text-align:center;padding:16px;">No accumulator trades yet</div>';
+
+    // Clear any leftover notification suppression keys for a clean slate
+    const btn = document.getElementById('accu-run-btn');
+    if (btn) { btn.style.opacity = '1'; }
+
+    log('🔄 Accumulator session reset — ready for a fresh start', 'i');
+    notify('🔄 Accumulator Reset', 'Session cleared. Profit/loss, history and counters are back to zero.', 'ok');
 }
 
 function handleAccuContractUpdate(c) {
@@ -3767,8 +4070,12 @@ function handleAccuContractUpdate(c) {
             <div style="font-size:11px;">Ticks: <b style="color:var(--green);">${accuTickCount}</b></div>`;
     }
 
-    // Contract settled
+    // Contract settled — this path is superseded by the idempotent override
+    // installed below, which is the one actually wired up at runtime.
     if (c.is_sold || c.is_expired) {
+        if (accuSettledContractIds.has(c.contract_id)) return; // already processed
+        accuSettledContractIds.add(c.contract_id);
+
         const profit   = parseFloat(c.profit || 0);
         const stake    = parseFloat(document.getElementById('accu-stake')?.value || 1);
         const isWin    = profit > 0;
@@ -3786,20 +4093,23 @@ function handleAccuContractUpdate(c) {
     }
 }
 
-function addAccuHistory(market, growth, stake, ticks, profit, isWin) {
+function addAccuHistory(market, growth, stake, ticks, profit, isWin, confidence) {
     const container = document.getElementById('accu-history');
     if (!container) return;
     const empty = container.querySelector('[style*="text-align:center"]');
     if (empty) empty.remove();
 
+    const confStr = (confidence !== undefined && confidence !== null) ? `${confidence}%` : '—';
+
     const row = document.createElement('div');
     row.style.cssText = `display:flex;align-items:center;padding:6px 0;border-bottom:1px solid var(--border);font-size:11px;`;
     row.innerHTML = `
-        <div style="width:80px;color:var(--muted);">${MKT[market]?.replace('Volatility','V')||market}</div>
+        <div style="width:70px;color:var(--muted);">${MKT[market]?.replace('Volatility','V')||market}</div>
         <div style="flex:1;color:var(--muted);">${(growth*100)}%</div>
-        <div style="width:80px;font-family:monospace;">$${stake.toFixed(2)}</div>
-        <div style="width:80px;color:var(--teal);">${ticks} ticks</div>
-        <div style="width:100px;text-align:right;font-weight:700;font-family:monospace;color:${isWin?'var(--green)':'var(--red)'};">${isWin?'+':''}$${profit.toFixed(2)}</div>`;
+        <div style="width:60px;font-family:monospace;">$${stake.toFixed(2)}</div>
+        <div style="width:60px;color:var(--teal);">${ticks}</div>
+        <div style="width:60px;color:var(--amber);">${confStr}</div>
+        <div style="width:90px;text-align:right;font-weight:700;font-family:monospace;color:${isWin?'var(--green)':'var(--red)'};">${isWin?'+':''}$${profit.toFixed(2)}</div>`;
     container.insertBefore(row, container.firstChild);
 }
 
@@ -3807,23 +4117,16 @@ function addAccuHistory(market, growth, stake, ticks, profit, isWin) {
 // handled in existing proposal and proposal_open_contract handlers
 
 // ================================================================
-// ACCUMULATOR ENTRY QUALITY CHECK
+// ACCUMULATOR ENTRY QUALITY CHECK — now backed by the multi-factor
+// confidence engine above. Kept as a thin wrapper for readability at
+// call sites and for backwards compatibility with existing code paths.
 // ================================================================
 
 function getAccuEntryQuality(sym) {
-    const mm  = marketMemory[sym] || { prices: [] };
-    const rsi = mm.prices.length >= 15 ? calcRSI(mm.prices, 14) : null;
-    const bb  = mm.prices.length >= 20 ? calcBollingerBands(mm.prices, 20, 2) : null;
-    const volMap = { R_10:15, R_25:30, R_50:50, R_75:75, R_100:90, '1HZ10V':35, '1HZ25V':50, '1HZ50V':65, '1HZ75V':80, '1HZ100V':95 };
-    const volScore = volMap[sym] || 50;
-
-    if (!rsi || !bb) return 'loading';
-
-    const goodEntry = rsi > 40 && rsi < 60 && bb.bandwidth < 0.2 && volScore < 50;
-    const okEntry   = rsi > 35 && rsi < 65 && bb.bandwidth < 0.35 && volScore < 70;
-
-    if (goodEntry) return 'great';
-    if (okEntry)   return 'ok';
+    const conf = calcAccuConfidence(sym);
+    if (!conf.ready) return 'loading';
+    if (conf.score >= 80) return 'great';
+    if (conf.score >= 70) return 'ok';
     return 'bad';
 }
 
@@ -3838,21 +4141,31 @@ function startWatchingForGreatEntry(stake, tp) {
     const btn = document.getElementById('accu-run-btn');
     if (btn) { btn.textContent = '⏳ Waiting for Great Entry...'; btn.style.opacity = '0.7'; }
 
-    log('⏳ Watching for GREAT ENTRY signal...', 'i');
+    log('⏳ Watching for a qualifying confidence score...', 'i');
 
     accuWatchInterval = setInterval(() => {
         if (!accuWaiting) { clearInterval(accuWatchInterval); return; }
 
-        const quality = getAccuEntryQuality(accuMarket);
-        log(`📊 Entry quality: ${quality.toUpperCase()}`, 'd');
+        const conf = calcAccuConfidence(accuMarket);
+        if (!conf.ready) { log('📊 Still collecting data for confidence score...', 'd'); return; }
 
-        if (quality === 'great') {
+        const threshold = parseFloat(document.getElementById('accu-conf-threshold')?.value || 85);
+        log(`📊 Confidence: ${conf.score}% (${conf.label}) — need ${threshold}%+ for Auto Mode, 70%+ for manual`, 'd');
+
+        // Manual (non-auto) start only needs "Good Entry" or better (tradeOk).
+        // Auto Mode is stricter and defers to the user's confidence threshold —
+        // that check happens where startWatchingForGreatEntry is called from
+        // the auto-restart path, via the threshold comparison here.
+        const isAutoRestart = accuAutoRunning;
+        const qualifies = isAutoRestart ? conf.score >= threshold : conf.tradeOk;
+
+        if (qualifies) {
             clearInterval(accuWatchInterval);
             accuWaiting = false;
             const btn = document.getElementById('accu-run-btn');
             if (btn) { btn.textContent = '▶ Start Accumulator'; btn.style.opacity = '1'; }
-            notify('✅ Great Entry Found!', 'Market conditions are perfect. Starting accumulator now!', 'ok');
-            log('✅ GREAT ENTRY detected — starting accumulator!', 'w');
+            notify('✅ Qualifying Entry Found!', `Confidence ${conf.score}% (${conf.label}). Starting accumulator now!`, 'ok');
+            log(`✅ Qualifying entry detected (${conf.score}%) — starting accumulator!`, 'w');
             // Auto start
             toggleAccumulator();
         }
@@ -3870,7 +4183,10 @@ function cancelWaiting() {
 
 // ================================================================
 // ACCUMULATOR AUTO MODE
-// Auto-restarts after every TP hit — keeps compounding
+// Runs continuously — entering a new trade whenever a qualifying signal
+// appears — until Take Profit, Stop Loss, manual stop, connection loss,
+// or an unrecoverable API error. See toggleAccuAuto / stopAccuAuto and the
+// idempotent settlement handler below for the restart / stop logic.
 // ================================================================
 
 let accuAutoEnabled    = false;
@@ -3894,13 +4210,18 @@ function toggleAccuAuto() {
 
     log(`🤖 Accumulator Auto Mode: ${accuAutoEnabled ? 'ON' : 'OFF'}`, 'i');
     if (accuAutoEnabled) {
-        notify('🤖 Auto Mode ON', `Bot will auto-restart after every TP hit.\nTP: $${document.getElementById('accu-tp')?.value || 0.10} per session`, 'ok');
+        const sl = parseFloat(document.getElementById('accu-sl')?.value || 0);
+        notify('🤖 Auto Mode ON', `Bot will trade continuously.\nTP: $${document.getElementById('accu-tp')?.value || 0.10} per session${sl > 0 ? ` | SL: -$${sl.toFixed(2)} total` : ''}`, 'ok');
     }
 }
 
-function stopAccuAuto() {
+// reason is optional — 'connection_lost' | 'api_error' | 'stop_loss' | undefined (manual)
+function stopAccuAuto(reason) {
     accuAutoEnabled  = false;
     accuAutoRunning  = false;
+    if (accuWatchInterval) { clearInterval(accuWatchInterval); accuWatchInterval = null; }
+    accuWaiting = false;
+
     const track = document.getElementById('accu-auto-track');
     const thumb = document.getElementById('accu-auto-thumb');
     const bar   = document.getElementById('accu-auto-bar');
@@ -3908,10 +4229,21 @@ function stopAccuAuto() {
     if (thumb) thumb.style.left       = '3px';
     if (bar)   bar.style.display      = 'none';
 
-    // Stop current contract if running
-    if (accuRunning) sellAccumulator();
-    log(`🤖 Auto Mode stopped. Sessions: ${accuSessions} | TP Hits: ${accuTpHits} | Total P/L: $${accuTotalPL.toFixed(2)}`, 'i');
-    notify('🤖 Auto Mode Stopped', `Sessions: ${accuSessions} | TP Hits: ${accuTpHits} | Total P/L: $${accuTotalPL.toFixed(2)}`, 'ok');
+    // Stop current contract if running (skip for connection loss — socket is already gone)
+    if (accuRunning && reason !== 'connection_lost') sellAccumulator();
+
+    const summary = `Sessions: ${accuSessions} | TP Hits: ${accuTpHits} | Total P/L: $${accuTotalPL.toFixed(2)}`;
+    log(`🤖 Auto Mode stopped${reason ? ' (' + reason + ')' : ''}. ${summary}`, 'i');
+
+    if (reason === 'stop_loss') {
+        notify('⛔ Stop Loss Reached', `Auto Mode stopped — Stop Loss hit.\n${summary}`, 'err');
+    } else if (reason === 'connection_lost') {
+        notify('📡 Connection Lost', `Auto Mode stopped — API connection dropped.\n${summary}`, 'err');
+    } else if (reason === 'api_error') {
+        notify('⚠️ API Error', `Auto Mode stopped — unrecoverable API error.\n${summary}`, 'err');
+    } else {
+        notify('🤖 Auto Mode Stopped', summary, 'ok');
+    }
 }
 
 function updateAccuAutoStats() {
@@ -3926,8 +4258,14 @@ function updateAccuAutoStats() {
     set('accu-auto-pl',       `$${accuTotalPL.toFixed(2)}`, accuTotalPL >= 0 ? 'var(--green)' : 'var(--red)');
 }
 
-// Override handleAccuContractUpdate to support auto mode
-const _origHandleAccu = handleAccuContractUpdate;
+// Idempotent, single source of truth for accumulator settlement.
+// Every proposal_open_contract update for a settled contract is routed
+// here; accuSettledContractIds ensures we only act on it ONCE no matter
+// how many duplicate update messages Deriv sends for the same contract_id.
+// This is also what fixes "Auto Mode stops unexpectedly" — before this
+// guard, a duplicate settlement message could re-enter the settlement
+// branch, sell/reset state a second time, and desync accuRunning from
+// what the UI showed, silently breaking the restart chain.
 handleAccuContractUpdate = function(c) {
     if (!c) return;
 
@@ -3944,11 +4282,10 @@ handleAccuContractUpdate = function(c) {
 
     // On settlement, use the most reliable source available
     if (c.is_sold || c.is_expired) {
-        accuTickCount = c.current_spot_count
-                     || c.number_of_ticks
-                     || c.tick_count_remaining !== undefined ? (c.tick_count - (c.tick_count_remaining||0)) : null
-                     || accuTickCount;
-        accuTickCount = parseInt(accuTickCount) || accuTickCount;
+        const derivedFromRemaining = c.tick_count_remaining !== undefined
+            ? (c.tick_count - (c.tick_count_remaining || 0))
+            : null;
+        accuTickCount = parseInt(c.current_spot_count || c.number_of_ticks || derivedFromRemaining || accuTickCount) || accuTickCount;
     }
 
     if (tickEl) {
@@ -3969,20 +4306,28 @@ handleAccuContractUpdate = function(c) {
             <div style="font-size:11px;">Ticks: <b style="color:var(--green);">${accuTickCount}</b></div>`;
     }
 
-    // Contract settled (sold or knocked out)
+    // Contract settled (sold or knocked out) — IDEMPOTENT GUARD
     if (c.is_sold || c.is_expired) {
+        if (!c.contract_id || accuSettledContractIds.has(c.contract_id)) {
+            // Either no contract id to key on, or we've already fully
+            // processed this settlement — ignore the duplicate update.
+            return;
+        }
+        accuSettledContractIds.add(c.contract_id);
+
         const profit = parseFloat(c.profit || 0);
         const stake  = parseFloat(document.getElementById('accu-stake')?.value || 1);
         const isWin  = profit > 0;
         const tp     = parseFloat(document.getElementById('accu-tp')?.value || 0.10);
+        const sl     = parseFloat(document.getElementById('accu-sl')?.value || 0);
 
-        // Get final tick count from contract — check all possible fields
-        const finalTicks = c.current_spot_count
-                        || c.number_of_ticks
-                        || accuTickCount
-                        || 0;
+        // Final tick count from contract — check all possible fields
+        const finalTicks = c.current_spot_count || c.number_of_ticks || accuTickCount || 0;
         accuTickCount = parseInt(finalTicks) || accuTickCount;
-        log(`📊 Accu settled: ticks=${accuTickCount} | current_spot_count=${c.current_spot_count} | number_of_ticks=${c.number_of_ticks}`, 'd');
+
+        // Snapshot the confidence score that was live when this trade was opened
+        const confSnapshot = accuLastConfidence[accuMarket];
+        const confScore    = confSnapshot && confSnapshot.ready ? confSnapshot.score : undefined;
 
         // Update auto stats
         accuSessions++;
@@ -3990,54 +4335,76 @@ handleAccuContractUpdate = function(c) {
         if (isWin && profit >= tp) accuTpHits++;
         updateAccuAutoStats();
 
-        // Add to history
-        addAccuHistory(accuMarket, accuGrowthRate, stake, accuTickCount, profit, isWin);
+        // Trade analytics log — confidence + underlying factors for this trade
+        accuTradeAnalytics.push({
+            time: new Date().toISOString(),
+            market: accuMarket,
+            confidence: confScore,
+            rsi: confSnapshot?.rsi, atr: confSnapshot?.atr,
+            bbWidth: confSnapshot?.bb?.bandwidth, emaTrend: confSnapshot?.emaTrendLabel,
+            adx: confSnapshot?.adx, tickStability: confSnapshot?.stab?.score,
+            ticks: accuTickCount, result: isWin ? 'TP' : 'Loss', profit
+        });
+        if (accuTradeAnalytics.length > 200) accuTradeAnalytics.shift();
+
+        // Add to history (with confidence column)
+        addAccuHistory(accuMarket, accuGrowthRate, stake, accuTickCount, profit, isWin, confScore);
 
         log(`${isWin ? '✅' : '❌'} Accumulator ${isWin?'sold':'knocked out'} | ${accuTickCount} ticks | P/L: $${profit.toFixed(2)} | Total: $${accuTotalPL.toFixed(2)}`, isWin ? 'w' : 'l');
 
         if (isWin) { try { playWin(); } catch(e) {} }
         else       { try { playLoss(); } catch(e) {} }
 
-        // Reset UI
-        // Note: notifications handled by auto mode override below
+        // Reset UI — exactly once per settled contract, thanks to the guard above
         resetAccuUI();
         if (profitEl) { profitEl.textContent = `$${profit.toFixed(2)}`; profitEl.style.color = isWin ? 'var(--green)' : 'var(--red)'; }
+
+        // ── STOP LOSS CHECK — takes priority over auto-restart ──
+        if (accuAutoEnabled && sl > 0 && accuTotalPL <= -sl) {
+            stopAccuAuto('stop_loss');
+            return; // do not restart — Stop Loss reached
+        }
 
         // AUTO MODE — restart after TP hit or after any settled contract
         if (accuAutoEnabled) {
             if (isWin) {
                 if (!accuNotifFired) { accuNotifFired = true; notify('✅ TP Hit — Auto Restarting!', `+$${profit.toFixed(2)} | Session ${accuSessions} | Total: $${accuTotalPL.toFixed(2)}`, 'ok'); setTimeout(()=>{accuNotifFired=false;},3000); }
                 log(`🤖 Auto restart in 1 second... (Session ${accuSessions + 1})`, 'i');
-                // Auto restart after short delay
                 setTimeout(() => {
                     if (accuAutoEnabled && derivWS && derivWS.readyState === WebSocket.OPEN) {
                         accuAutoRunning = true;
                         const bar = document.getElementById('accu-auto-bar');
                         if (bar) bar.style.display = 'flex';
-                        // In auto mode, wait for great entry before restarting
-                        const quality = getAccuEntryQuality(accuMarket);
-                        if (quality === 'great' || quality === 'ok') {
+                        const threshold = parseFloat(document.getElementById('accu-conf-threshold')?.value || 85);
+                        const conf = calcAccuConfidence(accuMarket);
+                        if (conf.ready && conf.score >= threshold) {
                             toggleAccumulator();
                         } else {
-                            log('⏳ Auto mode: waiting for great entry before next session...', 'i');
-                            const stake = parseFloat(document.getElementById('accu-stake')?.value || 1);
-                            const tp    = parseFloat(document.getElementById('accu-tp')?.value || 0.10);
-                            startWatchingForGreatEntry(stake, tp);
+                            log(`⏳ Auto mode: waiting for confidence ≥ ${threshold}% before next session...`, 'i');
+                            const stakeVal = parseFloat(document.getElementById('accu-stake')?.value || 1);
+                            startWatchingForGreatEntry(stakeVal, tp);
                         }
                     }
                 }, 1500);
             } else {
-                // Knocked out — notify but also auto restart if still enabled
+                // Knocked out — notify but also auto restart if still enabled and SL not hit
                 if (!accuNotifFired) {
-                accuNotifFired = true;
-                notify('💥 Knocked Out — Auto Restarting!', `Lost $${Math.abs(profit).toFixed(2)} | Total: $${accuTotalPL.toFixed(2)}`, 'warn');
-                setTimeout(() => { accuNotifFired = false; }, 3000);
-            }
+                    accuNotifFired = true;
+                    notify('💥 Knocked Out — Auto Restarting!', `Lost $${Math.abs(profit).toFixed(2)} | Total: $${accuTotalPL.toFixed(2)}`, 'warn');
+                    setTimeout(() => { accuNotifFired = false; }, 3000);
+                }
                 log(`🤖 Knocked out! Auto restarting in 2 seconds...`, 'x');
                 setTimeout(() => {
                     if (accuAutoEnabled && derivWS && derivWS.readyState === WebSocket.OPEN) {
                         accuAutoRunning = true;
-                        toggleAccumulator();
+                        const threshold = parseFloat(document.getElementById('accu-conf-threshold')?.value || 85);
+                        const conf = calcAccuConfidence(accuMarket);
+                        if (conf.ready && conf.score >= threshold) {
+                            toggleAccumulator();
+                        } else {
+                            const stakeVal = parseFloat(document.getElementById('accu-stake')?.value || 1);
+                            startWatchingForGreatEntry(stakeVal, tp);
+                        }
                     }
                 }, 2000);
             }
