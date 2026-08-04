@@ -217,6 +217,13 @@ body{padding-bottom:60px;}
 /* ── Iframe container ── */
 .iframe-wrap{flex:1;display:flex;flex-direction:column;overflow:hidden;min-height:0;}
 
+/* ── Accumulators — compact responsive layout ── */
+#accu-pane{padding:12px;}
+#accu-pane .accu-wrap{max-width:900px;margin:0 auto;display:flex;flex-direction:column;gap:10px;}
+.accu-row-2{display:grid;grid-template-columns:1fr 1fr;gap:10px;}
+.accu-row-3{display:grid;grid-template-columns:1fr 1fr 1fr;gap:8px;}
+.accu-card{padding:12px;}
+
 @media(max-width:768px){
     /* Hide sidebars by default on mobile */
     .sidebar,.sidebar-right{ display:none; }
@@ -249,6 +256,10 @@ body{padding-bottom:60px;}
     #mobile-bot-settings-btn {
         display: flex !important;
     }
+
+    /* Accumulators — stack to single column on mobile */
+    .accu-row-2,.accu-row-3{grid-template-columns:1fr;}
+    #accu-pane{padding:10px;}
 }
 @media(min-width:769px){
     #mobile-bot-settings-btn { display: none !important; }
@@ -882,11 +893,11 @@ body{padding-bottom:60px;}
 </div>
 
 <!-- ── ACCUMULATORS ── -->
-<div id="accu-pane" class="tab-pane scroll" style="padding:16px;">
-    <div style="max-width:900px;margin:0 auto;">
+<div id="accu-pane" class="tab-pane scroll">
+    <div class="accu-wrap">
 
         <!-- Header -->
-        <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:16px;flex-wrap:wrap;gap:10px;">
+        <div style="display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:10px;">
             <div>
                 <h2 style="font-size:18px;font-weight:900;">📈 Accumulator Trading</h2>
                 <p style="font-size:11px;color:var(--muted);margin-top:3px;">Grow your stake tick by tick. AI analyzes volatility to find the safest entry.</p>
@@ -895,10 +906,10 @@ body{padding-bottom:60px;}
         </div>
 
         <!-- Market + Settings row -->
-        <div style="display:grid;grid-template-columns:1fr 1fr;gap:12px;margin-bottom:14px;">
+        <div class="accu-row-2">
 
             <!-- Left: Market selector + Analysis -->
-            <div class="card" style="padding:16px;">
+            <div class="card accu-card">
                 <div style="font-size:10px;font-weight:700;color:var(--muted);text-transform:uppercase;margin-bottom:10px;">📊 Market Analysis</div>
 
                 <div style="margin-bottom:10px;">
@@ -932,33 +943,47 @@ body{padding-bottom:60px;}
                     </div>
                 </div>
 
-                <!-- BB + RSI indicators -->
-                <div style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:8px;margin-bottom:10px;">
+                <!-- BB + RSI + Trend indicators -->
+                <div class="accu-row-3" style="margin-bottom:10px;">
                     <div class="card-sm" style="padding:8px;text-align:center;">
                         <div style="font-size:9px;color:var(--muted);margin-bottom:3px;">RSI(14)</div>
-                        <div id="accu-rsi" style="font-size:18px;font-weight:900;color:#60a5fa;">—</div>
+                        <div id="accu-rsi" style="font-size:16px;font-weight:900;color:#60a5fa;">—</div>
                         <div id="accu-rsi-label" style="font-size:9px;color:var(--muted);">—</div>
                     </div>
                     <div class="card-sm" style="padding:8px;text-align:center;">
                         <div style="font-size:9px;color:var(--muted);margin-bottom:3px;">BB Width</div>
-                        <div id="accu-bb-width" style="font-size:18px;font-weight:900;color:#c4b5fd;">—</div>
+                        <div id="accu-bb-width" style="font-size:16px;font-weight:900;color:#c4b5fd;">—</div>
                         <div id="accu-bb-label" style="font-size:9px;color:var(--muted);">—</div>
                     </div>
                     <div class="card-sm" style="padding:8px;text-align:center;">
-                        <div style="font-size:9px;color:var(--muted);margin-bottom:3px;">Safe Ticks</div>
-                        <div id="accu-safe-ticks" style="font-size:18px;font-weight:900;color:var(--green);">—</div>
-                        <div style="font-size:9px;color:var(--muted);">in a row</div>
+                        <div style="font-size:9px;color:var(--muted);margin-bottom:3px;">ADX</div>
+                        <div id="accu-adx" style="font-size:16px;font-weight:900;color:var(--amber);">—</div>
+                        <div id="accu-adx-label" style="font-size:9px;color:var(--muted);">—</div>
+                    </div>
+                </div>
+                <div class="accu-row-3" style="margin-bottom:10px;">
+                    <div class="card-sm" style="padding:8px;text-align:center;">
+                        <div style="font-size:9px;color:var(--muted);margin-bottom:3px;">EMA Trend</div>
+                        <div id="accu-ema-trend" style="font-size:13px;font-weight:900;color:var(--muted);">—</div>
+                    </div>
+                    <div class="card-sm" style="padding:8px;text-align:center;">
+                        <div style="font-size:9px;color:var(--muted);margin-bottom:3px;">ATR</div>
+                        <div id="accu-atr" style="font-size:13px;font-weight:900;color:var(--muted);">—</div>
+                    </div>
+                    <div class="card-sm" style="padding:8px;text-align:center;">
+                        <div style="font-size:9px;color:var(--muted);margin-bottom:3px;">Tick Stability</div>
+                        <div id="accu-tick-stability" style="font-size:13px;font-weight:900;color:var(--muted);">—</div>
                     </div>
                 </div>
 
-                <!-- Entry signal -->
+                <!-- Entry signal / Confidence score -->
                 <div id="accu-signal-box" style="background:var(--bg);border:1px solid var(--border);border-radius:8px;padding:12px;text-align:center;">
                     <div style="font-size:11px;color:var(--muted);">Analyzing market...</div>
                 </div>
             </div>
 
             <!-- Right: Trade settings -->
-            <div class="card" style="padding:16px;">
+            <div class="card accu-card">
                 <div style="font-size:10px;font-weight:700;color:var(--muted);text-transform:uppercase;margin-bottom:10px;">⚙️ Trade Settings</div>
 
                 <div style="margin-bottom:10px;">
@@ -978,9 +1003,20 @@ body{padding-bottom:60px;}
                     <input type="number" id="accu-stake" value="1.00" min="1" step="0.50" style="font-size:14px;font-weight:900;text-align:center;color:var(--teal);">
                 </div>
 
+                <div class="accu-row-2" style="margin-bottom:10px;">
+                    <div>
+                        <div style="font-size:9px;color:var(--green);font-weight:700;text-transform:uppercase;margin-bottom:4px;">Take Profit $</div>
+                        <input type="number" id="accu-tp" value="0.10" step="0.10" min="0.10" style="color:var(--green);">
+                    </div>
+                    <div>
+                        <div style="font-size:9px;color:var(--red);font-weight:700;text-transform:uppercase;margin-bottom:4px;">Stop Loss $</div>
+                        <input type="number" id="accu-sl" value="5.00" step="0.50" min="0" style="color:var(--red);">
+                    </div>
+                </div>
+
                 <div style="margin-bottom:10px;">
-                    <div style="font-size:9px;color:var(--green);font-weight:700;text-transform:uppercase;margin-bottom:4px;">Take Profit (USD)</div>
-                    <input type="number" id="accu-tp" value="0.10" step="0.10" min="0.10" style="color:var(--green);">
+                    <div style="font-size:9px;color:var(--muted);font-weight:700;text-transform:uppercase;margin-bottom:4px;">AI Confidence Threshold (Auto Mode) %</div>
+                    <input type="number" id="accu-conf-threshold" value="85" min="50" max="99" style="text-align:center;">
                 </div>
 
                 <!-- Auto mode toggle -->
@@ -988,7 +1024,7 @@ body{padding-bottom:60px;}
                     <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:6px;">
                         <div>
                             <div style="font-size:11px;font-weight:900;color:var(--teal);">🤖 Auto Mode</div>
-                            <div style="font-size:9px;color:var(--muted);">Auto-restarts after every TP hit</div>
+                            <div style="font-size:9px;color:var(--muted);">Runs continuously until Take Profit, Stop Loss, or manual stop</div>
                         </div>
                         <div onclick="toggleAccuAuto()" id="accu-auto-track"
                              style="width:44px;height:24px;border-radius:20px;background:var(--border);cursor:pointer;position:relative;transition:.3s;flex-shrink:0;">
@@ -1011,8 +1047,8 @@ body{padding-bottom:60px;}
         </div>
 
         <!-- Live price + current contract -->
-        <div style="display:grid;grid-template-columns:1fr 1fr;gap:12px;margin-bottom:14px;">
-            <div class="card" style="padding:14px;">
+        <div class="accu-row-2">
+            <div class="card accu-card">
                 <div style="font-size:10px;font-weight:700;color:var(--muted);text-transform:uppercase;margin-bottom:8px;">📡 Live Price</div>
                 <div style="display:flex;align-items:center;justify-content:space-between;">
                     <div>
@@ -1026,7 +1062,7 @@ body{padding-bottom:60px;}
                 </div>
             </div>
 
-            <div class="card" style="padding:14px;">
+            <div class="card accu-card">
                 <div style="font-size:10px;font-weight:700;color:var(--muted);text-transform:uppercase;margin-bottom:8px;">📋 Current Contract</div>
                 <div id="accu-contract-info" style="font-size:12px;color:var(--muted);">No active contract</div>
                 <div style="margin-top:8px;">
@@ -1036,17 +1072,20 @@ body{padding-bottom:60px;}
             </div>
         </div>
 
-        <!-- Run/Stop button -->
-        <div style="display:grid;grid-template-columns:1fr 1fr;gap:12px;margin-bottom:14px;">
-            <button id="accu-run-btn" onclick="toggleAccumulator()" class="btn btn-teal" style="padding:16px;font-size:16px;font-weight:900;border-radius:10px;box-shadow:0 4px 20px #00d2c844;">
+        <!-- Run/Stop/Reset buttons -->
+        <div style="display:grid;grid-template-columns:1fr 1fr auto;gap:10px;">
+            <button id="accu-run-btn" onclick="toggleAccumulator()" class="btn btn-teal" style="padding:14px;font-size:15px;font-weight:900;border-radius:10px;box-shadow:0 4px 20px #00d2c844;">
                 ▶ Start Accumulator
             </button>
-            <button onclick="sellAccumulator()" id="accu-sell-btn" class="btn btn-ghost" style="padding:16px;font-size:14px;font-weight:900;border-radius:10px;display:none;">
+            <button onclick="sellAccumulator()" id="accu-sell-btn" class="btn btn-ghost" style="padding:14px;font-size:13px;font-weight:900;border-radius:10px;display:none;">
                 💰 Sell Now
+            </button>
+            <button onclick="resetAccumulator()" id="accu-reset-btn" class="btn btn-ghost" title="Reset accumulator session — clears stats, history and current contract without reloading the page" style="padding:14px 18px;font-size:13px;font-weight:900;border-radius:10px;">
+                🔄 Reset
             </button>
         </div>
         <!-- Auto mode status bar -->
-        <div id="accu-auto-bar" style="display:none;background:#00d2c818;border:1px solid #00d2c844;border-radius:8px;padding:10px 14px;margin-bottom:14px;display:none;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:8px;">
+        <div id="accu-auto-bar" style="display:none;background:#00d2c818;border:1px solid #00d2c844;border-radius:8px;padding:10px 14px;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:8px;">
             <div style="display:flex;align-items:center;gap:8px;">
                 <span style="width:8px;height:8px;border-radius:50%;background:var(--teal);display:inline-block;animation:pulse-dot 1s infinite;"></span>
                 <span style="font-size:12px;font-weight:700;color:var(--teal);">🤖 AUTO MODE RUNNING</span>
@@ -1063,14 +1102,15 @@ body{padding-bottom:60px;}
         </style>
 
         <!-- Transaction history -->
-        <div class="card" style="padding:14px;">
+        <div class="card accu-card">
             <div style="font-size:10px;font-weight:700;color:var(--muted);text-transform:uppercase;margin-bottom:10px;">📋 Accumulator History</div>
             <div style="display:flex;padding:6px 0;border-bottom:1px solid var(--border);font-size:10px;font-weight:700;color:var(--muted);">
-                <div style="width:80px;">Market</div>
+                <div style="width:70px;">Market</div>
                 <div style="flex:1;">Growth</div>
-                <div style="width:80px;">Stake</div>
-                <div style="width:80px;">Ticks</div>
-                <div style="width:100px;text-align:right;">Profit/Loss</div>
+                <div style="width:60px;">Stake</div>
+                <div style="width:60px;">Ticks</div>
+                <div style="width:60px;">Conf.</div>
+                <div style="width:90px;text-align:right;">Profit/Loss</div>
             </div>
             <div id="accu-history" style="display:flex;flex-direction:column;gap:2px;max-height:200px;overflow-y:auto;">
                 <div style="font-size:11px;color:var(--dim);text-align:center;padding:16px;">No accumulator trades yet</div>
@@ -1078,7 +1118,7 @@ body{padding-bottom:60px;}
         </div>
 
         <!-- Risk warning -->
-        <div style="margin-top:12px;padding:12px;background:#ff444f14;border:1px solid #ff444f44;border-radius:8px;">
+        <div style="padding:12px;background:#ff444f14;border:1px solid #ff444f44;border-radius:8px;">
             <p style="font-size:10px;color:#f87171;line-height:1.6;">⚠️ <b>Accumulator Risk:</b> Your entire stake is lost if the price moves outside the barrier on ANY tick. The longer you hold, the higher the risk. Always use Take Profit and never hold indefinitely.</p>
         </div>
     </div>
