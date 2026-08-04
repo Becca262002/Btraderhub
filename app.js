@@ -921,14 +921,23 @@ function connectPublicWS() {
                 runBotLogic(d, data.tick.quote);
             }
 
-            // Update accumulator live price display + drive multi-factor analysis
+            // Update accumulator live price display + drive the market behaviour /
+            // confidence engine. Track tick arrival times for the Tick Flow analysis
+            // (speed, acceleration, directional-change frequency).
             if (sym === accuMarket) {
                 const priceEl = document.getElementById('accu-price');
                 const digitEl = document.getElementById('accu-last-digit');
                 if (priceEl) priceEl.textContent = data.tick.quote;
                 if (digitEl) digitEl.textContent = `Last digit: ${d}`;
-                // Update analysis every 5 ticks — more responsive multi-factor engine
-                if (st.ticks % 5 === 0) updateAccuAnalysis(sym);
+
+                if (!accuTickTimes[sym]) accuTickTimes[sym] = [];
+                accuTickTimes[sym].push(Date.now());
+                if (accuTickTimes[sym].length > 120) accuTickTimes[sym].shift();
+
+                // Update cadence adapts to market speed — 1s indices refresh almost
+                // every tick, slower indices refresh less often to save work.
+                const profile = getMarketProfile(sym);
+                if (st.ticks % profile.updateEveryTicks === 0) updateAccuAnalysis(sym);
             }
         }
     };
@@ -3633,6 +3642,7 @@ let accuTickCount    = 0;
 let accuCurrentProfit = 0;
 let accuMarket       = 'R_10';
 let accuAnalysisTimer = null;
+let accuTickTimes    = {}; // sym -> [timestamps] — feeds the Tick Flow analysis
 
 // Idempotency guard — Deriv can (and does) send more than one
 // proposal_open_contract update for the same settled contract. Without this
@@ -3674,123 +3684,304 @@ function selectAccuGrowth(rate, btn) {
 }
 
 // ================================================================
-// MULTI-FACTOR ACCUMULATOR CONFIDENCE ENGINE
-// Combines Trend (EMA/ADX), Volatility, Bollinger Bands, RSI, ATR and
-// Tick Stability into a single weighted confidence score (0-100%).
-// Weighting: Trend 25% | Volatility 20% | RSI 15% | BB 15% | ATR 15% | Tick Stability 10%
+// ADAPTIVE MARKET PROFILES
+// Detects market "speed class" from the symbol and returns indicator
+// periods tuned for it, so the same engine works sensibly on fast 1s
+// indices as well as slow Volatility 75/100 and Jump/Step indices —
+// without any manual per-market configuration.
+// ================================================================
+function getMarketProfile(sym) {
+    const is1s   = /^1HZ/.test(sym);
+    const isSlow = ['R_75','R_100','jump_75','jump_100','stpRNG'].includes(sym);
+
+    if (is1s) {
+        // Fast markets — shorter lookbacks, faster confidence refresh
+        return { speedClass: 'fast', emaFast: 5, emaSlow: 13, rsiPeriod: 7, bbPeriod: 10, atrPeriod: 7, updateEveryTicks: 2, volTolerance: 1.4 };
+    }
+    if (isSlow) {
+        // Slow / high-volatility markets — longer smoothing, wider tolerance
+        return { speedClass: 'slow', emaFast: 12, emaSlow: 26, rsiPeriod: 21, bbPeriod: 30, atrPeriod: 21, updateEveryTicks: 8, volTolerance: 0.7 };
+    }
+    // Balanced medium-speed markets (R_10/25/50, jump_10/25/50)
+    return { speedClass: 'balanced', emaFast: 9, emaSlow: 21, rsiPeriod: 14, bbPeriod: 20, atrPeriod: 14, updateEveryTicks: 5, volTolerance: 1.0 };
+}
+
+// ================================================================
+// ADAPTIVE LEARNING — nudges factor weights based on completed-trade
+// history. Every 100 trades (per market) we compare the average score
+// of each factor between winning and losing trades; factors that ran
+// meaningfully higher on wins get a small weight boost next time,
+// factors that didn't help get trimmed. Adjustments are capped so the
+// model drifts gradually rather than overfitting to a short streak.
+// ================================================================
+let accuAdaptiveWeights = {}; // sym -> { trend, momentum, volatility, priceBehavior, structure }
+const ACCU_BASE_WEIGHTS = { trend: 0.25, momentum: 0.20, volatility: 0.20, priceBehavior: 0.20, structure: 0.15 };
+
+function getAdaptiveWeights(sym) {
+    return accuAdaptiveWeights[sym] || { ...ACCU_BASE_WEIGHTS };
+}
+
+function runAdaptiveLearning(sym) {
+    const trades = accuTradeAnalytics.filter(t => t.market === sym);
+    if (trades.length < 100 || trades.length % 100 !== 0) return;
+
+    const wins   = trades.filter(t => t.result === 'TP');
+    const losses = trades.filter(t => t.result === 'Loss');
+    if (wins.length < 10 || losses.length < 10) return; // not enough of both to learn from
+
+    const avg = (arr, key) => arr.length ? arr.reduce((s,t) => s + (t.factors?.[key] || 0), 0) / arr.length : 0;
+    const factors = ['trend','momentum','volatility','priceBehavior','structure'];
+    const weights = getAdaptiveWeights(sym);
+    let total = 0;
+
+    factors.forEach(f => {
+        const winAvg  = avg(wins, f);
+        const lossAvg = avg(losses, f);
+        const edge    = winAvg - lossAvg; // positive = factor correlates with wins
+        // Nudge by up to ±0.03 per learning pass, bounded to [0.08, 0.35]
+        const delta   = Math.max(-0.03, Math.min(0.03, edge / 400));
+        weights[f]    = Math.max(0.08, Math.min(0.35, (weights[f] ?? ACCU_BASE_WEIGHTS[f]) + delta));
+        total += weights[f];
+    });
+    // Renormalize so weights still sum to 1
+    factors.forEach(f => weights[f] = weights[f] / total);
+
+    accuAdaptiveWeights[sym] = weights;
+    log(`🧠 Adaptive learning: recalibrated weights for ${MKT[sym]||sym} after ${trades.length} trades`, 'i');
+}
+
+// ================================================================
+// MARKET BEHAVIOUR ENGINE
+// Looks at raw tick flow rather than lagging indicators — speed,
+// acceleration, directional-change frequency, stability/noise, a
+// short-horizon micro-trend read, and spike/reversal detection.
+// ================================================================
+function analyzeTickFlow(sym) {
+    const times  = accuTickTimes[sym] || [];
+    const mm     = marketMemory[sym];
+    const prices = mm?.prices || [];
+    if (prices.length < 10) return null;
+
+    // Tick speed — ticks per second from real arrival timestamps
+    let ticksPerSec = null;
+    if (times.length >= 5) {
+        const span = (times[times.length-1] - times[0]) / 1000;
+        ticksPerSec = span > 0 ? (times.length - 1) / span : null;
+    }
+
+    // Acceleration — is tick speed increasing or decreasing?
+    let accel = 'steady';
+    if (times.length >= 10) {
+        const half = Math.floor(times.length / 2);
+        const firstSpan = (times[half] - times[0]) / 1000;
+        const secondSpan = (times[times.length-1] - times[half]) / 1000;
+        const firstRate  = firstSpan > 0 ? half / firstSpan : 0;
+        const secondRate = secondSpan > 0 ? (times.length - half) / secondSpan : 0;
+        if (secondRate > firstRate * 1.2) accel = 'accelerating';
+        else if (secondRate < firstRate * 0.8) accel = 'decelerating';
+    }
+
+    // Directional change frequency — how often does tick-to-tick direction flip?
+    const recent = prices.slice(-30);
+    let flips = 0;
+    for (let i = 2; i < recent.length; i++) {
+        const prevDir = recent[i-1] - recent[i-2];
+        const curDir  = recent[i] - recent[i-1];
+        if ((prevDir > 0 && curDir < 0) || (prevDir < 0 && curDir > 0)) flips++;
+    }
+    const flipRate = recent.length > 2 ? flips / (recent.length - 2) : 0;
+
+    // Momentum — net directional bias over the recent window
+    const netMove  = recent.length > 1 ? recent[recent.length-1] - recent[0] : 0;
+    const avgAbs   = recent.length > 1
+        ? recent.slice(1).reduce((s,p,i) => s + Math.abs(p - recent[i]), 0) / (recent.length - 1)
+        : 0;
+    const tickMomentum = avgAbs > 0 ? netMove / (avgAbs * recent.length) : 0; // roughly -1..1
+
+    return { ticksPerSec, accel, flipRate, tickMomentum };
+}
+
+// Micro trend over the last 20-100 ticks — up / down / sideways bias
+function detectMicroTrend(prices) {
+    if (!prices || prices.length < 20) return { bias: 'unknown', strength: 0, label: '—' };
+    const window = prices.slice(-Math.min(100, prices.length));
+    const up   = window.filter((p,i) => i > 0 && p > window[i-1]).length;
+    const down = window.filter((p,i) => i > 0 && p < window[i-1]).length;
+    const total = window.length - 1;
+    const upPct = total > 0 ? up / total : 0.5;
+    const downPct = total > 0 ? down / total : 0.5;
+
+    let bias = 'sideways', label = '➡ Sideways';
+    if (upPct >= 0.58) { bias = 'up'; label = '📈 Upward bias'; }
+    else if (downPct >= 0.58) { bias = 'down'; label = '📉 Downward bias'; }
+    const strength = Math.round(Math.abs(upPct - downPct) * 100);
+    return { bias, strength, label };
+}
+
+// Reversal / spike guard — true when the market just did something the
+// engine should wait out rather than trade into immediately.
+function detectReversalRisk(prices) {
+    if (!prices || prices.length < 12) return { risk: false, reason: null };
+    const recent = prices.slice(-12);
+    const moves  = [];
+    for (let i = 1; i < recent.length; i++) moves.push(recent[i] - recent[i-1]);
+    const avgAbsMove = moves.reduce((s,m) => s + Math.abs(m), 0) / moves.length;
+    const lastMove    = moves[moves.length - 1];
+    const prevMove    = moves[moves.length - 2] || 0;
+
+    // Very large spike on the last tick
+    if (avgAbsMove > 0 && Math.abs(lastMove) > avgAbsMove * 4) {
+        return { risk: true, reason: 'Very large spike on the last tick' };
+    }
+    // Rapid reversal — sharp move immediately followed by an opposite sharp move
+    if (avgAbsMove > 0 && Math.abs(prevMove) > avgAbsMove * 2.5 &&
+        Math.sign(prevMove) !== Math.sign(lastMove) && Math.abs(lastMove) > avgAbsMove * 2) {
+        return { risk: true, reason: 'Rapid reversal just occurred' };
+    }
+    // Unusually long directional run — market is stretched, due for a pause
+    let runLen = 1;
+    for (let i = moves.length - 1; i > 0; i--) {
+        if (Math.sign(moves[i]) === Math.sign(moves[i-1]) && Math.sign(moves[i]) !== 0) runLen++;
+        else break;
+    }
+    if (runLen >= 9) {
+        return { risk: true, reason: `Unusually long ${runLen}-tick directional run` };
+    }
+    return { risk: false, reason: null };
+}
+
+// Market regime classification — combines trend strength and volatility
+// into one label, and the confidence threshold adapts to it (calm markets
+// can trade at a lower bar, explosive markets need a much higher one).
+function classifyRegime(trendStrength, stabilityScore, flipRate) {
+    // trendStrength: 0-100 (how directional), stabilityScore: 0-100 (higher = calmer)
+    if (stabilityScore >= 80 && trendStrength < 20) return { regime: 'Calm',      icon: '🟢', thresholdAdj: -5  };
+    if (stabilityScore >= 55 && trendStrength >= 35) return { regime: 'Trending', icon: '🟢', thresholdAdj: 0   };
+    if (stabilityScore < 30 || flipRate > 0.65)      return { regime: 'Explosive',icon: '🔴', thresholdAdj: 15  };
+    if (stabilityScore < 50)                          return { regime: 'Volatile', icon: '🟠', thresholdAdj: 8   };
+    return { regime: 'Normal', icon: '🟡', thresholdAdj: 0 };
+}
+
+// ================================================================
+// DYNAMIC WEIGHTED CONFIDENCE ENGINE
+// Every factor contributes partial credit rather than gating the trade —
+// this keeps trade frequency healthy (including on fast 1s markets)
+// while still steering away from poor-quality entries.
+// Weighting: Trend 25% | Momentum 20% | Volatility 20% | Price Behaviour 20% | Market Structure 15%
 // ================================================================
 function calcAccuConfidence(sym) {
     const mm = marketMemory[sym] || { prices: [] };
     const prices = mm.prices || [];
+    const profile = getMarketProfile(sym);
+    const minTicks = Math.max(20, profile.bbPeriod);
 
-    if (prices.length < 30) {
-        return { ready: false, ticksNeeded: 30 - prices.length };
+    if (prices.length < minTicks) {
+        return { ready: false, ticksNeeded: minTicks - prices.length, profile };
     }
 
-    const last  = prices[prices.length - 1];
-    const ema20 = calcEMA(prices, 20);
-    const ema50 = calcEMA(prices, Math.min(50, prices.length - 1));
-    const adx   = calcADX(prices, 14);
-    const rsi   = calcRSI(prices, 14);
-    const bb    = calcBollingerBands(prices, 20, 2);
-    const atr   = calcATR(prices, 14);
-    const stab  = calcTickStability(prices);
+    const last    = prices[prices.length - 1];
+    const emaFast = calcEMA(prices, profile.emaFast);
+    const emaSlow = calcEMA(prices, Math.min(profile.emaSlow, prices.length - 1));
+    const rsi     = calcRSI(prices, profile.rsiPeriod);
+    const rsiPrev = prices.length > 2 ? calcRSI(prices.slice(0, -1), profile.rsiPeriod) : null;
+    const bb      = calcBollingerBands(prices, profile.bbPeriod, 2);
+    const atr     = calcATR(prices, profile.atrPeriod);
+    const stab    = calcTickStability(prices);
+    const flow    = analyzeTickFlow(sym);
+    const micro   = detectMicroTrend(prices);
+    const reversal = detectReversalRisk(prices);
 
-    // ── 1) TREND FILTER (25%) — EMA20 > EMA50, price above both, ADX 20-25+ ──
+    // ── TREND (25%) — EMA fast>slow +15, price above EMA +10 ──
     let trendScore = 0;
     let emaTrendLabel = '—';
-    if (ema20 !== null && ema50 !== null) {
-        const emaAligned   = ema20 > ema50;
-        const priceAboveBoth = last > ema20 && last > ema50;
-        emaTrendLabel = emaAligned ? '📈 Bullish (EMA20>50)' : '📉 Bearish (EMA20<50)';
-        if (emaAligned && priceAboveBoth) trendScore += 60;
-        else if (emaAligned || priceAboveBoth) trendScore += 25;
-        if (adx !== null) {
-            if (adx >= 25) trendScore += 40;
-            else if (adx >= 20) trendScore += 28;
-            else if (adx >= 15) trendScore += 12;
-        }
+    if (emaFast !== null && emaSlow !== null) {
+        const aligned = emaFast > emaSlow;
+        emaTrendLabel = aligned ? `📈 Bullish (EMA${profile.emaFast}>${profile.emaSlow})` : `📉 Bearish (EMA${profile.emaFast}<${profile.emaSlow})`;
+        if (aligned) trendScore += 60; // scaled to 100, weighted below (15/25 of trend)
+        if (last > emaFast) trendScore += 40; // (10/25 of trend)
     }
     trendScore = Math.min(100, trendScore);
 
-    // ── 2) VOLATILITY FILTER (20%) — stable, smooth ticks, no spikes ──
-    let volScore = 0;
-    if (stab) {
-        // Reuse tick-stability score as the volatility-smoothness proxy —
-        // "stable, smooth, no sudden spikes" is exactly what that measures.
-        volScore = stab.score;
-    }
-
-    // ── 3) RSI FILTER (15%) — high-probability zone 52-65, avoid >70 or <45 ──
-    let rsiScore = 0;
+    // ── MOMENTUM (20%) — RSI 48-65 +10, RSI rising +10 ──
+    let momentumScore = 0;
     if (rsi !== null) {
-        if (rsi > 70 || rsi < 45) rsiScore = 0;
-        else if (rsi >= 52 && rsi <= 65) rsiScore = 100;
-        else if (rsi > 45 && rsi < 52) rsiScore = 55; // approaching the zone
-        else if (rsi > 65 && rsi <= 70) rsiScore = 40; // leaving the zone
+        if (rsi >= 48 && rsi <= 65) momentumScore += 50;
+        else if (rsi > 65 && rsi <= 72) momentumScore += 20;
+        else if (rsi >= 40 && rsi < 48) momentumScore += 20;
+        if (rsiPrev !== null && rsi > rsiPrev) momentumScore += 50;
     }
+    momentumScore = Math.min(100, momentumScore);
 
-    // ── 4) BOLLINGER BAND FILTER (15%) — squeeze then healthy expansion, aligned with trend ──
-    let bbScore = 0;
+    // ── VOLATILITY (20%) — BB not excessively wide +10, stable volatility +10 ──
+    let volatilityScore = 0;
     if (bb) {
-        if (!accuBandwidthHistory[sym]) accuBandwidthHistory[sym] = [];
-        const hist = accuBandwidthHistory[sym];
-        hist.push(bb.bandwidth);
-        if (hist.length > 30) hist.shift();
-
-        const recentMin = Math.min(...hist);
-        const wasSqueezed = recentMin < 0.15; // saw a compression recently
-        const nowExpanding = bb.bandwidth > recentMin * 1.3 && bb.bandwidth > 0.15;
-        const trendUp = ema20 !== null && ema50 !== null && ema20 > ema50;
-        const alignedWithTrend = (trendUp && last > bb.middle) || (!trendUp && last < bb.middle);
-
-        if (wasSqueezed && nowExpanding && alignedWithTrend) bbScore = 100;
-        else if (wasSqueezed && nowExpanding) bbScore = 70;
-        else if (bb.bandwidth > 0.1 && bb.bandwidth < 0.4) bbScore = 45; // healthy, not extreme
-        else bbScore = 15;
+        const wideCeiling = 0.5 * profile.volTolerance;
+        if (bb.bandwidth < wideCeiling) volatilityScore += 50;
+        else if (bb.bandwidth < wideCeiling * 1.5) volatilityScore += 20;
     }
+    if (stab) volatilityScore += Math.round(stab.score * 0.5);
+    volatilityScore = Math.min(100, volatilityScore);
 
-    // ── 5) ATR FILTER (15%) — avoid sudden spikes / abnormal highs / extreme lows ──
-    let atrScore = 0;
-    let atrLabel = '—';
-    if (atr !== null) {
-        if (!accuBandwidthHistory[sym + '_atr']) accuBandwidthHistory[sym + '_atr'] = [];
-        const atrHist = accuBandwidthHistory[sym + '_atr'];
-        atrHist.push(atr);
-        if (atrHist.length > 30) atrHist.shift();
-        const atrAvg = atrHist.reduce((a,b)=>a+b,0) / atrHist.length;
-        const ratio  = atrAvg > 0 ? atr / atrAvg : 1;
-        if (ratio >= 0.5 && ratio <= 2) { atrScore = 100; atrLabel = 'Normal range'; }
-        else if (ratio > 2 && ratio <= 3) { atrScore = 45; atrLabel = 'Elevated — caution'; }
-        else if (ratio > 3) { atrScore = 0; atrLabel = '⚠️ Spike — avoid'; }
-        else { atrScore = 30; atrLabel = 'Abnormally low'; }
-    }
+    // ── PRICE BEHAVIOUR (20%) — no sudden spikes +10, smooth tick movement +10 ──
+    let priceBehaviorScore = 0;
+    if (!reversal.risk) priceBehaviorScore += 50;
+    if (stab) priceBehaviorScore += Math.round(Math.max(0, 100 - stab.jumpFreq * 300) * 0.5);
+    priceBehaviorScore = Math.min(100, priceBehaviorScore);
 
-    // ── 6) TICK STABILITY FILTER (10%) — last 100 ticks smoothness ──
-    let stabilityScore = stab ? stab.score : 0;
+    // ── MARKET STRUCTURE (15%) — directional consistency +10, not right after a big move +5 ──
+    let structureScore = 0;
+    if (micro.bias !== 'sideways' && micro.bias !== 'unknown') structureScore += Math.min(67, 40 + micro.strength);
+    else structureScore += 20;
+    if (!reversal.risk) structureScore += 33;
+    structureScore = Math.min(100, structureScore);
 
-    // ── WEIGHTED CONFIDENCE SCORE ──
-    const weights = { trend: 0.25, vol: 0.20, rsi: 0.15, bb: 0.15, atr: 0.15, stability: 0.10 };
+    // ── REGIME DETECTION — adjusts the effective entry threshold ──
+    const trendStrength = Math.abs((micro.strength || 0));
+    const regimeInfo = classifyRegime(trendStrength, stab ? stab.score : 50, flow ? flow.flipRate : 0.3);
+
+    // ── WEIGHTED SCORE (adaptive weights, learned per market over time) ──
+    const w = getAdaptiveWeights(sym);
     const score = Math.round(
-        trendScore      * weights.trend +
-        volScore        * weights.vol   +
-        rsiScore        * weights.rsi   +
-        bbScore         * weights.bb    +
-        atrScore        * weights.atr   +
-        stabilityScore  * weights.stability
+        trendScore         * w.trend +
+        momentumScore       * w.momentum +
+        volatilityScore     * w.volatility +
+        priceBehaviorScore  * w.priceBehavior +
+        structureScore      * w.structure
     );
 
-    let label, color, tradeOk;
-    if (score >= 90)      { label = '🟢 Excellent Entry'; color = 'var(--green)'; tradeOk = true;  }
-    else if (score >= 80) { label = '🟢 Great Entry';     color = 'var(--green)'; tradeOk = true;  }
-    else if (score >= 70) { label = '🟡 Good Entry';      color = 'var(--amber)'; tradeOk = true;  }
-    else                  { label = '🔴 No Trade';        color = 'var(--red)';   tradeOk = false; }
+    const effectiveThreshold = 75 + regimeInfo.thresholdAdj; // baseline "Good Entry" bar, shifted by regime
+
+    let label, color;
+    if (score >= 90)      { label = '🟢 Excellent Entry'; color = 'var(--green)'; }
+    else if (score >= 80) { label = '🟢 Great Entry';     color = 'var(--green)'; }
+    else if (score >= 75) { label = '🟡 Good Entry';      color = 'var(--amber)'; }
+    else                  { label = '🔴 No Trade';        color = 'var(--red)';   }
+
+    // Loss-prevention overrides — these can block a trade even if the
+    // weighted score alone looks acceptable.
+    const blockers = [];
+    if (reversal.risk) blockers.push(reversal.reason);
+    if (stab && stab.jumpFreq > 0.15) blockers.push('Erratic tick movement (frequent jumps)');
+    if (regimeInfo.regime === 'Explosive') blockers.push('Market regime is Explosive');
+    const lossPreventionBlocked = blockers.length > 0;
+
+    const tradeOk = score >= effectiveThreshold && !lossPreventionBlocked;
 
     return {
-        ready: true, score, label, color, tradeOk,
-        ema20, ema50, emaTrendLabel, adx, rsi, bb, atr, atrLabel, stab,
-        breakdown: { trendScore, volScore, rsiScore, bbScore, atrScore, stabilityScore }
+        ready: true, score, label, color, tradeOk, effectiveThreshold,
+        emaFast, emaSlow, emaTrendLabel, rsi, bb, atr, stab, flow, micro, reversal,
+        regime: regimeInfo, blockers, profile,
+        breakdown: { trendScore, momentumScore, volatilityScore, priceBehaviorScore, structureScore },
+        weights: w
     };
+}
+
+// Human-readable spike-risk label for the dashboard
+function spikeRiskLabel(conf) {
+    if (!conf.ready) return { text: '—', color: 'var(--muted)' };
+    if (conf.reversal?.risk) return { text: 'High', color: 'var(--red)' };
+    if (conf.stab && conf.stab.jumpFreq > 0.08) return { text: 'Elevated', color: 'var(--amber)' };
+    return { text: 'Low', color: 'var(--green)' };
 }
 
 function updateAccuAnalysis(sym) {
@@ -3806,49 +3997,54 @@ function updateAccuAnalysis(sym) {
         set('accu-ema-trend', '—');
         set('accu-atr', '—');
         set('accu-tick-stability', '—');
+        set('accu-regime', '—'); set('accu-spike-risk', '—'); set('accu-micro-trend', '—');
         const sigBox = document.getElementById('accu-signal-box');
-        if (sigBox) sigBox.innerHTML = `<div style="font-size:11px;color:var(--muted);">Collecting data... need ${conf.ticksNeeded} more ticks</div>`;
-        // Volatility bar placeholder while collecting
-        const volMap = { R_10:15, R_25:30, R_50:50, R_75:75, R_100:90, '1HZ10V':35, '1HZ25V':50, '1HZ50V':65, '1HZ75V':80, '1HZ100V':95 };
-        const volScore = volMap[sym] || 50;
-        const volBar   = document.getElementById('accu-vol-bar');
-        const volLabel = document.getElementById('accu-vol-label');
-        if (volBar)   { volBar.style.width = volScore + '%'; volBar.style.background = volScore < 30 ? 'var(--green)' : volScore < 60 ? 'var(--amber)' : 'var(--red)'; }
-        if (volLabel) { volLabel.textContent = volScore < 30 ? 'Low ✅' : volScore < 60 ? 'Medium ⚠️' : 'High ❌'; volLabel.style.color = volBar ? volBar.style.background : ''; }
+        if (sigBox) sigBox.innerHTML = `<div style="font-size:11px;color:var(--muted);">Collecting data... need ${conf.ticksNeeded} more ticks (${conf.profile.speedClass} market profile)</div>`;
         return;
     }
 
     // RSI
     set('accu-rsi', conf.rsi ?? '—', conf.rsi > 70 ? 'var(--red)' : conf.rsi < 30 ? 'var(--green)' : '#60a5fa');
-    set('accu-rsi-label', conf.rsi > 70 ? 'Overbought' : conf.rsi < 30 ? 'Oversold' : (conf.rsi >= 52 && conf.rsi <= 65) ? 'Sweet spot' : 'Neutral');
+    set('accu-rsi-label', conf.rsi > 70 ? 'Overbought' : conf.rsi < 30 ? 'Oversold' : (conf.rsi >= 48 && conf.rsi <= 65) ? 'Sweet spot' : 'Neutral');
 
     // BB
     if (conf.bb) {
-        set('accu-bb-width', conf.bb.bandwidth.toFixed(2) + '%', conf.bb.bandwidth < 0.1 ? 'var(--green)' : conf.bb.bandwidth < 0.3 ? 'var(--amber)' : 'var(--red)');
-        set('accu-bb-label', conf.bb.bandwidth < 0.1 ? 'Squeezing ✅' : conf.bb.bandwidth < 0.3 ? 'Normal ⚠️' : 'Wide ❌');
+        set('accu-bb-width', conf.bb.bandwidth.toFixed(2) + '%', conf.breakdown.volatilityScore >= 60 ? 'var(--green)' : conf.breakdown.volatilityScore >= 35 ? 'var(--amber)' : 'var(--red)');
+        set('accu-bb-label', conf.bb.bandwidth < 0.1 ? 'Squeezing ✅' : conf.bb.bandwidth < 0.4 ? 'Normal' : 'Wide ⚠️');
     }
 
-    // ADX
-    set('accu-adx', conf.adx ?? '—', conf.adx >= 25 ? 'var(--green)' : conf.adx >= 20 ? 'var(--amber)' : 'var(--muted)');
-    set('accu-adx-label', conf.adx >= 25 ? 'Strong trend' : conf.adx >= 20 ? 'Building' : 'Weak/sideways');
+    // Tick speed (repurposed "ADX" tile)
+    const tps = conf.flow?.ticksPerSec;
+    set('accu-adx', tps !== null && tps !== undefined ? `${tps.toFixed(1)}/s` : '—', 'var(--amber)');
+    set('accu-adx-label', conf.flow ? (conf.flow.accel === 'accelerating' ? 'Accelerating' : conf.flow.accel === 'decelerating' ? 'Decelerating' : 'Steady') : '—');
 
     // EMA trend
-    set('accu-ema-trend', conf.emaTrendLabel, conf.ema20 > conf.ema50 ? 'var(--green)' : 'var(--red)');
+    set('accu-ema-trend', conf.emaTrendLabel, conf.emaFast > conf.emaSlow ? 'var(--green)' : 'var(--red)');
 
     // ATR
-    set('accu-atr', conf.atr !== null ? conf.atr.toFixed(5) : '—', conf.breakdown.atrScore >= 70 ? 'var(--green)' : conf.breakdown.atrScore >= 40 ? 'var(--amber)' : 'var(--red)');
+    set('accu-atr', conf.atr !== null ? conf.atr.toFixed(5) : '—', 'var(--muted)');
 
     // Tick stability
     if (conf.stab) {
         set('accu-tick-stability', `${conf.stab.score}/100`, conf.stab.score >= 70 ? 'var(--green)' : conf.stab.score >= 40 ? 'var(--amber)' : 'var(--red)');
     }
 
-    // Volatility meter — driven by the same volatility sub-score now
+    // Market regime
+    set('accu-regime', `${conf.regime.icon} ${conf.regime.regime}`, conf.regime.regime === 'Calm' || conf.regime.regime === 'Trending' ? 'var(--green)' : conf.regime.regime === 'Explosive' ? 'var(--red)' : 'var(--amber)');
+
+    // Spike risk
+    const spike = spikeRiskLabel(conf);
+    set('accu-spike-risk', spike.text, spike.color);
+
+    // Micro trend
+    set('accu-micro-trend', conf.micro.label, conf.micro.bias === 'up' ? 'var(--green)' : conf.micro.bias === 'down' ? 'var(--red)' : 'var(--muted)');
+
+    // Volatility meter — driven by the volatility sub-score
     const volBar   = document.getElementById('accu-vol-bar');
     const volLabel = document.getElementById('accu-vol-label');
-    const volPct   = 100 - conf.breakdown.volScore; // invert: higher instability = higher bar
-    if (volBar)   { volBar.style.width = Math.max(5, volPct) + '%'; volBar.style.background = conf.breakdown.volScore >= 70 ? 'var(--green)' : conf.breakdown.volScore >= 40 ? 'var(--amber)' : 'var(--red)'; }
-    if (volLabel) { volLabel.textContent = conf.breakdown.volScore >= 70 ? 'Low ✅' : conf.breakdown.volScore >= 40 ? 'Medium ⚠️' : 'High ❌'; volLabel.style.color = volBar ? volBar.style.background : ''; }
+    const volPct   = 100 - conf.breakdown.volatilityScore;
+    if (volBar)   { volBar.style.width = Math.max(5, volPct) + '%'; volBar.style.background = conf.breakdown.volatilityScore >= 60 ? 'var(--green)' : conf.breakdown.volatilityScore >= 35 ? 'var(--amber)' : 'var(--red)'; }
+    if (volLabel) { volLabel.textContent = conf.breakdown.volatilityScore >= 60 ? 'Low ✅' : conf.breakdown.volatilityScore >= 35 ? 'Medium ⚠️' : 'High ❌'; volLabel.style.color = volBar ? volBar.style.background : ''; }
 
     // Safe ticks in a row (kept for the "Live Price" card context)
     const safeTicks = document.getElementById('accu-safe-ticks');
@@ -3865,28 +4061,37 @@ function updateAccuAnalysis(sym) {
         safeTicks.style.color = consecutive > 10 ? 'var(--green)' : consecutive > 5 ? 'var(--amber)' : 'var(--red)';
     }
 
-    // Entry signal / confidence score box
+    // ── AI Market Scanner dashboard — Market Health + Recommendation ──
     const sigBox    = document.getElementById('accu-signal-box');
     const growthRec = document.getElementById('accu-growth-rec');
     if (sigBox) {
         const b = conf.breakdown;
+        const recommend = conf.tradeOk
+            ? `<span style="color:var(--green);">🟢 ENTER</span>`
+            : conf.blockers.length > 0
+                ? `<span style="color:var(--red);">🔴 WAIT — ${conf.blockers[0]}</span>`
+                : `<span style="color:var(--amber);">🟡 WAIT — below ${conf.effectiveThreshold}% threshold</span>`;
+
         sigBox.innerHTML = `
             <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:6px;">
-                <div style="font-size:16px;font-weight:900;color:${conf.color};">${conf.label}</div>
-                <div style="font-size:20px;font-weight:900;color:${conf.color};">${conf.score}%</div>
+                <div style="font-size:16px;font-weight:900;color:${conf.color};">Market Health: ${conf.score}%</div>
+                <div style="font-size:12px;font-weight:900;color:${conf.color};">${conf.label}</div>
             </div>
             <div class="pbar" style="margin-bottom:8px;"><div class="pbar-fill" style="width:${conf.score}%;background:${conf.color};"></div></div>
-            <div style="display:grid;grid-template-columns:1fr 1fr;gap:4px;font-size:9px;color:var(--muted);text-align:left;">
-                <div>Trend (25%): <b style="color:var(--text);">${Math.round(b.trendScore)}</b></div>
-                <div>Volatility (20%): <b style="color:var(--text);">${Math.round(b.volScore)}</b></div>
-                <div>RSI (15%): <b style="color:var(--text);">${Math.round(b.rsiScore)}</b></div>
-                <div>Bollinger (15%): <b style="color:var(--text);">${Math.round(b.bbScore)}</b></div>
-                <div>ATR (15%): <b style="color:var(--text);">${Math.round(b.atrScore)}</b></div>
-                <div>Tick Stability (10%): <b style="color:var(--text);">${Math.round(b.stabilityScore)}</b></div>
-            </div>`;
+            <div style="display:grid;grid-template-columns:1fr 1fr;gap:4px;font-size:9px;color:var(--muted);text-align:left;margin-bottom:8px;">
+                <div>Regime: <b style="color:var(--text);">${conf.regime.icon} ${conf.regime.regime}</b></div>
+                <div>Threshold (adaptive): <b style="color:var(--text);">${conf.effectiveThreshold}%</b></div>
+                <div>Trend (${Math.round(conf.weights.trend*100)}%): <b style="color:var(--text);">${Math.round(b.trendScore)}</b></div>
+                <div>Momentum (${Math.round(conf.weights.momentum*100)}%): <b style="color:var(--text);">${Math.round(b.momentumScore)}</b></div>
+                <div>Volatility (${Math.round(conf.weights.volatility*100)}%): <b style="color:var(--text);">${Math.round(b.volatilityScore)}</b></div>
+                <div>Price Behaviour (${Math.round(conf.weights.priceBehavior*100)}%): <b style="color:var(--text);">${Math.round(b.priceBehaviorScore)}</b></div>
+                <div>Structure (${Math.round(conf.weights.structure*100)}%): <b style="color:var(--text);">${Math.round(b.structureScore)}</b></div>
+                <div>Tick Stability: <b style="color:var(--text);">${conf.stab ? conf.stab.score : '—'}%</b></div>
+            </div>
+            <div style="font-size:11px;font-weight:700;text-align:left;">Recommendation: ${recommend}</div>`;
 
         // Recommend growth rate based on the volatility sub-score
-        const recRate = b.volScore >= 75 ? '3%' : b.volScore >= 50 ? '2%' : '1%';
+        const recRate = b.volatilityScore >= 75 ? '3%' : b.volatilityScore >= 50 ? '2%' : '1%';
         if (growthRec) growthRec.textContent = `AI recommends: ${recRate} for this market`;
     }
 }
@@ -4125,23 +4330,44 @@ function addAccuHistory(market, growth, stake, ticks, profit, isWin, confidence)
 function getAccuEntryQuality(sym) {
     const conf = calcAccuConfidence(sym);
     if (!conf.ready) return 'loading';
+    if (conf.score >= 90) return 'excellent';
     if (conf.score >= 80) return 'great';
-    if (conf.score >= 70) return 'ok';
+    if (conf.score >= 75) return 'good';
     return 'bad';
+}
+
+// Does the current confidence reading clear BOTH the engine's own adaptive
+// threshold (regime-adjusted, loss-prevention aware) AND the user's Auto
+// Mode threshold setting? Manual starts only need the engine's own bar.
+// Also enforces a brief stabilization cooldown after the previous trade
+// closed, per the loss-prevention rule: don't re-enter into a market that
+// hasn't settled down yet.
+const ACCU_STABILIZE_COOLDOWN_MS = 1200;
+let accuLastSettleTime = 0;
+
+function meetsAutoThreshold(conf) {
+    if (!conf.ready) return false;
+    if (Date.now() - accuLastSettleTime < ACCU_STABILIZE_COOLDOWN_MS) return false;
+    const userThreshold = parseFloat(document.getElementById('accu-conf-threshold')?.value || 75);
+    return conf.tradeOk && conf.score >= userThreshold;
 }
 
 let accuWatchInterval = null;
 let accuWaiting       = false;
 
+// Continuous market monitor — this is the "Smart Auto Mode" watcher.
+// It keeps re-evaluating market health (not just polling for one static
+// condition), automatically pausing through Explosive/blocked regimes and
+// resuming the instant a qualifying reading returns.
 function startWatchingForGreatEntry(stake, tp) {
     if (accuWatchInterval) clearInterval(accuWatchInterval);
     accuWaiting = true;
 
     // Update run button to show waiting state
     const btn = document.getElementById('accu-run-btn');
-    if (btn) { btn.textContent = '⏳ Waiting for Great Entry...'; btn.style.opacity = '0.7'; }
+    if (btn) { btn.textContent = '⏳ Monitoring market...'; btn.style.opacity = '0.7'; }
 
-    log('⏳ Watching for a qualifying confidence score...', 'i');
+    log('⏳ Smart monitor active — watching for a qualifying entry...', 'i');
 
     accuWatchInterval = setInterval(() => {
         if (!accuWaiting) { clearInterval(accuWatchInterval); return; }
@@ -4149,27 +4375,23 @@ function startWatchingForGreatEntry(stake, tp) {
         const conf = calcAccuConfidence(accuMarket);
         if (!conf.ready) { log('📊 Still collecting data for confidence score...', 'd'); return; }
 
-        const threshold = parseFloat(document.getElementById('accu-conf-threshold')?.value || 85);
-        log(`📊 Confidence: ${conf.score}% (${conf.label}) — need ${threshold}%+ for Auto Mode, 70%+ for manual`, 'd');
-
-        // Manual (non-auto) start only needs "Good Entry" or better (tradeOk).
-        // Auto Mode is stricter and defers to the user's confidence threshold —
-        // that check happens where startWatchingForGreatEntry is called from
-        // the auto-restart path, via the threshold comparison here.
         const isAutoRestart = accuAutoRunning;
-        const qualifies = isAutoRestart ? conf.score >= threshold : conf.tradeOk;
+        const qualifies = isAutoRestart ? meetsAutoThreshold(conf) : conf.tradeOk;
 
-        if (qualifies) {
-            clearInterval(accuWatchInterval);
-            accuWaiting = false;
-            const btn = document.getElementById('accu-run-btn');
-            if (btn) { btn.textContent = '▶ Start Accumulator'; btn.style.opacity = '1'; }
-            notify('✅ Qualifying Entry Found!', `Confidence ${conf.score}% (${conf.label}). Starting accumulator now!`, 'ok');
-            log(`✅ Qualifying entry detected (${conf.score}%) — starting accumulator!`, 'w');
-            // Auto start
-            toggleAccumulator();
+        if (!qualifies) {
+            const why = conf.blockers.length ? conf.blockers[0] : `score ${conf.score}% below ${conf.effectiveThreshold}% threshold`;
+            log(`📊 Waiting — ${conf.regime.icon} ${conf.regime.regime} | ${why}`, 'd');
+            return;
         }
-    }, 3000); // check every 3 seconds
+
+        clearInterval(accuWatchInterval);
+        accuWaiting = false;
+        const btn2 = document.getElementById('accu-run-btn');
+        if (btn2) { btn2.textContent = '▶ Start Accumulator'; btn2.style.opacity = '1'; }
+        notify('✅ Qualifying Entry Found!', `Confidence ${conf.score}% (${conf.label}) | Regime: ${conf.regime.regime}. Starting accumulator now!`, 'ok');
+        log(`✅ Qualifying entry detected (${conf.score}%, ${conf.regime.regime}) — starting accumulator!`, 'w');
+        toggleAccumulator();
+    }, 1500); // fast poll — Smart Auto Mode reacts quickly to changing conditions
 }
 
 // Stop watching if user clicks run button again
@@ -4335,17 +4557,30 @@ handleAccuContractUpdate = function(c) {
         if (isWin && profit >= tp) accuTpHits++;
         updateAccuAutoStats();
 
-        // Trade analytics log — confidence + underlying factors for this trade
+        // Trade analytics log — confidence + underlying factors for this trade.
+        // `factors` stores the 0-100 sub-scores that runAdaptiveLearning()
+        // compares between wins and losses to recalibrate weights over time.
         accuTradeAnalytics.push({
             time: new Date().toISOString(),
             market: accuMarket,
             confidence: confScore,
+            regime: confSnapshot?.regime?.regime,
             rsi: confSnapshot?.rsi, atr: confSnapshot?.atr,
             bbWidth: confSnapshot?.bb?.bandwidth, emaTrend: confSnapshot?.emaTrendLabel,
-            adx: confSnapshot?.adx, tickStability: confSnapshot?.stab?.score,
+            tickStability: confSnapshot?.stab?.score,
+            factors: confSnapshot?.breakdown ? {
+                trend: confSnapshot.breakdown.trendScore,
+                momentum: confSnapshot.breakdown.momentumScore,
+                volatility: confSnapshot.breakdown.volatilityScore,
+                priceBehavior: confSnapshot.breakdown.priceBehaviorScore,
+                structure: confSnapshot.breakdown.structureScore
+            } : undefined,
             ticks: accuTickCount, result: isWin ? 'TP' : 'Loss', profit
         });
-        if (accuTradeAnalytics.length > 200) accuTradeAnalytics.shift();
+        if (accuTradeAnalytics.length > 500) accuTradeAnalytics.shift();
+
+        // Adaptive learning — recalibrate this market's factor weights every 100 trades
+        runAdaptiveLearning(accuMarket);
 
         // Add to history (with confidence column)
         addAccuHistory(accuMarket, accuGrowthRate, stake, accuTickCount, profit, isWin, confScore);
@@ -4357,6 +4592,7 @@ handleAccuContractUpdate = function(c) {
 
         // Reset UI — exactly once per settled contract, thanks to the guard above
         resetAccuUI();
+        accuLastSettleTime = Date.now(); // starts the stabilization cooldown before the next entry
         if (profitEl) { profitEl.textContent = `$${profit.toFixed(2)}`; profitEl.style.color = isWin ? 'var(--green)' : 'var(--red)'; }
 
         // ── STOP LOSS CHECK — takes priority over auto-restart ──
@@ -4375,12 +4611,12 @@ handleAccuContractUpdate = function(c) {
                         accuAutoRunning = true;
                         const bar = document.getElementById('accu-auto-bar');
                         if (bar) bar.style.display = 'flex';
-                        const threshold = parseFloat(document.getElementById('accu-conf-threshold')?.value || 85);
                         const conf = calcAccuConfidence(accuMarket);
-                        if (conf.ready && conf.score >= threshold) {
+                        if (meetsAutoThreshold(conf)) {
                             toggleAccumulator();
                         } else {
-                            log(`⏳ Auto mode: waiting for confidence ≥ ${threshold}% before next session...`, 'i');
+                            const threshold = parseFloat(document.getElementById('accu-conf-threshold')?.value || 75);
+                            log(`⏳ Auto mode: waiting for a qualifying entry (≥${threshold}%, regime-aware) before next session...`, 'i');
                             const stakeVal = parseFloat(document.getElementById('accu-stake')?.value || 1);
                             startWatchingForGreatEntry(stakeVal, tp);
                         }
@@ -4397,9 +4633,8 @@ handleAccuContractUpdate = function(c) {
                 setTimeout(() => {
                     if (accuAutoEnabled && derivWS && derivWS.readyState === WebSocket.OPEN) {
                         accuAutoRunning = true;
-                        const threshold = parseFloat(document.getElementById('accu-conf-threshold')?.value || 85);
                         const conf = calcAccuConfidence(accuMarket);
-                        if (conf.ready && conf.score >= threshold) {
+                        if (meetsAutoThreshold(conf)) {
                             toggleAccumulator();
                         } else {
                             const stakeVal = parseFloat(document.getElementById('accu-stake')?.value || 1);
