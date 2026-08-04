@@ -923,11 +923,23 @@ body{padding-bottom:60px;}
                         <optgroup label="High Risk">
                             <option value="R_75">❌ Volatility 75 Index</option>
                             <option value="R_100">❌ Volatility 100 Index</option>
-                            <option value="1HZ10V">⚠️ Volatility 10 (1s)</option>
-                            <option value="1HZ25V">⚠️ Volatility 25 (1s)</option>
-                            <option value="1HZ50V">❌ Volatility 50 (1s)</option>
-                            <option value="1HZ75V">❌ Volatility 75 (1s)</option>
-                            <option value="1HZ100V">❌ Volatility 100 (1s)</option>
+                        </optgroup>
+                        <optgroup label="1s Indices (Fast)">
+                            <option value="1HZ10V">⚡ Volatility 10 (1s)</option>
+                            <option value="1HZ25V">⚡ Volatility 25 (1s)</option>
+                            <option value="1HZ50V">⚡ Volatility 50 (1s)</option>
+                            <option value="1HZ75V">⚡ Volatility 75 (1s)</option>
+                            <option value="1HZ100V">⚡ Volatility 100 (1s)</option>
+                        </optgroup>
+                        <optgroup label="Jump Indices">
+                            <option value="jump_10">Jump 10 Index</option>
+                            <option value="jump_25">Jump 25 Index</option>
+                            <option value="jump_50">Jump 50 Index</option>
+                            <option value="jump_75">Jump 75 Index</option>
+                            <option value="jump_100">Jump 100 Index</option>
+                        </optgroup>
+                        <optgroup label="Step Indices">
+                            <option value="stpRNG">Step Index</option>
                         </optgroup>
                     </select>
                 </div>
@@ -956,7 +968,7 @@ body{padding-bottom:60px;}
                         <div id="accu-bb-label" style="font-size:9px;color:var(--muted);">—</div>
                     </div>
                     <div class="card-sm" style="padding:8px;text-align:center;">
-                        <div style="font-size:9px;color:var(--muted);margin-bottom:3px;">ADX</div>
+                        <div style="font-size:9px;color:var(--muted);margin-bottom:3px;">Tick Speed</div>
                         <div id="accu-adx" style="font-size:16px;font-weight:900;color:var(--amber);">—</div>
                         <div id="accu-adx-label" style="font-size:9px;color:var(--muted);">—</div>
                     </div>
@@ -973,6 +985,20 @@ body{padding-bottom:60px;}
                     <div class="card-sm" style="padding:8px;text-align:center;">
                         <div style="font-size:9px;color:var(--muted);margin-bottom:3px;">Tick Stability</div>
                         <div id="accu-tick-stability" style="font-size:13px;font-weight:900;color:var(--muted);">—</div>
+                    </div>
+                </div>
+                <div class="accu-row-3" style="margin-bottom:10px;">
+                    <div class="card-sm" style="padding:8px;text-align:center;">
+                        <div style="font-size:9px;color:var(--muted);margin-bottom:3px;">Market Regime</div>
+                        <div id="accu-regime" style="font-size:13px;font-weight:900;color:var(--muted);">—</div>
+                    </div>
+                    <div class="card-sm" style="padding:8px;text-align:center;">
+                        <div style="font-size:9px;color:var(--muted);margin-bottom:3px;">Spike Risk</div>
+                        <div id="accu-spike-risk" style="font-size:13px;font-weight:900;color:var(--muted);">—</div>
+                    </div>
+                    <div class="card-sm" style="padding:8px;text-align:center;">
+                        <div style="font-size:9px;color:var(--muted);margin-bottom:3px;">Micro Trend</div>
+                        <div id="accu-micro-trend" style="font-size:13px;font-weight:900;color:var(--muted);">—</div>
                     </div>
                 </div>
 
@@ -1016,7 +1042,7 @@ body{padding-bottom:60px;}
 
                 <div style="margin-bottom:10px;">
                     <div style="font-size:9px;color:var(--muted);font-weight:700;text-transform:uppercase;margin-bottom:4px;">AI Confidence Threshold (Auto Mode) %</div>
-                    <input type="number" id="accu-conf-threshold" value="85" min="50" max="99" style="text-align:center;">
+                    <input type="number" id="accu-conf-threshold" value="75" min="50" max="99" style="text-align:center;">
                 </div>
 
                 <!-- Auto mode toggle -->
