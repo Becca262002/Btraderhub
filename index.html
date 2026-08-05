@@ -264,6 +264,12 @@ body{padding-bottom:60px;}
 @media(min-width:769px){
     #mobile-bot-settings-btn { display: none !important; }
 }
+/* ── Testimonials marquee — auto-scrolls right to left ── */
+.testimonial-viewport{overflow:hidden;position:relative;-webkit-mask-image:linear-gradient(90deg,transparent,#000 24px,#000 calc(100% - 24px),transparent);mask-image:linear-gradient(90deg,transparent,#000 24px,#000 calc(100% - 24px),transparent);}
+.testimonial-track{display:flex;flex-direction:row;gap:10px;width:max-content;animation:testimonialMarquee 42s linear infinite;}
+.testimonial-viewport:hover .testimonial-track{animation-play-state:paused;}
+@keyframes testimonialMarquee{from{transform:translateX(0);}to{transform:translateX(-50%);}}
+@media(max-width:768px){.testimonial-track{animation-duration:30s;}}
     </style>
 </head>
 <body>
@@ -345,7 +351,8 @@ body{padding-bottom:60px;}
             <!-- Testimonials -->
             <div style="background:var(--bg2);border:1px solid var(--border);border-radius:12px;padding:16px;margin-bottom:16px;">
                 <div style="font-size:11px;font-weight:900;color:var(--muted);text-transform:uppercase;letter-spacing:.08em;margin-bottom:12px;">💬 What Our Traders Say</div>
-                <div style="display:flex;flex-direction:row;overflow-x:auto;gap:10px;padding-bottom:8px;scroll-snap-type:x mandatory;">
+                <div class="testimonial-viewport">
+                <div class="testimonial-track">
 
                     <!-- Testimonial 1 -->
                     <div style="background:var(--bg);border:1px solid var(--border);border-radius:10px;padding:14px;min-width:260px;max-width:260px;scroll-snap-align:start;flex-shrink:0;">
@@ -431,6 +438,86 @@ body{padding-bottom:60px;}
                         <div style="font-size:9px;color:var(--dim);margin-top:8px;">Verified Trader · 3 days ago</div>
                     </div>
 
+                    <!-- Duplicate set — makes the right-to-left marquee loop seamlessly -->
+                    <div style="background:var(--bg);border:1px solid var(--border);border-radius:10px;padding:14px;min-width:260px;max-width:260px;flex-shrink:0;" aria-hidden="true">
+                        <div style="display:flex;align-items:center;gap:10px;margin-bottom:8px;">
+                            <div style="width:38px;height:38px;border-radius:50%;background:linear-gradient(135deg,#00d2c8,#00a09a);display:flex;align-items:center;justify-content:center;font-size:16px;font-weight:900;color:#000;flex-shrink:0;">J</div>
+                            <div>
+                                <div style="font-size:12px;font-weight:900;color:var(--text);">James M.</div>
+                                <div style="font-size:10px;color:var(--muted);">Nairobi, Kenya</div>
+                            </div>
+                            <div style="margin-left:auto;color:#fbbf24;font-size:12px;">★★★★★</div>
+                        </div>
+                        <p style="font-size:11px;color:var(--muted);line-height:1.5;">"The AI scanner is incredible. It told me to trade Even Only on V50 at 89% confidence and I won 8 trades in a row. Best trading platform I've used!"</p>
+                        <div style="font-size:9px;color:var(--dim);margin-top:8px;">Verified Trader · 3 days ago</div>
+                    </div>
+
+                    <div style="background:var(--bg);border:1px solid var(--border);border-radius:10px;padding:14px;min-width:260px;max-width:260px;flex-shrink:0;" aria-hidden="true">
+                        <div style="display:flex;align-items:center;gap:10px;margin-bottom:8px;">
+                            <div style="width:38px;height:38px;border-radius:50%;background:linear-gradient(135deg,#9f7aea,#6d28d9);display:flex;align-items:center;justify-content:center;font-size:16px;font-weight:900;color:#fff;flex-shrink:0;">S</div>
+                            <div>
+                                <div style="font-size:12px;font-weight:900;color:var(--text);">Sarah K.</div>
+                                <div style="font-size:10px;color:var(--muted);">Lagos, Nigeria</div>
+                            </div>
+                            <div style="margin-left:auto;color:#fbbf24;font-size:12px;">★★★★★</div>
+                        </div>
+                        <p style="font-size:11px;color:var(--muted);line-height:1.5;">"I was skeptical at first but the bot actually works! Made $120 profit in my first week. The stop loss feature saved me when the market reversed. 10/10!"</p>
+                        <div style="font-size:9px;color:var(--dim);margin-top:8px;">Verified Trader · 1 week ago</div>
+                    </div>
+
+                    <div style="background:var(--bg);border:1px solid var(--border);border-radius:10px;padding:14px;min-width:260px;max-width:260px;flex-shrink:0;" aria-hidden="true">
+                        <div style="display:flex;align-items:center;gap:10px;margin-bottom:8px;">
+                            <div style="width:38px;height:38px;border-radius:50%;background:linear-gradient(135deg,#f59e0b,#d97706);display:flex;align-items:center;justify-content:center;font-size:16px;font-weight:900;color:#000;flex-shrink:0;">D</div>
+                            <div>
+                                <div style="font-size:12px;font-weight:900;color:var(--text);">David O.</div>
+                                <div style="font-size:10px;color:var(--muted);">Accra, Ghana</div>
+                            </div>
+                            <div style="margin-left:auto;color:#fbbf24;font-size:12px;">★★★★☆</div>
+                        </div>
+                        <p style="font-size:11px;color:var(--muted);line-height:1.5;">"The digit stats are exactly like Deriv's own platform. I use the AI scanner every morning to find the best market before I start trading. Very professional!"</p>
+                        <div style="font-size:9px;color:var(--dim);margin-top:8px;">Verified Trader · 2 weeks ago</div>
+                    </div>
+
+                    <div style="background:var(--bg);border:1px solid var(--border);border-radius:10px;padding:14px;min-width:260px;max-width:260px;flex-shrink:0;" aria-hidden="true">
+                        <div style="display:flex;align-items:center;gap:10px;margin-bottom:8px;">
+                            <div style="width:38px;height:38px;border-radius:50%;background:linear-gradient(135deg,#ff444f,#c0001a);display:flex;align-items:center;justify-content:center;font-size:16px;font-weight:900;color:#fff;flex-shrink:0;">A</div>
+                            <div>
+                                <div style="font-size:12px;font-weight:900;color:var(--text);">Amina B.</div>
+                                <div style="font-size:10px;color:var(--muted);">Dar es Salaam, Tanzania</div>
+                            </div>
+                            <div style="margin-left:auto;color:#fbbf24;font-size:12px;">★★★★★</div>
+                        </div>
+                        <p style="font-size:11px;color:var(--muted);line-height:1.5;">"Finally a platform that works on my phone! The AI auto-update feature is amazing — it changes direction based on market conditions automatically. Love it!"</p>
+                        <div style="font-size:9px;color:var(--dim);margin-top:8px;">Verified Trader · 5 days ago</div>
+                    </div>
+
+                    <div style="background:var(--bg);border:1px solid var(--border);border-radius:10px;padding:14px;min-width:260px;max-width:260px;flex-shrink:0;" aria-hidden="true">
+                        <div style="display:flex;align-items:center;gap:10px;margin-bottom:8px;">
+                            <div style="width:38px;height:38px;border-radius:50%;background:linear-gradient(135deg,#10b981,#059669);display:flex;align-items:center;justify-content:center;font-size:16px;font-weight:900;color:#fff;flex-shrink:0;">P</div>
+                            <div>
+                                <div style="font-size:12px;font-weight:900;color:var(--text);">Peter N.</div>
+                                <div style="font-size:10px;color:var(--muted);">Kampala, Uganda</div>
+                            </div>
+                            <div style="margin-left:auto;color:#fbbf24;font-size:12px;">★★★★★</div>
+                        </div>
+                        <p style="font-size:11px;color:var(--muted);line-height:1.5;">"The martingale with stop loss is perfectly balanced. I set $5 stop loss and $20 take profit and the bot handles everything. Withdrew $200 this month!"</p>
+                        <div style="font-size:9px;color:var(--dim);margin-top:8px;">Verified Trader · 1 week ago</div>
+                    </div>
+
+                    <div style="background:var(--bg);border:1px solid var(--border);border-radius:10px;padding:14px;min-width:260px;max-width:260px;flex-shrink:0;" aria-hidden="true">
+                        <div style="display:flex;align-items:center;gap:10px;margin-bottom:8px;">
+                            <div style="width:38px;height:38px;border-radius:50%;background:linear-gradient(135deg,#3b82f6,#1d4ed8);display:flex;align-items:center;justify-content:center;font-size:16px;font-weight:900;color:#fff;flex-shrink:0;">R</div>
+                            <div>
+                                <div style="font-size:12px;font-weight:900;color:var(--text);">Ruth W.</div>
+                                <div style="font-size:10px;color:var(--muted);">Mombasa, Kenya</div>
+                            </div>
+                            <div style="margin-left:auto;color:#fbbf24;font-size:12px;">★★★★★</div>
+                        </div>
+                        <p style="font-size:11px;color:var(--muted);line-height:1.5;">"I connected my Deriv account in less than a minute. The interface is clean and easy to understand even for beginners. The AI signals are spot on!"</p>
+                        <div style="font-size:9px;color:var(--dim);margin-top:8px;">Verified Trader · 3 days ago</div>
+                    </div>
+
+                </div>
                 </div>
             </div>
 
