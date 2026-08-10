@@ -224,6 +224,10 @@ body{padding-bottom:60px;}
 .accu-row-3{display:grid;grid-template-columns:1fr 1fr 1fr;gap:8px;}
 .accu-card{padding:12px;}
 
+/* ── APA style selector ── */
+.apa-style-btn.apa-style-active{border-color:var(--teal);background:#00d2c814;color:var(--teal);}
+.apa-style-btn.apa-style-active span{color:inherit;}
+
 @media(max-width:768px){
     /* Hide sidebars by default on mobile */
     .sidebar,.sidebar-right{ display:none; }
@@ -1252,62 +1256,123 @@ body{padding-bottom:60px;}
     </div>
 </div>
 
-<!-- ── MT5 SIGNALS ── -->
+<!-- ── MT5 + ADVANCED PRICE ACTION TRADING ── -->
 <div id="mt5-pane" class="tab-pane scroll" style="padding:16px;">
-    <div style="max-width:860px;margin:0 auto;">
+    <div style="max-width:920px;margin:0 auto;">
 
         <!-- Header -->
-        <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:16px;flex-wrap:wrap;gap:10px;">
+        <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:14px;flex-wrap:wrap;gap:10px;">
             <div>
-                <h2 style="font-size:18px;font-weight:900;">📊 MT5 CFD Signals</h2>
-                <p style="font-size:11px;color:var(--muted);margin-top:3px;">AI-powered signals for Deriv MT5. Click any signal to open MT5 and trade instantly.</p>
+                <h2 style="font-size:18px;font-weight:900;">📊 MT5 — Advanced Price Action</h2>
+                <p style="font-size:11px;color:var(--muted);margin-top:3px;">Real multi-timeframe structure, liquidity &amp; displacement analysis. Applies a validated setup into the real MT5 terminal — never auto-executed.</p>
             </div>
-            <div style="display:flex;gap:8px;align-items:center;">
-                <button onclick="refreshMT5Signals()" class="btn btn-teal" style="font-size:11px;padding:7px 16px;">🔄 Refresh Signals</button>
-                <a href="https://app.deriv.com/mt5" target="_blank" class="btn btn-ghost" style="font-size:11px;padding:7px 16px;text-decoration:none;">Open MT5 →</a>
+            <a href="https://app.deriv.com/mt5" target="_blank" class="btn btn-ghost" style="font-size:11px;padding:7px 16px;text-decoration:none;">Open MT5 →</a>
+        </div>
+
+        <!-- Trading style selector -->
+        <div class="card" style="padding:14px;margin-bottom:14px;">
+            <div style="font-size:10px;font-weight:700;color:var(--muted);text-transform:uppercase;margin-bottom:10px;">How do you trade?</div>
+            <div class="accu-row-3">
+                <button class="btn btn-ghost apa-style-btn" onclick="selectApaStyle('quick',this)" style="padding:12px;text-align:left;flex-direction:column;align-items:flex-start;gap:2px;">
+                    <span style="font-size:12px;font-weight:900;">⚡ Quick Profit</span>
+                    <span style="font-size:9px;color:var(--muted);font-weight:400;">Short-term setups, closed relatively quickly</span>
+                </button>
+                <button class="btn btn-ghost apa-style-btn apa-style-active" onclick="selectApaStyle('day',this)" style="padding:12px;text-align:left;flex-direction:column;align-items:flex-start;gap:2px;">
+                    <span style="font-size:12px;font-weight:900;">📅 Day Trading</span>
+                    <span style="font-size:9px;color:var(--muted);font-weight:400;">Intraday moves, closed within the session</span>
+                </button>
+                <button class="btn btn-ghost apa-style-btn" onclick="selectApaStyle('swing',this)" style="padding:12px;text-align:left;flex-direction:column;align-items:flex-start;gap:2px;">
+                    <span style="font-size:12px;font-weight:900;">📈 Swing Trading</span>
+                    <span style="font-size:9px;color:var(--muted);font-weight:400;">Fewer, larger setups — held longer</span>
+                </button>
             </div>
         </div>
 
-        <!-- How it works banner -->
-        <div style="background:#00d2c818;border:1px solid #00d2c844;border-radius:10px;padding:14px;margin-bottom:16px;display:flex;align-items:center;gap:12px;">
-            <div style="font-size:24px;">💡</div>
-            <div>
-                <div style="font-size:12px;font-weight:700;color:var(--teal);margin-bottom:3px;">How to use MT5 Signals</div>
-                <div style="font-size:11px;color:var(--muted);">1. Our AI scans CFD markets in real time &nbsp;→&nbsp; 2. Click <b style="color:var(--teal);">Trade on MT5</b> on any signal &nbsp;→&nbsp; 3. MT5 opens with the instrument ready &nbsp;→&nbsp; 4. Confirm your trade</div>
+        <div class="accu-row-2">
+            <!-- Market select + Setup card -->
+            <div class="card accu-card">
+                <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:10px;">
+                    <div style="font-size:10px;font-weight:700;color:var(--muted);text-transform:uppercase;">📈 APA Setup</div>
+                    <button onclick="runApaAnalysis()" class="btn btn-ghost" style="font-size:10px;padding:4px 10px;">🔄 Re-analyze</button>
+                </div>
+                <select id="apa-market-select" onchange="onApaMarketChange(this.value)" style="font-size:12px;margin-bottom:10px;">
+                    <optgroup label="Volatility Indices">
+                        <option value="R_10">Volatility 10 Index</option>
+                        <option value="R_25">Volatility 25 Index</option>
+                        <option value="R_50">Volatility 50 Index</option>
+                        <option value="R_75" selected>Volatility 75 Index</option>
+                        <option value="R_100">Volatility 100 Index</option>
+                    </optgroup>
+                    <optgroup label="Volatility (1s) Indices">
+                        <option value="1HZ10V">Volatility 10 (1s) Index</option>
+                        <option value="1HZ25V">Volatility 25 (1s) Index</option>
+                        <option value="1HZ50V">Volatility 50 (1s) Index</option>
+                        <option value="1HZ75V">Volatility 75 (1s) Index</option>
+                        <option value="1HZ100V">Volatility 100 (1s) Index</option>
+                    </optgroup>
+                    <optgroup label="Step">
+                        <option value="stpRNG">Step Index</option>
+                    </optgroup>
+                    <optgroup label="Boom &amp; Crash (validated live)">
+                        <option value="BOOM300N">Boom 300 Index</option>
+                        <option value="BOOM500">Boom 500 Index</option>
+                        <option value="BOOM600">Boom 600 Index</option>
+                        <option value="BOOM900">Boom 900 Index</option>
+                        <option value="BOOM1000">Boom 1000 Index</option>
+                        <option value="CRASH300N">Crash 300 Index</option>
+                        <option value="CRASH500">Crash 500 Index</option>
+                        <option value="CRASH600">Crash 600 Index</option>
+                        <option value="CRASH900">Crash 900 Index</option>
+                        <option value="CRASH1000">Crash 1000 Index</option>
+                    </optgroup>
+                </select>
+
+                <div id="apa-setup-card">
+                    <div style="font-size:12px;color:var(--muted);text-align:center;padding:20px;">Select a market to analyze.</div>
+                </div>
+            </div>
+
+            <!-- Risk + scanner filters -->
+            <div class="card accu-card">
+                <div style="font-size:10px;font-weight:700;color:var(--muted);text-transform:uppercase;margin-bottom:10px;">⚙️ Risk &amp; Scanner</div>
+                <div style="margin-bottom:12px;">
+                    <div style="font-size:9px;color:var(--muted);font-weight:700;text-transform:uppercase;margin-bottom:4px;">Risk per Trade</div>
+                    <select id="apa-risk" onchange="saveApaPrefs()" style="font-size:12px;">
+                        <option value="0.25">0.25%</option>
+                        <option value="0.5">0.5%</option>
+                        <option value="1" selected>1% (default)</option>
+                        <option value="2">2%</option>
+                    </select>
+                </div>
+                <div style="font-size:9px;color:var(--muted);font-weight:700;text-transform:uppercase;margin-bottom:6px;">Scanner Filter</div>
+                <div id="apa-scanner-filters" style="display:flex;gap:6px;flex-wrap:wrap;margin-bottom:10px;">
+                    <button onclick="filterApaScanner('all',this)"          class="btn btn-teal"  style="font-size:10px;padding:5px 10px;">All</button>
+                    <button onclick="filterApaScanner('volatility',this)"   class="btn btn-ghost" style="font-size:10px;padding:5px 10px;">Volatility</button>
+                    <button onclick="filterApaScanner('volatility_1s',this)"class="btn btn-ghost" style="font-size:10px;padding:5px 10px;">1s</button>
+                    <button onclick="filterApaScanner('step',this)"         class="btn btn-ghost" style="font-size:10px;padding:5px 10px;">Step</button>
+                    <button onclick="filterApaScanner('boom_crash',this)"   class="btn btn-ghost" style="font-size:10px;padding:5px 10px;">Boom/Crash</button>
+                </div>
+                <button onclick="refreshApaScanner()" class="btn btn-ghost" style="width:100%;font-size:11px;padding:8px;">🔄 Refresh Scanner</button>
             </div>
         </div>
 
-        <!-- Market selector -->
-        <div style="display:flex;gap:8px;margin-bottom:14px;flex-wrap:wrap;">
-            <button onclick="filterMT5('all',this)"        class="btn btn-teal"  style="font-size:11px;padding:5px 14px;">All</button>
-            <button onclick="filterMT5('boom_crash',this)" class="btn btn-ghost" style="font-size:11px;padding:5px 14px;">🚀💥 Boom &amp; Crash</button>
-            <button onclick="filterMT5('step',this)"       class="btn btn-ghost" style="font-size:11px;padding:5px 14px;">👣 Step Index</button>
-            <button onclick="filterMT5('volatility',this)" class="btn btn-ghost" style="font-size:11px;padding:5px 14px;">📊 Volatility</button>
-        </div>
-
-        <!-- COMING SOON banner -->
-        <div style="background:linear-gradient(135deg,#00d2c818,#9f7aea18);border:2px dashed #00d2c844;border-radius:14px;padding:40px;text-align:center;margin-bottom:16px;">
-            <div style="font-size:40px;margin-bottom:12px;">🚀</div>
-            <div style="font-size:22px;font-weight:900;color:var(--teal);margin-bottom:8px;">MT5 Direct Trading — Coming Soon!</div>
-            <div style="font-size:13px;color:var(--muted);margin-bottom:16px;max-width:500px;margin-left:auto;margin-right:auto;">We are building full MT5 integration so you can trade CFDs, Forex, Crypto and Commodities directly on Btraderhub without leaving the platform.</div>
-            <div style="display:flex;gap:10px;justify-content:center;flex-wrap:wrap;margin-bottom:16px;">
-                <span class="badge badge-teal">💱 Forex</span>
-                <span class="badge badge-purple">₿ Crypto</span>
-                <span class="badge badge-amber">🥇 Commodities</span>
-                <span class="badge badge-blue">📈 Indices</span>
-                <span class="badge badge-green">🚀 Boom &amp; Crash</span>
+        <!-- APA Market Scanner -->
+        <div class="card accu-card" style="margin-top:14px;">
+            <div style="font-size:10px;font-weight:700;color:var(--muted);text-transform:uppercase;margin-bottom:10px;">🔍 APA Market Scanner</div>
+            <div style="display:flex;padding:6px 0;border-bottom:1px solid var(--border);font-size:10px;font-weight:700;color:var(--muted);">
+                <div style="flex:1;">Market</div>
+                <div style="width:60px;">Dir</div>
+                <div style="width:50px;">Score</div>
+                <div style="width:100px;">Setup</div>
             </div>
-            <button class="btn btn-teal" style="padding:12px 32px;font-size:14px;font-weight:900;border-radius:10px;" onclick="notify('🔔 Coming Soon!','We will notify you when MT5 direct trading is live on Btraderhub!','ok')">
-                🔔 Notify Me When Live
-            </button>
+            <div id="apa-scanner-body">
+                <div style="font-size:11px;color:var(--dim);text-align:center;padding:16px;">Open this tab to scan markets.</div>
+            </div>
         </div>
-
-        <!-- Signals grid (hidden until MT5 ready) -->
-        <div id="mt5-signals-grid" style="display:grid;grid-template-columns:repeat(auto-fill,minmax(260px,1fr));gap:12px;opacity:0.4;pointer-events:none;"></div>
 
         <!-- Disclaimer -->
-        <div style="margin-top:20px;padding:12px;background:var(--bg2);border:1px solid var(--border);border-radius:8px;">
-            <p style="font-size:10px;color:var(--muted);line-height:1.6;">⚠️ <b>Risk Warning:</b> CFD trading involves significant risk of loss. These signals are generated by AI analysis and are for informational purposes only. They do not constitute financial advice. Always use stop loss and only trade with money you can afford to lose. Past performance does not guarantee future results.</p>
+        <div style="margin-top:14px;padding:12px;background:var(--bg2);border:1px solid var(--border);border-radius:8px;">
+            <p style="font-size:10px;color:var(--muted);line-height:1.6;">⚠️ <b>Risk Warning:</b> This is a decision-support tool, not financial advice. Setups are generated by automated price-action analysis and can be wrong. Deriv's public API cannot place MT5 orders directly — "Apply to MT5" opens the real MT5 terminal with the setup's levels for you to place yourself, after you confirm. Always verify the account, market and price before trading.</p>
         </div>
     </div>
 </div>
