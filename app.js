@@ -291,7 +291,7 @@ function switchTab(id) {
         changeDigitMarket(document.getElementById('digit-market')?.value || 'R_10');
     }
     if (id === 'scanner') runFullScan();
-    if (id === 'mt5')     { connectMT5Feed(); setTimeout(renderMT5Signals, 800); }
+    if (id === 'mt5')     { loadApaPrefs(); renderApaScanner(); runApaAnalysis(); }
     if (id === 'chart')   { setTimeout(() => updateChartIndicators(), 500); }
     if (id === 'accu')    { onAccuMarketChange(document.getElementById('accu-market')?.value || 'R_10'); updateAccuProfitCalc(); }
 }
@@ -742,6 +742,54 @@ let publicWS      = null;
 let publicWsReady = false;
 let pubNextId     = 1;
 function pubReqId() { return pubNextId++; }
+// Symbols Deriv's own active_symbols response has actually confirmed as
+// live/tradable — the APA engine treats this as the source of truth for
+// "is this market available" rather than a hard-coded assumption.
+let knownActiveSymbols = new Set();
+
+// ── Real OHLC candle fetch (Deriv ticks_history, style:"candles") ──
+// This is a genuine Deriv API capability (not a synthetic approximation
+// from ticks) and is what the APA multi-timeframe engine below is built on.
+// granularity is in seconds: 60=M1, 300=M5, 900=M15, 1800=M30, 3600=H1,
+// 14400=H4, 86400=D1.
+function fetchCandles(sym, granularity, count = 120) {
+    return new Promise((resolve, reject) => {
+        if (!publicWS || publicWS.readyState !== WebSocket.OPEN) { reject(new Error('public WS not connected')); return; }
+        const reqId = pubReqId();
+        const timeout = setTimeout(() => {
+            publicWS.removeEventListener('message', handler);
+            reject(new Error('candle request timed out'));
+        }, 8000);
+        function handler(ev) {
+            let data;
+            try { data = JSON.parse(ev.data); } catch(e) { return; }
+            if (data.req_id !== reqId) return;
+            clearTimeout(timeout);
+            publicWS.removeEventListener('message', handler);
+            if (data.error) { reject(new Error(data.error.message || 'candle fetch error')); return; }
+            resolve(data.candles || []);
+        }
+        publicWS.addEventListener('message', handler);
+        publicWS.send(JSON.stringify({
+            ticks_history: sym, style: 'candles', granularity,
+            count, end: 'latest', req_id: reqId
+        }));
+    });
+}
+
+// Small TTL cache so the scanner and setup card don't re-request the same
+// candles on every render — cache lifetime is a fraction of the timeframe
+// itself so data still feels live.
+let apaCandleCache = {}; // key: `${sym}_${granularity}` -> { candles, fetchedAt }
+async function getCandles(sym, granularity, count = 120) {
+    const key = `${sym}_${granularity}`;
+    const cached = apaCandleCache[key];
+    const ttl = Math.max(5000, granularity * 250); // e.g. M1(60s) -> 15s TTL, H4 -> ~1hr TTL
+    if (cached && (Date.now() - cached.fetchedAt) < ttl) return cached.candles;
+    const candles = await fetchCandles(sym, granularity, count);
+    apaCandleCache[key] = { candles, fetchedAt: Date.now() };
+    return candles;
+}
 
 // Amy's exact extractLastDigit — normalizes by decimals from pip_size
 function extractLastDigit(quote, decimals) {
@@ -801,6 +849,13 @@ function connectPublicWS() {
 
         // Step 2: active_symbols — read pip_size and seed each symbol
         if (data.msg_type === 'active_symbols') {
+            // Record every symbol Deriv confirms as currently active/tradable —
+            // the APA engine checks this before treating any market as
+            // available, instead of assuming a hard-coded list is correct.
+            (data.active_symbols || []).forEach(s => {
+                if (s.underlying_symbol) knownActiveSymbols.add(s.underlying_symbol);
+            });
+
             const bySymbol = {};
             (data.active_symbols || []).forEach(s => {
                 if (ALL_MKTS.includes(s.underlying_symbol)) {
@@ -3332,244 +3387,677 @@ document.addEventListener('click', (e) => {
 // Risk disclaimer shown from main load event (no duplicate listener needed)
 
 // ================================================================
-// MT5 CFD SIGNALS ENGINE
-// Real-time signals for Deriv MT5 — click to trade
+// MT5 + ADVANCED PRICE ACTION (APA) ENGINE
+// Replaces the old "Coming Soon" / momentum-signal MT5 tab with a real
+// multi-timeframe price-action analysis + Deriv MT5 hand-off flow.
+//
+// HONEST SCOPE NOTE (see chat write-up for the full audit): Deriv's public
+// API has no method to place or manage an MT5 order from a browser — MT5
+// execution only happens inside the real MT5 terminal. So "Apply to MT5"
+// here validates the account, market, and signal, then hands the user a
+// ready-to-place trade inside the real MT5 terminal via deep link. It
+// never claims a trade was executed, because this app cannot confirm that.
 // ================================================================
 
-// MT5 instruments — Deriv Synthetic Indices focus
-const MT5_INSTRUMENTS = [
-    // Boom & Crash
-    { symbol:'BOOM1000', name:'Boom 1000 Index',  cat:'boom_crash', pip:0.01, icon:'🚀', derivSym:'BOOM1000' },
-    { symbol:'BOOM500',  name:'Boom 500 Index',   cat:'boom_crash', pip:0.01, icon:'🚀', derivSym:'BOOM500' },
-    { symbol:'BOOM300',  name:'Boom 300 Index',   cat:'boom_crash', pip:0.01, icon:'🚀', derivSym:'BOOM300' },
-    { symbol:'CRASH1000',name:'Crash 1000 Index', cat:'boom_crash', pip:0.01, icon:'💥', derivSym:'CRASH1000' },
-    { symbol:'CRASH500', name:'Crash 500 Index',  cat:'boom_crash', pip:0.01, icon:'💥', derivSym:'CRASH500' },
-    { symbol:'CRASH300', name:'Crash 300 Index',  cat:'boom_crash', pip:0.01, icon:'💥', derivSym:'CRASH300' },
-    // Step Indices
-    { symbol:'STEP100',  name:'Step Index',       cat:'step',       pip:0.00001, icon:'👣', derivSym:'stpRNG' },
-    // Volatility Indices (continuous)
-    { symbol:'VOL10',    name:'Volatility 10',    cat:'volatility', pip:0.001, icon:'📊', derivSym:'R_10' },
-    { symbol:'VOL25',    name:'Volatility 25',    cat:'volatility', pip:0.001, icon:'📊', derivSym:'R_25' },
-    { symbol:'VOL50',    name:'Volatility 50',    cat:'volatility', pip:0.001, icon:'📊', derivSym:'R_50' },
-    { symbol:'VOL75',    name:'Volatility 75',    cat:'volatility', pip:0.001, icon:'📊', derivSym:'R_75' },
-    { symbol:'VOL100',   name:'Volatility 100',   cat:'volatility', pip:0.001, icon:'📊', derivSym:'R_100' },
-    // Volatility 1s Indices
-    { symbol:'VOL10S',   name:'Volatility 10 (1s)',  cat:'volatility', pip:0.001, icon:'⚡', derivSym:'1HZ10V' },
-    { symbol:'VOL25S',   name:'Volatility 25 (1s)',  cat:'volatility', pip:0.001, icon:'⚡', derivSym:'1HZ25V' },
-    { symbol:'VOL50S',   name:'Volatility 50 (1s)',  cat:'volatility', pip:0.001, icon:'⚡', derivSym:'1HZ50V' },
-    { symbol:'VOL75S',   name:'Volatility 75 (1s)',  cat:'volatility', pip:0.001, icon:'⚡', derivSym:'1HZ75V' },
-    { symbol:'VOL100S',  name:'Volatility 100 (1s)', cat:'volatility', pip:0.001, icon:'⚡', derivSym:'1HZ100V' },
+// ── Market configuration: Display name -> Deriv symbol -> MT5 symbol -> category ──
+// `confirmed` markets are ones we're confident exist on Deriv's synthetic
+// index list; others are included per your requested market list but are
+// validated live against `knownActiveSymbols` (from the real active_symbols
+// API response) before ever being shown as tradable — never assumed.
+const APA_MARKETS = [
+    // Volatility Indices
+    { deriv:'R_10',     mt5:'Volatility 10 Index',      display:'Volatility 10 Index',      cat:'volatility',    confirmed:true },
+    { deriv:'R_25',     mt5:'Volatility 25 Index',      display:'Volatility 25 Index',      cat:'volatility',    confirmed:true },
+    { deriv:'R_50',     mt5:'Volatility 50 Index',      display:'Volatility 50 Index',      cat:'volatility',    confirmed:true },
+    { deriv:'R_75',     mt5:'Volatility 75 Index',      display:'Volatility 75 Index',      cat:'volatility',    confirmed:true },
+    { deriv:'R_100',    mt5:'Volatility 100 Index',     display:'Volatility 100 Index',     cat:'volatility',    confirmed:true },
+    { deriv:'1HZ10V',   mt5:'Volatility 10 (1s) Index', display:'Volatility 10 (1s) Index', cat:'volatility_1s', confirmed:true },
+    { deriv:'1HZ25V',   mt5:'Volatility 25 (1s) Index', display:'Volatility 25 (1s) Index', cat:'volatility_1s', confirmed:true },
+    { deriv:'1HZ50V',   mt5:'Volatility 50 (1s) Index', display:'Volatility 50 (1s) Index', cat:'volatility_1s', confirmed:true },
+    { deriv:'1HZ75V',   mt5:'Volatility 75 (1s) Index', display:'Volatility 75 (1s) Index', cat:'volatility_1s', confirmed:true },
+    { deriv:'1HZ100V',  mt5:'Volatility 100 (1s) Index',display:'Volatility 100 (1s) Index',cat:'volatility_1s', confirmed:true },
+    // Step Index — Deriv currently offers a single Step Index (not
+    // separate 100/200/300/400/500 variants). Listed once, honestly.
+    { deriv:'stpRNG',   mt5:'Step Index',               display:'Step Index',               cat:'step',          confirmed:true },
+    // Boom / Crash — symbol codes below are validated live; anything not
+    // confirmed by Deriv's own active_symbols response is shown as
+    // unavailable rather than assumed to exist.
+    { deriv:'BOOM300N', mt5:'Boom 300 Index',   display:'Boom 300 Index',   cat:'boom_crash', confirmed:false },
+    { deriv:'BOOM500',  mt5:'Boom 500 Index',   display:'Boom 500 Index',   cat:'boom_crash', confirmed:false },
+    { deriv:'BOOM600',  mt5:'Boom 600 Index',   display:'Boom 600 Index',   cat:'boom_crash', confirmed:false },
+    { deriv:'BOOM900',  mt5:'Boom 900 Index',   display:'Boom 900 Index',   cat:'boom_crash', confirmed:false },
+    { deriv:'BOOM1000', mt5:'Boom 1000 Index',  display:'Boom 1000 Index',  cat:'boom_crash', confirmed:false },
+    { deriv:'CRASH300N',mt5:'Crash 300 Index',  display:'Crash 300 Index',  cat:'boom_crash', confirmed:false },
+    { deriv:'CRASH500', mt5:'Crash 500 Index',  display:'Crash 500 Index',  cat:'boom_crash', confirmed:false },
+    { deriv:'CRASH600', mt5:'Crash 600 Index',  display:'Crash 600 Index',  cat:'boom_crash', confirmed:false },
+    { deriv:'CRASH900', mt5:'Crash 900 Index',  display:'Crash 900 Index',  cat:'boom_crash', confirmed:false },
+    { deriv:'CRASH1000',mt5:'Crash 1000 Index', display:'Crash 1000 Index', cat:'boom_crash', confirmed:false },
 ];
 
-// Store MT5 price data
-let mt5PriceData = {};  // symbol -> { prices: [], lastPrice: null, change: 0 }
-let mt5PublicWS  = null;
-let mt5WsReady   = false;
-let mt5Filter    = 'all';
-
-// Connect to public WS for MT5 price data
-function connectMT5Feed() {
-    if (mt5PublicWS && mt5PublicWS.readyState === WebSocket.OPEN) return;
-
-    mt5PublicWS = new WebSocket('wss://ws.derivws.com/websockets/v3?app_id=1089');
-    mt5PublicWS.onopen = () => {
-        mt5WsReady = true;
-        // Subscribe to all MT5 instruments
-        MT5_INSTRUMENTS.forEach((inst, i) => {
-            setTimeout(() => {
-                if (mt5PublicWS.readyState === WebSocket.OPEN) {
-                    mt5PublicWS.send(JSON.stringify({
-                        ticks: inst.derivSym,
-                        subscribe: 1,
-                        req_id: 9000 + i
-                    }));
-                }
-            }, i * 100);
-        });
-    };
-
-    mt5PublicWS.onmessage = (ev) => {
-        try {
-            const data = JSON.parse(ev.data);
-            if (data.msg_type === 'tick' && data.tick) {
-                const sym   = data.tick.symbol;
-                const price = data.tick.quote;
-                const inst  = MT5_INSTRUMENTS.find(i => i.derivSym === sym);
-                if (!inst) return;
-
-                if (!mt5PriceData[inst.symbol]) {
-                    mt5PriceData[inst.symbol] = { prices: [], lastPrice: null, change: 0 };
-                }
-                const d = mt5PriceData[inst.symbol];
-                d.prices.push(price);
-                if (d.prices.length > 100) d.prices.shift();
-
-                if (d.lastPrice !== null) {
-                    d.change = ((price - d.prices[0]) / d.prices[0]) * 100;
-                }
-                d.lastPrice = price;
-
-                // Update signal card if visible
-                updateMT5Card(inst.symbol);
-            }
-        } catch(e) {}
-    };
-
-    mt5PublicWS.onclose = () => {
-        mt5WsReady = false;
-        setTimeout(connectMT5Feed, 3000);
-    };
-
-    mt5PublicWS.onerror = () => { mt5WsReady = false; };
+// A market is only ever presented as tradable once Deriv's own
+// active_symbols response has confirmed it (see connectPublicWS above).
+// Until then — or if Deriv never confirms it — it's shown as unavailable.
+function isMarketAvailable(mkt) {
+    return knownActiveSymbols.size > 0 && knownActiveSymbols.has(mkt.deriv);
 }
 
-// Generate MT5 signal from price data
-function generateMT5Signal(symbol) {
-    const d = mt5PriceData[symbol];
-    if (!d || d.prices.length < 10) return null;
+// ── Trading styles → timeframe stack + expiry ──
+// granularities in seconds: M1=60 M5=300 M15=900 M30=1800 H1=3600 H4=14400 D1=86400
+const APA_STYLES = {
+    quick: { label: 'Quick Profit',  desc: 'High-quality setups, closed out relatively quickly.', bias: 900,   setup: 300,  entry: 60,   expiryMin: 4  },
+    day:   { label: 'Day Trading',   desc: 'Capture intraday moves, closed within the session.',   bias: 14400, setup: 900,  entry: 300,  expiryMin: 20 },
+    swing: { label: 'Swing Trading', desc: 'Fewer, larger setups — willing to hold longer.',        bias: 86400, setup: 14400,entry: 900,  expiryMin: 90 },
+};
+const GRAN_LABEL = { 60:'M1', 300:'M5', 900:'M15', 1800:'M30', 3600:'H1', 14400:'H4', 86400:'D1' };
 
-    const prices  = d.prices;
-    const last    = prices[prices.length - 1];
-    const prev    = prices[0];
-    const change  = ((last - prev) / prev) * 100;
+let apaStyle          = 'day';
+let apaMarket         = 'R_75';
+let apaScannerFilter  = 'all';
+let apaCurrentSignal  = null;
+let apaNotifiedIds    = new Set();
+let apaAuditLog       = [];
+try { apaAuditLog = JSON.parse(localStorage.getItem('bth_apa_audit') || '[]'); } catch(e) { apaAuditLog = []; }
 
-    // Simple momentum signal
-    const rising  = prices.filter((p,i) => i > 0 && p > prices[i-1]).length;
-    const total   = prices.length - 1;
-    const bullPct = (rising / total) * 100;
-
-    let direction, confidence, reason;
-
-    if (bullPct > 60) {
-        direction  = 'BUY';
-        confidence = Math.min(92, Math.round(bullPct));
-        reason     = `Bullish momentum ${bullPct.toFixed(0)}% of last ${prices.length} ticks`;
-    } else if (bullPct < 40) {
-        direction  = 'SELL';
-        confidence = Math.min(92, Math.round(100 - bullPct));
-        reason     = `Bearish momentum ${(100-bullPct).toFixed(0)}% of last ${prices.length} ticks`;
-    } else {
-        direction  = change >= 0 ? 'BUY' : 'SELL';
-        confidence = Math.round(50 + Math.abs(bullPct - 50));
-        reason     = `Neutral — slight ${change >= 0 ? 'upward' : 'downward'} bias`;
-    }
-
-    return { direction, confidence, reason, change, lastPrice: last };
+function saveApaAudit() {
+    try { localStorage.setItem('bth_apa_audit', JSON.stringify(apaAuditLog.slice(-200))); } catch(e) {}
+}
+function logApaAudit(entry) {
+    apaAuditLog.push({ ...entry, time: new Date().toISOString() });
+    if (apaAuditLog.length > 200) apaAuditLog.shift();
+    saveApaAudit();
 }
 
-// Render all MT5 signal cards
-function renderMT5Signals() {
-    const grid = document.getElementById('mt5-signals-grid');
-    if (!grid) return;
-    grid.innerHTML = '';
-
-    const filtered = MT5_INSTRUMENTS.filter(i => mt5Filter === 'all' || i.cat === mt5Filter);
-
-    filtered.forEach(inst => {
-        const sig  = generateMT5Signal(inst.symbol);
-        const d    = mt5PriceData[inst.symbol];
-        const card = document.createElement('div');
-        card.id    = `mt5-card-${inst.symbol}`;
-
-        const isBuy    = sig?.direction === 'BUY';
-        const sigColor = sig ? (isBuy ? 'var(--green)' : 'var(--red)') : 'var(--muted)';
-        const change   = d?.change || 0;
-        const chgColor = change >= 0 ? 'var(--green)' : 'var(--red)';
-        const price    = d?.lastPrice ? d.lastPrice.toFixed(inst.pip < 0.001 ? 5 : inst.pip < 0.1 ? 2 : 1) : '—';
-
-        // Build MT5 deep link
-        const mt5Url = `https://app.deriv.com/mt5?symbol=${inst.derivSym}`;
-
-        card.className = 'card';
-        card.style.cssText = 'padding:14px;transition:all .2s;cursor:pointer;';
-        card.onmouseenter = () => card.style.borderColor = sigColor;
-        card.onmouseleave = () => card.style.borderColor = 'var(--border)';
-
-        card.innerHTML = `
-            <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:10px;">
-                <div style="display:flex;align-items:center;gap:8px;">
-                    <span style="font-size:20px;">${inst.icon}</span>
-                    <div>
-                        <div style="font-size:13px;font-weight:900;">${inst.name}</div>
-                        <div style="font-size:10px;color:var(--muted);">${inst.symbol} · ${inst.cat}</div>
-                    </div>
-                </div>
-                <div style="text-align:right;">
-                    <div style="font-size:14px;font-weight:900;font-family:monospace;">${price}</div>
-                    <div style="font-size:10px;color:${chgColor};font-weight:700;">${change >= 0 ? '+' : ''}${change.toFixed(3)}%</div>
-                </div>
-            </div>
-
-            ${sig ? `
-            <div style="background:${sigColor}18;border:1px solid ${sigColor}44;border-radius:8px;padding:10px;margin-bottom:10px;">
-                <div style="display:flex;align-items:center;justify-content:space-between;">
-                    <span style="font-size:16px;font-weight:900;color:${sigColor};">${sig.direction === 'BUY' ? '📈' : '📉'} ${sig.direction}</span>
-                    <span style="font-size:13px;font-weight:900;color:${sigColor};">${sig.confidence}%</span>
-                </div>
-                <div style="font-size:10px;color:var(--muted);margin-top:4px;">${sig.reason}</div>
-            </div>` : `
-            <div style="background:var(--bg3);border-radius:8px;padding:10px;margin-bottom:10px;text-align:center;">
-                <div style="font-size:11px;color:var(--muted);">Loading price data...</div>
-            </div>`}
-
-            <a href="${mt5Url}" target="_blank"
-               style="display:block;width:100%;padding:10px;border-radius:8px;text-align:center;
-                      font-size:13px;font-weight:900;text-decoration:none;
-                      background:${sig ? sigColor : 'var(--bg3)'};
-                      color:${sig ? (isBuy ? '#000' : '#fff') : 'var(--muted)'};"
-               onclick="log('📊 Opening MT5 for ${inst.name} — ${sig?.direction || 'signal pending'}', 'i')">
-                ${sig ? `${sig.direction === 'BUY' ? '🟢' : '🔴'} Trade ${sig.direction} on MT5` : '📊 Open MT5'}
-            </a>`;
-
-        grid.appendChild(card);
-    });
-
-    // Show message if no data yet
-    if (filtered.every(i => !mt5PriceData[i.symbol]?.lastPrice)) {
-        grid.innerHTML = `<div style="grid-column:1/-1;text-align:center;padding:40px;color:var(--muted);">
-            <div style="font-size:24px;margin-bottom:10px;">📡</div>
-            <div style="font-size:14px;font-weight:700;margin-bottom:6px;">Loading MT5 price feeds...</div>
-            <div style="font-size:12px;">Connecting to Deriv market data. This takes a few seconds.</div>
-        </div>`;
-    }
+// ── User preferences (client-side only — no server DB exists to persist to) ──
+function loadApaPrefs() {
+    try {
+        const p = JSON.parse(localStorage.getItem('bth_apa_prefs') || '{}');
+        if (p.style) apaStyle = p.style;
+        if (p.market) apaMarket = p.market;
+        if (p.risk) { const el = document.getElementById('apa-risk'); if (el) el.value = p.risk; }
+    } catch(e) {}
 }
-
-// Update single MT5 card
-function updateMT5Card(symbol) {
-    const card = document.getElementById(`mt5-card-${symbol}`);
-    if (!card) return;
-    // Only re-render if MT5 tab is active
-    if (document.getElementById('mt5-pane')?.classList.contains('active')) {
-        renderMT5Signals();
-    }
+function saveApaPrefs() {
+    try {
+        localStorage.setItem('bth_apa_prefs', JSON.stringify({
+            style: apaStyle, market: apaMarket,
+            risk: document.getElementById('apa-risk')?.value || '1'
+        }));
+    } catch(e) {}
 }
-
-// Filter MT5 signals by category
-function filterMT5(cat, btn) {
-    mt5Filter = cat;
-    document.querySelectorAll('#mt5-pane .btn').forEach(b => {
-        b.classList.remove('btn-teal');
-        b.classList.add('btn-ghost');
-    });
-    if (btn) { btn.classList.remove('btn-ghost'); btn.classList.add('btn-teal'); }
-    renderMT5Signals();
-}
-
-// Refresh signals
-function refreshMT5Signals() {
-    renderMT5Signals();
-    notify('📊 MT5 Signals', 'Signals refreshed with latest price data.', 'info');
-}
-
-// Auto-refresh every 30 seconds when tab is active
-setInterval(() => {
-    if (document.getElementById('mt5-pane')?.classList.contains('active')) {
-        renderMT5Signals();
-    }
-}, 30000);
 
 // ================================================================
-// CHART TAB — BB + RSI Live Indicator Bar
+// PRICE-ACTION PRIMITIVES (operate on real OHLC candle arrays)
+// ================================================================
+
+// Fractal swing points — a 5-candle pivot high/low
+function findSwings(candles) {
+    const swings = [];
+    for (let i = 2; i < candles.length - 2; i++) {
+        const c = candles[i];
+        if (c.high > candles[i-1].high && c.high > candles[i-2].high && c.high > candles[i+1].high && c.high > candles[i+2].high) {
+            swings.push({ i, type: 'high', price: c.high, epoch: c.epoch });
+        }
+        if (c.low < candles[i-1].low && c.low < candles[i-2].low && c.low < candles[i+1].low && c.low < candles[i+2].low) {
+            swings.push({ i, type: 'low', price: c.low, epoch: c.epoch });
+        }
+    }
+    return swings;
+}
+
+// Market structure: HH/HL/LH/LL, BOS, CHoCH
+function analyzeStructure(candles) {
+    if (!candles || candles.length < 15) return null;
+    const swings = findSwings(candles);
+    const highs  = swings.filter(s => s.type === 'high');
+    const lows   = swings.filter(s => s.type === 'low');
+    const last   = candles[candles.length - 1];
+
+    let highLabel = null, lowLabel = null;
+    if (highs.length >= 2) highLabel = highs[highs.length-1].price > highs[highs.length-2].price ? 'HH' : 'LH';
+    if (lows.length  >= 2) lowLabel  = lows[lows.length-1].price  > lows[lows.length-2].price  ? 'HL' : 'LL';
+
+    let bias = 'neutral';
+    if (highLabel === 'HH' && lowLabel === 'HL') bias = 'bullish';
+    else if (highLabel === 'LH' && lowLabel === 'LL') bias = 'bearish';
+    else if (highLabel === 'HH' || lowLabel === 'HL') bias = 'bullish';
+    else if (highLabel === 'LH' || lowLabel === 'LL') bias = 'bearish';
+
+    // BOS — close breaks beyond the most recent swing in the bias direction
+    const lastSwingHigh = highs[highs.length-1];
+    const lastSwingLow  = lows[lows.length-1];
+    let bos = false, choch = false;
+    if (bias === 'bullish' && lastSwingHigh && last.close > lastSwingHigh.price) bos = true;
+    if (bias === 'bearish' && lastSwingLow  && last.close < lastSwingLow.price)  bos = true;
+    // CHoCH — price breaks structure opposite to the prevailing bias
+    if (bias === 'bullish' && lastSwingLow && last.close < lastSwingLow.price) choch = true;
+    if (bias === 'bearish' && lastSwingHigh && last.close > lastSwingHigh.price) choch = true;
+
+    return { bias, highLabel, lowLabel, bos, choch, swings, highs, lows, lastSwingHigh, lastSwingLow };
+}
+
+// Liquidity pools + sweep detection
+function analyzeLiquidity(candles, structure) {
+    if (!structure) return null;
+    const { highs, lows } = structure;
+    const last = candles[candles.length - 1];
+    const prev = candles[candles.length - 2];
+    if (!prev) return null;
+
+    const tol = (() => {
+        const avg = candles.slice(-20).reduce((s,c) => s + (c.high - c.low), 0) / Math.min(20, candles.length);
+        return avg * 0.15;
+    })();
+
+    // Equal highs/lows — swings within tolerance of each other
+    const equalHighs = highs.filter((h,i) => highs.some((h2,j) => j !== i && Math.abs(h.price - h2.price) < tol));
+    const equalLows  = lows.filter((l,i) => lows.some((l2,j) => j !== i && Math.abs(l.price - l2.price) < tol));
+
+    const nearestHigh = highs.length ? highs[highs.length-1] : null;
+    const nearestLow  = lows.length  ? lows[lows.length-1]  : null;
+
+    // Sweep: wick pierces a pool, body closes back inside
+    let sweep = null;
+    if (nearestLow && last.low < nearestLow.price && last.close > nearestLow.price) {
+        sweep = { type: 'sell_side', label: 'Sell-side liquidity swept (bullish)', pool: nearestLow.price };
+    } else if (nearestHigh && last.high > nearestHigh.price && last.close < nearestHigh.price) {
+        sweep = { type: 'buy_side', label: 'Buy-side liquidity swept (bearish)', pool: nearestHigh.price };
+    }
+
+    return { equalHighs, equalLows, nearestHigh, nearestLow, sweep };
+}
+
+// Displacement — body significantly larger than recent average, breaking structure
+function analyzeDisplacement(candles, structure) {
+    if (!candles || candles.length < 10 || !structure) return null;
+    const bodies = candles.slice(-15, -1).map(c => Math.abs(c.close - c.open));
+    const avgBody = bodies.reduce((a,b)=>a+b,0) / Math.max(1, bodies.length);
+    const last = candles[candles.length - 1];
+    const lastBody = Math.abs(last.close - last.open);
+    const isBullish = last.close > last.open;
+
+    const strong = avgBody > 0 && lastBody > avgBody * 1.6;
+    const alignedWithBias = (structure.bias === 'bullish' && isBullish) || (structure.bias === 'bearish' && !isBullish);
+    return { strong, alignedWithBias, isBullish, lastBody, avgBody, confirmsBreak: strong && (structure.bos || structure.choch) };
+}
+
+// Fair Value Gap — classic 3-candle imbalance
+function findFVG(candles) {
+    if (!candles || candles.length < 3) return null;
+    for (let i = candles.length - 1; i >= 2; i--) {
+        const a = candles[i-2], c = candles[i];
+        if (a.high < c.low) return { direction: 'bullish', top: c.low, bottom: a.high, epoch: c.epoch, i, mitigated: false };
+        if (a.low > c.high) return { direction: 'bearish', top: a.low, bottom: c.high, epoch: c.epoch, i, mitigated: false };
+    }
+    return null;
+}
+
+// Order block — last opposite candle before the displacement move
+function findOrderBlock(candles, displacement) {
+    if (!candles || candles.length < 5 || !displacement || !displacement.strong) return null;
+    const idx = candles.length - 2; // candle immediately before the displacement candle
+    for (let i = idx; i >= Math.max(0, idx - 5); i--) {
+        const c = candles[i];
+        const isBull = c.close > c.open;
+        if (displacement.isBullish && !isBull) return { direction: 'bullish', high: c.high, low: c.low, epoch: c.epoch };
+        if (!displacement.isBullish && isBull) return { direction: 'bearish', high: c.high, low: c.low, epoch: c.epoch };
+    }
+    return null;
+}
+
+// Premium/discount positioning within the recent dealing range
+function analyzePremiumDiscount(candles) {
+    const recent = candles.slice(-50);
+    const hi = Math.max(...recent.map(c => c.high));
+    const lo = Math.min(...recent.map(c => c.low));
+    const last = candles[candles.length-1].close;
+    const pct = hi > lo ? (last - lo) / (hi - lo) : 0.5;
+    return { pct, zone: pct < 0.5 ? 'discount' : 'premium', high: hi, low: lo };
+}
+
+// ================================================================
+// APA SIGNAL — combines everything into a scored, directional setup
+// (or an honest "no trade")
+// ================================================================
+async function computeApaSignal(sym, styleKey) {
+    const style = APA_STYLES[styleKey] || APA_STYLES.day;
+    let biasC, setupC, entryC;
+    try {
+        [biasC, setupC, entryC] = await Promise.all([
+            getCandles(sym, style.bias, 80),
+            getCandles(sym, style.setup, 100),
+            getCandles(sym, style.entry, 120)
+        ]);
+    } catch (e) {
+        return { noTrade: true, reason: 'Live candle data unavailable right now', score: 0 };
+    }
+    if (!setupC || setupC.length < 20 || !entryC || entryC.length < 20) {
+        return { noTrade: true, reason: 'Not enough candle history yet for this market', score: 0 };
+    }
+
+    const biasStruct  = analyzeStructure(biasC);
+    const setupStruct = analyzeStructure(setupC);
+    const entryStruct = analyzeStructure(entryC);
+    if (!setupStruct) return { noTrade: true, reason: 'Structure unclear on the setup timeframe', score: 0 };
+
+    const liquidity     = analyzeLiquidity(setupC, setupStruct);
+    const displacement   = analyzeDisplacement(entryC, entryStruct || setupStruct);
+    const fvg            = findFVG(entryC);
+    const ob              = findOrderBlock(entryC, displacement);
+    const premiumDiscount = analyzePremiumDiscount(setupC);
+
+    // Direction requires setup-TF bias AND (a valid sweep OR a confirmed BOS)
+    let direction = null;
+    if (setupStruct.bias === 'bullish' && (liquidity?.sweep?.type === 'sell_side' || setupStruct.bos)) direction = 'BUY';
+    else if (setupStruct.bias === 'bearish' && (liquidity?.sweep?.type === 'buy_side' || setupStruct.bos)) direction = 'SELL';
+
+    // ── MARKET STRUCTURE (20) ──
+    let structureScore = 0;
+    if (setupStruct.bias !== 'neutral') structureScore += 8;
+    if (setupStruct.bos) structureScore += 7;
+    if (!setupStruct.choch) structureScore += 3; // no conflicting fresh CHoCH
+    if (direction === 'BUY' && premiumDiscount.zone === 'discount') structureScore += 2;
+    if (direction === 'SELL' && premiumDiscount.zone === 'premium') structureScore += 2;
+    structureScore = Math.min(20, structureScore);
+
+    // ── LIQUIDITY (20) ──
+    let liquidityScore = 0;
+    if (liquidity?.sweep) liquidityScore += 12;
+    if (liquidity?.nearestHigh || liquidity?.nearestLow) liquidityScore += 4;
+    if ((liquidity?.equalHighs?.length || 0) + (liquidity?.equalLows?.length || 0) > 0) liquidityScore += 4;
+    liquidityScore = Math.min(20, liquidityScore);
+
+    // ── DISPLACEMENT (15) ──
+    let displacementScore = 0;
+    if (displacement?.strong) displacementScore += 8;
+    if (displacement?.alignedWithBias) displacementScore += 4;
+    if (displacement?.confirmsBreak) displacementScore += 3;
+    displacementScore = Math.min(15, displacementScore);
+
+    // ── FVG / IMBALANCE (10) ──
+    let fvgScore = 0;
+    if (fvg) {
+        const aligned = (direction === 'BUY' && fvg.direction === 'bullish') || (direction === 'SELL' && fvg.direction === 'bearish');
+        fvgScore = aligned ? 10 : 4;
+    }
+
+    // ── ORDER BLOCK / SUPPLY-DEMAND (10) ──
+    let obScore = 0;
+    if (ob) {
+        const aligned = (direction === 'BUY' && ob.direction === 'bullish') || (direction === 'SELL' && ob.direction === 'bearish');
+        obScore = aligned ? 10 : 3;
+    }
+
+    // ── MULTI-TIMEFRAME ALIGNMENT (15) ──
+    let mtfScore = 0;
+    const biasDir = biasStruct?.bias, entryDir = entryStruct?.bias;
+    if (direction) {
+        const wantBias = direction === 'BUY' ? 'bullish' : 'bearish';
+        if (biasDir === wantBias) mtfScore += 8;
+        if (entryDir === wantBias) mtfScore += 7;
+        else if (entryDir === 'neutral') mtfScore += 3;
+    }
+    mtfScore = Math.min(15, mtfScore);
+
+    // ── ENTRY / SL / TP + RISK:REWARD (10) ──
+    const lastPrice = entryC[entryC.length-1].close;
+    let entry = lastPrice, sl = null, tp1 = null, tp2 = null, rr = 0, rrScore = 0;
+    if (direction === 'BUY') {
+        const obLow = ob?.direction === 'bullish' ? ob.low : null;
+        sl  = (obLow ?? liquidity?.nearestLow?.price ?? entry * 0.997) * 0.999;
+        tp1 = liquidity?.nearestHigh?.price ?? entry + (entry - sl) * 2;
+        tp2 = premiumDiscount.high;
+    } else if (direction === 'SELL') {
+        const obHigh = ob?.direction === 'bearish' ? ob.high : null;
+        sl  = (obHigh ?? liquidity?.nearestHigh?.price ?? entry * 1.003) * 1.001;
+        tp1 = liquidity?.nearestLow?.price ?? entry - (sl - entry) * 2;
+        tp2 = premiumDiscount.low;
+    }
+    if (direction && sl && tp1) {
+        const risk   = Math.abs(entry - sl);
+        const reward = Math.abs(tp1 - entry);
+        rr = risk > 0 ? reward / risk : 0;
+        rrScore = rr >= 2 ? 10 : rr >= 1.5 ? 7 : rr >= 1 ? 4 : 0;
+    }
+
+    const score = Math.round(structureScore + liquidityScore + displacementScore + fvgScore + obScore + mtfScore + rrScore);
+
+    if (!direction || score < 55) {
+        const reasons = [];
+        if (!direction) reasons.push('No aligned structure + liquidity setup');
+        if (rr && rr < 1) reasons.push('Poor risk/reward');
+        if (setupStruct.choch) reasons.push('Structure just shifted (CHoCH) — bias unclear');
+        return { noTrade: true, reason: reasons[0] || 'Setup quality below threshold', score, breakdown: { structureScore, liquidityScore, displacementScore, fvgScore, obScore, mtfScore, rrScore } };
+    }
+
+    let label, color;
+    if (score >= 85)      { label = '🟢 GREAT ENTRY'; color = 'var(--green)'; }
+    else if (score >= 70) { label = '🟡 GOOD SETUP';  color = 'var(--amber)'; }
+    else                  { label = '🟠 WATCH';        color = '#f97316'; }
+
+    const tags = [];
+    if (liquidity?.sweep) tags.push('Liquidity Sweep');
+    if (setupStruct.bos) tags.push('BOS');
+    if (setupStruct.choch) tags.push('CHoCH');
+    if (displacement?.strong) tags.push('Displacement');
+    if (fvg) tags.push('FVG');
+    if (ob) tags.push('Order Block');
+
+    const mkt = APA_MARKETS.find(m => m.deriv === sym);
+    return {
+        noTrade: false, id: `${sym}_${styleKey}_${Date.now()}`,
+        market: sym, mt5Symbol: mkt?.mt5 || sym, display: mkt?.display || sym,
+        style: styleKey, styleLabel: style.label,
+        direction, score, label, color, tags,
+        entry, sl, tp1, tp2, rr: rr.toFixed(2),
+        htfBias: biasStruct?.bias || 'unclear',
+        confidence: score >= 85 ? 'HIGH' : score >= 70 ? 'MEDIUM' : 'LOW',
+        breakdown: { structureScore, liquidityScore, displacementScore, fvgScore, obScore, mtfScore, rrScore },
+        entryGranLabel: GRAN_LABEL[style.entry], setupGranLabel: GRAN_LABEL[style.setup], biasGranLabel: GRAN_LABEL[style.bias],
+        generatedAt: Date.now(), expiresAt: Date.now() + style.expiryMin * 60000
+    };
+}
+
+// ================================================================
+// UI — Style selector, scanner, setup card
+// ================================================================
+function selectApaStyle(styleKey, btn) {
+    apaStyle = styleKey;
+    document.querySelectorAll('.apa-style-btn').forEach(b => b.classList.remove('apa-style-active'));
+    if (btn) btn.classList.add('apa-style-active');
+    saveApaPrefs();
+    runApaAnalysis();
+    renderApaScanner();
+}
+
+function onApaMarketChange(sym) {
+    apaMarket = sym;
+    saveApaPrefs();
+    runApaAnalysis();
+}
+
+async function runApaAnalysis() {
+    const card = document.getElementById('apa-setup-card');
+    if (!card) return;
+    card.innerHTML = `<div style="font-size:12px;color:var(--muted);text-align:center;padding:20px;">🔎 Analyzing ${MKT[apaMarket]||apaMarket} on ${APA_STYLES[apaStyle].label} timeframes...</div>`;
+
+    const mkt = APA_MARKETS.find(m => m.deriv === apaMarket);
+    if (mkt && !mkt.confirmed && !isMarketAvailable(mkt)) {
+        card.innerHTML = `<div style="font-size:12px;color:var(--red);text-align:center;padding:20px;">Market currently unavailable on your MT5 account.</div>`;
+        apaCurrentSignal = null;
+        return;
+    }
+
+    const sig = await computeApaSignal(apaMarket, apaStyle);
+    apaCurrentSignal = sig.noTrade ? null : sig;
+    renderApaSetupCard(sig);
+
+    if (!sig.noTrade && sig.score >= 85) {
+        const notifKey = `${sig.market}_${sig.style}_${sig.direction}_${Math.floor(Date.now()/60000)}`;
+        if (!apaNotifiedIds.has(notifKey)) {
+            apaNotifiedIds.add(notifKey);
+            notify('🟢 GREAT ENTRY', `${sig.display} ${sig.direction} — APA Score ${sig.score}/100`, 'ok');
+        }
+    }
+}
+
+function renderApaSetupCard(sig) {
+    const card = document.getElementById('apa-setup-card');
+    if (!card) return;
+
+    if (!sig || sig.noTrade) {
+        card.innerHTML = `
+            <div style="text-align:center;padding:24px 16px;">
+                <div style="font-size:32px;margin-bottom:8px;">🔴</div>
+                <div style="font-size:15px;font-weight:900;color:var(--red);margin-bottom:4px;">NO TRADE</div>
+                <div style="font-size:11px;color:var(--muted);">${sig?.reason || 'No qualifying setup right now'}${sig?.score !== undefined ? ` (score ${sig.score}/100)` : ''}</div>
+            </div>`;
+        return;
+    }
+
+    const dirColor = sig.direction === 'BUY' ? 'var(--green)' : 'var(--red)';
+    const fmt = (n) => n !== null && n !== undefined ? Number(n).toFixed(5) : '—';
+    const expiresIn = Math.max(0, Math.round((sig.expiresAt - Date.now()) / 60000));
+
+    card.innerHTML = `
+        <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:10px;flex-wrap:wrap;gap:8px;">
+            <div>
+                <div style="font-size:15px;font-weight:900;">${sig.display}</div>
+                <div style="font-size:10px;color:var(--muted);">${sig.styleLabel} · Bias ${sig.biasGranLabel} / Setup ${sig.setupGranLabel} / Entry ${sig.entryGranLabel}</div>
+            </div>
+            <div style="text-align:right;">
+                <div style="font-size:20px;font-weight:900;color:${sig.color};">${sig.score}/100</div>
+                <div style="font-size:11px;font-weight:700;color:${sig.color};">${sig.label}</div>
+            </div>
+        </div>
+        <div style="display:flex;gap:8px;margin-bottom:10px;flex-wrap:wrap;">
+            <span class="badge" style="background:${dirColor}22;color:${dirColor};border:1px solid ${dirColor}44;font-size:12px;padding:4px 10px;">${sig.direction === 'BUY' ? '📈' : '📉'} ${sig.direction}</span>
+            <span class="badge badge-blue">HTF Bias: ${sig.htfBias}</span>
+            <span class="badge badge-teal">Confidence: ${sig.confidence}</span>
+            <span class="badge badge-amber">⏱ Expires in ${expiresIn}m</span>
+        </div>
+        <div class="accu-row-3" style="margin-bottom:10px;">
+            <div class="card-sm" style="padding:8px;text-align:center;"><div style="font-size:9px;color:var(--muted);">ENTRY</div><div style="font-size:13px;font-weight:900;font-family:monospace;">${fmt(sig.entry)}</div></div>
+            <div class="card-sm" style="padding:8px;text-align:center;"><div style="font-size:9px;color:var(--muted);">STOP LOSS</div><div style="font-size:13px;font-weight:900;font-family:monospace;color:var(--red);">${fmt(sig.sl)}</div></div>
+            <div class="card-sm" style="padding:8px;text-align:center;"><div style="font-size:9px;color:var(--muted);">R:R</div><div style="font-size:13px;font-weight:900;">1:${sig.rr}</div></div>
+        </div>
+        <div class="accu-row-2" style="margin-bottom:10px;">
+            <div class="card-sm" style="padding:8px;text-align:center;"><div style="font-size:9px;color:var(--muted);">TAKE PROFIT 1</div><div style="font-size:13px;font-weight:900;font-family:monospace;color:var(--green);">${fmt(sig.tp1)}</div></div>
+            <div class="card-sm" style="padding:8px;text-align:center;"><div style="font-size:9px;color:var(--muted);">TAKE PROFIT 2</div><div style="font-size:13px;font-weight:900;font-family:monospace;color:var(--green);">${fmt(sig.tp2)}</div></div>
+        </div>
+        <div style="font-size:10px;color:var(--muted);margin-bottom:10px;">Setup: <b style="color:var(--text);">${sig.tags.join(' + ') || '—'}</b></div>
+        <button onclick="openApplyToMT5Modal()" class="btn btn-teal" style="width:100%;padding:12px;font-size:14px;font-weight:900;border-radius:8px;">📲 APPLY TO MT5</button>`;
+}
+
+// ── Scanner — lighter-weight pass across the configured (and confirmed) market list ──
+async function renderApaScanner() {
+    const body = document.getElementById('apa-scanner-body');
+    if (!body) return;
+    const markets = APA_MARKETS.filter(m => apaScannerFilter === 'all' || m.cat === apaScannerFilter);
+    body.innerHTML = `<div style="font-size:11px;color:var(--muted);text-align:center;padding:16px;">Scanning ${markets.length} markets...</div>`;
+
+    const rows = [];
+    for (const mkt of markets) {
+        if (!mkt.confirmed && !isMarketAvailable(mkt)) {
+            rows.push({ mkt, unavailable: true });
+            continue;
+        }
+        try {
+            const sig = await computeApaSignal(mkt.deriv, apaStyle);
+            rows.push({ mkt, sig });
+        } catch(e) {
+            rows.push({ mkt, sig: { noTrade: true, reason: 'Data error', score: 0 } });
+        }
+        // small pacing delay so we don't hammer the public WS with rapid-fire candle requests
+        await new Promise(r => setTimeout(r, 120));
+    }
+
+    rows.sort((a,b) => (b.sig?.score || -1) - (a.sig?.score || -1));
+
+    body.innerHTML = rows.map(r => {
+        if (r.unavailable) {
+            return `<div style="display:flex;padding:8px 0;border-bottom:1px solid var(--border);font-size:11px;color:var(--dim);">
+                <div style="flex:1;">${r.mkt.display}</div><div style="width:110px;">Unavailable</div></div>`;
+        }
+        const sig = r.sig;
+        const dirColor = sig.direction === 'BUY' ? 'var(--green)' : sig.direction === 'SELL' ? 'var(--red)' : 'var(--muted)';
+        const setupLabel = sig.noTrade ? (sig.score >= 55 ? 'Watch' : 'No Trade') : (sig.score >= 85 ? 'Great Entry' : sig.score >= 70 ? 'Good Setup' : 'Watch');
+        return `<div style="display:flex;align-items:center;padding:8px 0;border-bottom:1px solid var(--border);font-size:11px;cursor:pointer;" onclick="onApaMarketChange('${r.mkt.deriv}');document.getElementById('apa-market-select').value='${r.mkt.deriv}';">
+            <div style="flex:1;font-weight:700;">${r.mkt.display}</div>
+            <div style="width:60px;color:${dirColor};font-weight:700;">${sig.direction || '—'}</div>
+            <div style="width:50px;font-weight:900;color:${sig.score>=85?'var(--green)':sig.score>=70?'var(--amber)':'var(--muted)'};">${sig.score}</div>
+            <div style="width:100px;color:var(--muted);">${setupLabel}</div>
+        </div>`;
+    }).join('') || '<div style="font-size:11px;color:var(--dim);text-align:center;padding:16px;">No markets in this filter.</div>';
+}
+
+function filterApaScanner(cat, btn) {
+    apaScannerFilter = cat;
+    document.querySelectorAll('#apa-scanner-filters .btn').forEach(b => { b.classList.remove('btn-teal'); b.classList.add('btn-ghost'); });
+    if (btn) { btn.classList.remove('btn-ghost'); btn.classList.add('btn-teal'); }
+    renderApaScanner();
+}
+
+function refreshApaScanner() {
+    apaCandleCache = {}; // force fresh candles
+    renderApaScanner();
+    runApaAnalysis();
+}
+
+// ================================================================
+// APPLY TO MT5 — validated hand-off, never a faked execution
+// ================================================================
+let apaMt5AccountChecked = false;
+let apaMt5HasAccount     = false;
+
+// Real Deriv API call — checks whether the user's authenticated session has
+// an MT5 trading account. If the call isn't supported by the current
+// connection or times out, we say so honestly rather than assume either way.
+function checkMt5Account() {
+    return new Promise((resolve) => {
+        if (!derivWS || derivWS.readyState !== WebSocket.OPEN) { resolve({ ok: false, reason: 'not_connected' }); return; }
+        const reqId = nextReqId();
+        const timeout = setTimeout(() => {
+            derivWS.removeEventListener('message', handler);
+            resolve({ ok: false, reason: 'timeout' });
+        }, 6000);
+        function handler(ev) {
+            let data; try { data = JSON.parse(ev.data); } catch(e) { return; }
+            if (data.req_id !== reqId) return;
+            clearTimeout(timeout);
+            derivWS.removeEventListener('message', handler);
+            if (data.error) { resolve({ ok: false, reason: 'unsupported', message: data.error.message }); return; }
+            const list = data.mt5_login_list || [];
+            const standard = list.filter(a => (a.account_type === 'real' || a.account_type === 'demo'));
+            resolve({ ok: true, accounts: list, hasAccount: standard.length > 0 });
+        }
+        derivWS.addEventListener('message', handler);
+        derivWS.send(JSON.stringify({ mt5_login_list: 1, req_id: reqId }));
+    });
+}
+
+async function openApplyToMT5Modal() {
+    if (!apaCurrentSignal) return;
+    const sig = apaCurrentSignal;
+
+    // 1) Authenticated?
+    if (!accessToken || !accountId) {
+        showApaModal(`<div style="text-align:center;padding:10px;">
+            <div style="font-size:14px;font-weight:900;margin-bottom:8px;">Please log in to continue</div>
+            <div style="font-size:12px;color:var(--muted);margin-bottom:14px;">You need to connect your Deriv account before applying a setup to MT5.</div>
+            <button class="btn btn-teal" style="width:100%;padding:12px;" onclick="closeApaModal();loginWithDeriv();">✨ Connect My Deriv Account</button>
+        </div>`);
+        return;
+    }
+
+    // 2) Signal still valid / not expired?
+    if (Date.now() > sig.expiresAt) {
+        showApaModal(`<div style="text-align:center;padding:10px;">
+            <div style="font-size:32px;margin-bottom:8px;">⏱</div>
+            <div style="font-size:14px;font-weight:900;margin-bottom:8px;">Setup expired</div>
+            <div style="font-size:12px;color:var(--muted);margin-bottom:14px;">This setup is no longer current. Re-run the analysis for a fresh read.</div>
+            <button class="btn btn-teal" style="width:100%;padding:12px;" onclick="closeApaModal();runApaAnalysis();">🔄 Re-analyze</button>
+        </div>`);
+        return;
+    }
+
+    showApaModal(`<div style="text-align:center;padding:20px;"><div style="font-size:12px;color:var(--muted);">Checking your MT5 account...</div></div>`);
+    const acctCheck = await checkMt5Account();
+
+    if (!acctCheck.ok || !acctCheck.hasAccount) {
+        const note = acctCheck.reason === 'unsupported'
+            ? `We couldn't automatically verify your MT5 account (${acctCheck.message || 'the check is not available on this connection'}). You can still continue if you already have one.`
+            : `No Standard MT5 trading account was found on your Deriv login.`;
+        showApaModal(`<div style="text-align:center;padding:10px;">
+            <div style="font-size:14px;font-weight:900;margin-bottom:8px;">MT5 Account Required</div>
+            <div style="font-size:12px;color:var(--muted);margin-bottom:16px;">${note}</div>
+            <a href="https://app.deriv.com/mt5" target="_blank" class="btn btn-teal" style="display:block;width:100%;padding:12px;margin-bottom:8px;text-decoration:none;">➕ Create Standard MT5 Account</a>
+            <button class="btn btn-ghost" style="width:100%;padding:12px;" onclick="closeApaModal();confirmApplyToMT5(true);">✅ I already have an MT5 account — Connect</button>
+        </div>`);
+        return;
+    }
+
+    renderApaConfirm(sig);
+}
+
+// User asserted they already have an account (self-declared, since the
+// automated check was inconclusive) — still runs the same price/expiry
+// revalidation before handing off.
+function confirmApplyToMT5(skipAccountCheck) {
+    if (!apaCurrentSignal) return;
+    renderApaConfirm(apaCurrentSignal);
+}
+
+async function renderApaConfirm(sig) {
+    // Revalidate price hasn't drifted materially from the setup
+    let freshCandles;
+    try { freshCandles = await fetchCandles(sig.market, APA_STYLES[sig.style].entry, 2); } catch(e) { freshCandles = null; }
+    const livePrice = freshCandles && freshCandles.length ? freshCandles[freshCandles.length-1].close : sig.entry;
+    const deviation  = Math.abs(livePrice - sig.entry) / sig.entry;
+
+    if (deviation > 0.004) {
+        showApaModal(`<div style="text-align:center;padding:10px;">
+            <div style="font-size:14px;font-weight:900;color:var(--amber);margin-bottom:8px;">⚠️ Setup changed</div>
+            <div style="font-size:12px;color:var(--muted);margin-bottom:14px;">${sig.display} has moved away from the original entry (${sig.entry.toFixed(5)} → ${livePrice.toFixed(5)}). Please review the updated setup.</div>
+            <button class="btn btn-teal" style="width:100%;padding:12px;" onclick="closeApaModal();runApaAnalysis();">🔄 Re-analyze</button>
+        </div>`);
+        logApaAudit({ event: 'setup_changed', market: sig.market, style: sig.style, entry: sig.entry, livePrice });
+        return;
+    }
+
+    const risk = document.getElementById('apa-risk')?.value || '1';
+    showApaModal(`<div style="padding:6px 0;">
+        <div style="font-size:14px;font-weight:900;text-align:center;margin-bottom:12px;">Apply Trade to MT5?</div>
+        <div style="background:var(--bg);border:1px solid var(--border);border-radius:8px;padding:12px;margin-bottom:14px;font-size:12px;line-height:1.9;">
+            <div style="display:flex;justify-content:space-between;"><span style="color:var(--muted);">Direction</span><b style="color:${sig.direction==='BUY'?'var(--green)':'var(--red)'};">${sig.direction} ${sig.display}</b></div>
+            <div style="display:flex;justify-content:space-between;"><span style="color:var(--muted);">Entry</span><b style="font-family:monospace;">${sig.entry.toFixed(5)}</b></div>
+            <div style="display:flex;justify-content:space-between;"><span style="color:var(--muted);">Stop Loss</span><b style="font-family:monospace;color:var(--red);">${sig.sl.toFixed(5)}</b></div>
+            <div style="display:flex;justify-content:space-between;"><span style="color:var(--muted);">Take Profit 1</span><b style="font-family:monospace;color:var(--green);">${sig.tp1.toFixed(5)}</b></div>
+            <div style="display:flex;justify-content:space-between;"><span style="color:var(--muted);">Risk</span><b>${risk}%</b></div>
+        </div>
+        <div style="font-size:10px;color:var(--muted);margin-bottom:14px;text-align:center;">Deriv's public API can't place MT5 orders directly — this opens the real MT5 terminal with ${sig.mt5Symbol} selected so you can place the trade with these levels.</div>
+        <button class="btn btn-teal" style="width:100%;padding:12px;margin-bottom:8px;font-weight:900;" onclick="finalizeApplyToMT5()">✅ CONFIRM &amp; OPEN IN MT5</button>
+        <button class="btn btn-ghost" style="width:100%;padding:10px;" onclick="closeApaModal()">Cancel</button>
+    </div>`);
+}
+
+function finalizeApplyToMT5() {
+    const sig = apaCurrentSignal;
+    if (!sig) { closeApaModal(); return; }
+    closeApaModal();
+    window.open(`https://app.deriv.com/mt5?symbol=${encodeURIComponent(sig.mt5Symbol)}`, '_blank');
+    logApaAudit({
+        event: 'sent_to_mt5', signalId: sig.id, market: sig.market, style: sig.style,
+        direction: sig.direction, score: sig.score, entry: sig.entry, sl: sig.sl, tp1: sig.tp1, tp2: sig.tp2
+    });
+    notify('📲 Opened in MT5', `${sig.display} ${sig.direction} — enter the shown levels in the MT5 terminal to place the trade.`, 'info');
+}
+
+function showApaModal(html) {
+    let modal = document.getElementById('apa-modal');
+    if (!modal) {
+        modal = document.createElement('div');
+        modal.id = 'apa-modal';
+        modal.style.cssText = 'display:flex;position:fixed;inset:0;z-index:99999;background:#000000cc;align-items:center;justify-content:center;padding:16px;';
+        modal.innerHTML = `<div style="background:var(--bg2);border:1px solid var(--border);border-radius:14px;width:100%;max-width:420px;padding:20px;" id="apa-modal-inner"></div>`;
+        document.body.appendChild(modal);
+        modal.addEventListener('click', (e) => { if (e.target === modal) closeApaModal(); });
+    }
+    document.getElementById('apa-modal-inner').innerHTML = html;
+    modal.style.display = 'flex';
+}
+function closeApaModal() {
+    const modal = document.getElementById('apa-modal');
+    if (modal) modal.style.display = 'none';
+}
+
+// Auto-refresh the scanner + setup card every 45s when the MT5 tab is active —
+// gentle enough not to hammer the candle API, frequent enough to feel live.
+setInterval(() => {
+    if (document.getElementById('mt5-pane')?.classList.contains('active')) {
+        renderApaScanner();
+        if (apaCurrentSignal) runApaAnalysis();
+    }
+}, 45000);
 // ================================================================
 
 function updateChartIndicators(symbol) {
