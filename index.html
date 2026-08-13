@@ -68,7 +68,7 @@
     --blue:#4299e1;
     --purple:#9f7aea;
 }
-body{font-family:'Inter',system-ui,sans-serif;background:var(--bg);color:var(--text);height:100vh;overflow:hidden;display:flex;flex-direction:column;user-select:none;padding-bottom:0;}
+body{font-family:'Inter',system-ui,sans-serif;background:var(--bg);color:var(--text);min-height:100vh;overflow-x:hidden;display:flex;flex-direction:column;user-select:none;padding-bottom:0;}
 ::selection{background:#ff444f33;color:#fff;}
 
 /* ── Header ── */
@@ -87,11 +87,22 @@ nav{height:44px;background:var(--bg2);border-bottom:1px solid var(--border);disp
 .tab-btn.active{background:var(--teal);color:#000;font-weight:700;}
 
 /* ── Main ── */
-main{flex:1;overflow:hidden;position:relative;}
-.tab-pane{display:none;height:100%;width:100%;overflow:hidden;}
+/* The whole page scrolls as one normal document now (sticky-footer
+   pattern below) instead of each pane scrolling in an isolated,
+   height-clipped box — that isolation was what squeezed the footer up
+   against page content. `main` still fills any leftover viewport space
+   when content is short, so the footer naturally sits at the bottom
+   instead of floating mid-page. */
+main{flex:1;position:relative;}
+.tab-pane{display:none;width:100%;}
 .tab-pane.active{display:flex;}
 .tab-pane.scroll{display:none;}
-.tab-pane.scroll.active{display:block;overflow-y:auto;height:100%;}
+.tab-pane.scroll.active{display:block;}
+/* DBot and Chart are full-height "app" views (sidebars, live chart) —
+   give them a real minimum height so they still fill the screen the way
+   they always did, without clipping the page if their own internal
+   panels ever need more room than the viewport. */
+#bot-pane.active,#chart-pane.active{min-height:calc(100vh - 156px);}
 
 /* ── Inputs/Select ── */
 input,select{background:var(--bg);border:1px solid var(--border);color:var(--text);border-radius:6px;padding:7px 10px;font-size:12px;outline:none;font-family:inherit;width:100%;transition:border-color .15s;}
@@ -1490,8 +1501,8 @@ body{padding-bottom:60px;}
     </div>
 </div>
 
-<!-- ═══ FOOTER — sits above bot bar ═══ -->
-<footer style="background:#0e1118;border-top:1px solid #1a2035;padding:8px 20px;display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:10px;flex-shrink:0;margin-bottom:56px;">
+<!-- ═══ FOOTER — normal document flow, sits after all page content ═══ -->
+<footer style="background:#0e1118;border-top:1px solid #1a2035;padding:14px 20px;display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:10px;flex-shrink:0;">
     <div style="font-size:10px;color:#4a5568;">© 2026 Btraderhub. All rights reserved. Trading involves significant risk of loss.</div>
     <div style="display:flex;align-items:center;gap:14px;flex-wrap:wrap;">
         <a href="https://whatsapp.com/channel/0029Vb8RepJDeON2hcLhah2c" target="_blank" rel="noopener" style="display:flex;align-items:center;gap:4px;color:#25D366;font-size:10px;text-decoration:none;font-weight:700;">📱 WhatsApp Channel</a>
