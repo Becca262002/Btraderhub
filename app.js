@@ -190,6 +190,12 @@ window.addEventListener('load', async () => {
     // Start public WebSocket for digit stats
     connectPublicWS();
 
+    // MT5 signal lifecycle runs independently of which tab is open, so
+    // signals keep generating/expiring correctly even if the user never
+    // visits the MT5 tab first — give the public WS a moment to connect.
+    loadMt5Signals();
+    setTimeout(startMt5BackgroundScan, 4000);
+
     const params     = new URLSearchParams(window.location.search);
     const code       = params.get('code');
     const oauthState = params.get('state');
@@ -286,14 +292,16 @@ function switchTab(id) {
         }
     }
     if (btn) btn.classList.add('active');
+    window.scrollTo(0, 0); // start each tab at the top now that the page scrolls as a whole
 
     if (id === 'digits') {
         changeDigitMarket(document.getElementById('digit-market')?.value || 'R_10');
     }
     if (id === 'scanner') runFullScan();
-    if (id === 'mt5')     { loadApaPrefs(); renderApaScanner(); runApaAnalysis(); }
+    if (id === 'mt5')     { loadApaPrefs(); startMt5BackgroundScan(); renderMt5SignalsUI(); populateMt5InstrumentFilter(); runApaAnalysis(); }
     if (id === 'chart')   { setTimeout(() => updateChartIndicators(), 500); }
     if (id === 'accu')    { onAccuMarketChange(document.getElementById('accu-market')?.value || 'R_10'); updateAccuProfitCalc(); }
+    if (id === 'bulk')    { initBulkTab(); }
 }
 
 function switchPanel(name, el) {
@@ -622,6 +630,8 @@ function routeMsg(r) {
     if (r.msg_type === 'balance' && r.balance) {
         const el = document.getElementById('balance');
         if (el) el.textContent = `${parseFloat(r.balance.balance).toFixed(2)} ${r.balance.currency}`;
+        liveBalance = parseFloat(r.balance.balance); // tracked for Bulk Trading's insufficient-balance check
+        if (document.getElementById('bulk-pane')?.classList.contains('active')) initBulkTab();
     }
 
     // Tick and history from authenticated WS — routed to stub
@@ -1455,6 +1465,459 @@ Will return to ${originalDirection.toUpperCase()} ${originalPrediction} after wi
             }
         }
     }
+}
+
+
+// ================================================================
+// BULK TRADING ENGINE
+// Configure one setup, execute N trades from it — strictly sequential
+// (never parallel), each trade fully round-tripped through the real
+// Deriv proposal -> buy -> settlement flow before the next one is sent,
+// so there is no way for a double-click, re-render, or reconnect to
+// fire a duplicate contract. Reuses CONTRACT_MAP and nextReqId() from
+// the existing DBot implementation rather than duplicating contract logic.
+// History persists to localStorage (this app has no backend/database).
+// ================================================================
+
+const BULK_MAX_TRADES      = 100;   // sensible hard cap on trades per batch
+const BULK_MAX_TOTAL_STAKE = 1000;  // sensible hard cap on total stake per batch
+
+let bulkDirection    = 'over';
+let bulkStakeMode    = 'per';   // 'per' = stake per trade | 'total' = total budget
+let bulkExecuting    = false;
+let bulkCurrentBatch = null;
+let bulkBatches      = [];
+let liveBalance       = null;   // tracked from the real balance stream, used for the insufficient-balance check
+
+function loadBulkBatches() {
+    try { bulkBatches = JSON.parse(localStorage.getItem('bth_bulk_batches') || '[]'); }
+    catch(e) { bulkBatches = []; }
+}
+function saveBulkBatches() {
+    try { localStorage.setItem('bth_bulk_batches', JSON.stringify(bulkBatches.slice(-100))); } catch(e) {}
+}
+function makeBulkBatchId() {
+    return `BT-${Date.now().toString(36).toUpperCase()}`;
+}
+
+// ── Direction controls (namespaced separately from the DBot's so the two
+// tools never fight over shared state) ──
+function onBulkTypeChange() {
+    const type = document.getElementById('bulk-type')?.value || 'over_under';
+    const wrap = document.getElementById('bulk-dir-controls');
+    const pred = document.getElementById('bulk-pred-wrap');
+    if (!wrap) return;
+    wrap.innerHTML = '';
+
+    const dirMap = {
+        over_under:     [['over','Over Only'],['under','Under Only']],
+        even_odd:       [['even','Even Only'],['odd','Odd Only']],
+        rise_fall:      [['rise','Rise Only'],['fall','Fall Only']],
+        only_ups_downs: [['ups','Only Ups'],['downs','Only Downs']]
+    };
+    const opts = dirMap[type] || [];
+    opts.forEach(([val, label]) => {
+        const btn = document.createElement('button');
+        btn.className = 'dir-btn';
+        btn.textContent = label;
+        btn.dataset.dir = val;
+        btn.onclick = () => selectBulkDir(val);
+        wrap.appendChild(btn);
+    });
+    if (pred) pred.style.display = type === 'over_under' ? 'block' : 'none';
+    if (opts.length > 0) selectBulkDir(opts[0][0]);
+    updateBulkPreview();
+}
+function selectBulkDir(dir) {
+    bulkDirection = dir;
+    const neg = ['under','odd','fall','downs'];
+    document.querySelectorAll('#bulk-dir-controls .dir-btn').forEach(b => {
+        b.classList.remove('pos','neg');
+        if (b.dataset.dir === dir) b.classList.add(neg.includes(dir) ? 'neg' : 'pos');
+    });
+    updateBulkPreview();
+}
+
+// ── Number of trades stepper ──
+function stepBulkTrades(delta) {
+    const el = document.getElementById('bulk-trades');
+    if (!el) return;
+    let v = parseInt(el.value || 1) + delta;
+    v = Math.max(1, Math.min(BULK_MAX_TRADES, v));
+    el.value = v;
+    updateBulkPreview();
+}
+function setBulkTrades(n) {
+    const el = document.getElementById('bulk-trades');
+    if (el) el.value = Math.max(1, Math.min(BULK_MAX_TRADES, n));
+    updateBulkPreview();
+}
+
+// ── Stake mode toggle (Mode A: per-trade | Mode B: total budget) ──
+function setBulkStakeMode(mode) {
+    bulkStakeMode = mode;
+    const btnPer = document.getElementById('bulk-mode-per');
+    const btnTot = document.getElementById('bulk-mode-total');
+    const label  = document.getElementById('bulk-stake-label');
+    if (btnPer) { btnPer.classList.toggle('btn-teal', mode==='per');   btnPer.classList.toggle('btn-ghost', mode!=='per'); }
+    if (btnTot) { btnTot.classList.toggle('btn-teal', mode==='total'); btnTot.classList.toggle('btn-ghost', mode!=='total'); }
+    if (label) label.textContent = mode === 'per' ? 'Stake per Trade (USD)' : 'Total Budget (USD)';
+    updateBulkPreview();
+}
+
+function getBulkConfig() {
+    const trades  = Math.max(1, Math.min(BULK_MAX_TRADES, parseInt(document.getElementById('bulk-trades')?.value || 1)));
+    const stakeIn = parseFloat(document.getElementById('bulk-stake')?.value || 1);
+    const stakePerTrade = bulkStakeMode === 'per' ? stakeIn : (stakeIn / trades);
+    const totalStake    = bulkStakeMode === 'per' ? stakeIn * trades : stakeIn;
+    return {
+        market: document.getElementById('bulk-market')?.value || 'R_10',
+        type:   document.getElementById('bulk-type')?.value || 'over_under',
+        direction: bulkDirection,
+        pred:   parseInt(document.getElementById('bulk-pred')?.value || 5),
+        duration: parseInt(document.getElementById('bulk-dur')?.value || 1),
+        trades, stakePerTrade: Math.round(stakePerTrade * 100) / 100, totalStake: Math.round(totalStake * 100) / 100
+    };
+}
+
+function updateBulkPreview() {
+    const cfg = getBulkConfig();
+    const body = document.getElementById('bulk-preview-body');
+    const btn  = document.getElementById('bulk-execute-btn');
+    if (!body) return;
+
+    const acct   = allAccounts.find(a => a.account_id === accountId);
+    const acctType = acct ? (acct.account_type === 'real' ? 'REAL' : 'DEMO') : '—';
+    const acctColor = acctType === 'REAL' ? 'var(--red)' : 'var(--teal)';
+
+    body.innerHTML = `
+        <div style="display:flex;justify-content:space-between;"><span style="color:var(--muted);">Market</span><b>${MKT[cfg.market]||cfg.market}</b></div>
+        <div style="display:flex;justify-content:space-between;"><span style="color:var(--muted);">Direction</span><b style="color:${['under','odd','fall','downs'].includes(cfg.direction)?'var(--red)':'var(--teal)'};">${cfg.direction.toUpperCase()}${cfg.type==='over_under'?' '+cfg.pred:''}</b></div>
+        <div style="display:flex;justify-content:space-between;"><span style="color:var(--muted);">Number of Trades</span><b>${cfg.trades}</b></div>
+        <div style="display:flex;justify-content:space-between;"><span style="color:var(--muted);">Stake per Trade</span><b>$${cfg.stakePerTrade.toFixed(2)}</b></div>
+        <div style="display:flex;justify-content:space-between;border-top:1px solid var(--border);padding-top:4px;margin-top:2px;"><span style="color:var(--muted);">Total Stake</span><b style="color:var(--teal);">$${cfg.totalStake.toFixed(2)}</b></div>
+        <div style="display:flex;justify-content:space-between;"><span style="color:var(--muted);">Account</span><b style="color:${acctColor};">${acctType}</b></div>`;
+
+    if (btn && !bulkExecuting) btn.textContent = `EXECUTE ${cfg.trades} TRADE${cfg.trades===1?'':'S'}`;
+}
+
+// Populate from an AI Scanner signal — used by the two bridge functions below.
+function populateBulkFromSignal(sig) {
+    if (!sig) return;
+    const marketSel = document.getElementById('bulk-market');
+    const typeSel    = document.getElementById('bulk-type');
+    const predEl     = document.getElementById('bulk-pred');
+    const durEl      = document.getElementById('bulk-dur');
+    if (sig.symbol && marketSel) marketSel.value = sig.symbol;
+    if (typeSel) { typeSel.value = sig.type; onBulkTypeChange(); }
+    selectBulkDir(sig.botDirection);
+    if (sig.pred !== null && sig.pred !== undefined && predEl) predEl.value = sig.pred;
+    if (sig.ticks && durEl) durEl.value = sig.ticks;
+
+    const note = document.getElementById('bulk-signal-note');
+    if (note) {
+        note.style.display = 'block';
+        note.textContent = `📡 Populated from AI Scanner: ${sig.label || MKT[sig.symbol] || sig.symbol || ''} — ${sig.direction} (${sig.confidence}% confidence). Review before executing.`;
+    }
+    updateBulkPreview();
+    switchTab('bulk');
+    notify('📦 Signal Sent to Bulk Trading', `${sig.direction} · ${sig.confidence}% confidence — review the setup and choose your trade count.`, 'ok');
+}
+function applySignalToBulk(sig) {
+    if (typeof sig === 'string') { try { sig = JSON.parse(sig); } catch(e) { return; } }
+    populateBulkFromSignal(sig);
+}
+function applyBestSignalToBulk() {
+    const results = ALL_MKTS.map(sym => ({ sym, signal: generateSignal(sym) }))
+        .sort((a,b) => (b.signal?.confidence||0) - (a.signal?.confidence||0));
+    if (results[0]?.signal) populateBulkFromSignal(results[0].signal);
+}
+
+// ── Validation / risk protection ──
+function validateBulkConfig(cfg) {
+    if (!derivWS || derivWS.readyState !== WebSocket.OPEN) return 'Not connected to Deriv. Please log in first.';
+    if (!accountId) return 'No trading account selected.';
+    if (cfg.trades < 1 || cfg.trades > BULK_MAX_TRADES) return `Number of trades must be between 1 and ${BULK_MAX_TRADES}.`;
+    if (!(cfg.stakePerTrade >= 0.35)) return 'Stake per trade is below the $0.35 minimum.';
+    if (cfg.totalStake > BULK_MAX_TOTAL_STAKE) return `Total planned stake ($${cfg.totalStake.toFixed(2)}) exceeds the safety cap of $${BULK_MAX_TOTAL_STAKE}.`;
+    if (liveBalance !== null && cfg.totalStake > liveBalance) return `Insufficient balance: total stake $${cfg.totalStake.toFixed(2)} exceeds your balance of $${liveBalance.toFixed(2)}.`;
+    if (!cfg.market) return 'Select a market.';
+    if (!CONTRACT_MAP[cfg.type]?.[cfg.direction]) return 'Select a valid trade direction.';
+    return null;
+}
+
+// ── Low-level, self-contained request helpers — decoupled from the DBot's
+// global pendingContract/lastContractId state so Bulk Trading can never
+// interfere with (or be interfered with by) the DBot or Accumulator. ──
+function derivRequest(payload, timeoutMs = 10000) {
+    return new Promise((resolve, reject) => {
+        if (!derivWS || derivWS.readyState !== WebSocket.OPEN) { reject(new Error('Not connected')); return; }
+        const reqId = nextReqId();
+        const timer = setTimeout(() => { derivWS.removeEventListener('message', handler); reject(new Error('Request timed out')); }, timeoutMs);
+        function handler(ev) {
+            let data; try { data = JSON.parse(ev.data); } catch(e) { return; }
+            if (data.req_id !== reqId) return;
+            clearTimeout(timer);
+            derivWS.removeEventListener('message', handler);
+            if (data.error) { reject(new Error(data.error.message || 'API error')); return; }
+            resolve(data);
+        }
+        derivWS.addEventListener('message', handler);
+        derivWS.send(JSON.stringify({ ...payload, req_id: reqId }));
+    });
+}
+function waitForBulkContractSettlement(contractId, timeoutMs = 120000) {
+    return new Promise((resolve, reject) => {
+        if (!derivWS || derivWS.readyState !== WebSocket.OPEN) { reject(new Error('Not connected')); return; }
+        let subId = null;
+        const timer = setTimeout(() => { cleanup(); reject(new Error('Settlement timed out')); }, timeoutMs);
+        function cleanup() {
+            clearTimeout(timer);
+            derivWS.removeEventListener('message', handler);
+            if (subId && derivWS.readyState === WebSocket.OPEN) derivWS.send(JSON.stringify({ forget: subId }));
+        }
+        function handler(ev) {
+            let data; try { data = JSON.parse(ev.data); } catch(e) { return; }
+            if (data.msg_type !== 'proposal_open_contract') return;
+            const c = data.proposal_open_contract;
+            if (!c || c.contract_id !== contractId) return;
+            if (data.subscription?.id) subId = data.subscription.id;
+            if (c.is_sold || c.is_expired) { cleanup(); resolve(c); }
+        }
+        derivWS.addEventListener('message', handler);
+        derivWS.send(JSON.stringify({ proposal_open_contract: 1, contract_id: contractId, subscribe: 1, req_id: nextReqId() }));
+    });
+}
+
+// One fully round-tripped trade: proposal -> buy -> settlement. The caller
+// always awaits this before starting the next one, which is what makes the
+// whole batch sequential and duplicate-proof.
+async function executeSingleBulkTrade(cfg) {
+    const contractType = CONTRACT_MAP[cfg.type]?.[cfg.direction];
+    if (!contractType) throw new Error('Invalid contract configuration');
+
+    const isDigit    = ['DIGITEVEN','DIGITODD','DIGITOVER','DIGITUNDER'].includes(contractType);
+    const isRunHL    = ['RUNHIGH','RUNLOW'].includes(contractType);
+    const isRiseFall = ['CALL','PUT'].includes(contractType);
+
+    const proposalReq = {
+        proposal: 1, amount: parseFloat(cfg.stakePerTrade.toFixed(2)), basis: 'stake',
+        contract_type: contractType, currency: 'USD', underlying_symbol: cfg.market
+    };
+    if (isDigit)         { proposalReq.duration = Math.max(1, Math.min(10, cfg.duration)); proposalReq.duration_unit = 't'; }
+    else if (isRunHL)    { proposalReq.duration = Math.max(2, Math.min(10, cfg.duration)); proposalReq.duration_unit = 't'; }
+    else if (isRiseFall) { proposalReq.duration = Math.max(1, cfg.duration); proposalReq.duration_unit = 'm'; }
+    if (cfg.type === 'over_under') proposalReq.barrier = String(cfg.pred);
+
+    const proposalResp = await derivRequest(proposalReq);
+    const proposalId = proposalResp.proposal.id;
+    const askPrice    = parseFloat(proposalResp.proposal.ask_price);
+
+    const buyResp   = await derivRequest({ buy: proposalId, price: askPrice });
+    const contractId = buyResp.buy.contract_id;
+    const buyPrice    = parseFloat(buyResp.buy.buy_price);
+
+    const settled = await waitForBulkContractSettlement(contractId);
+    const profit  = parseFloat(settled.profit || 0);
+    return { contractType, stake: buyPrice, contractId, profit, isWin: profit > 0, timestamp: Date.now() };
+}
+
+function computeBatchStatus(batch) {
+    const done   = batch.results.filter(r => r.status === 'Completed').length;
+    const failed = batch.results.filter(r => r.status === 'Failed').length;
+    if (done === batch.trades) return 'Completed';
+    if (done === 0 && failed > 0) return 'Failed';
+    return 'Partially Completed';
+}
+
+// ── Main entry point — guarded against double-click / re-entrant calls ──
+async function startBulkExecution() {
+    if (bulkExecuting) return; // idempotency guard — a second click while running does nothing
+    const cfg = getBulkConfig();
+    const err = validateBulkConfig(cfg);
+    if (err) { notify('Cannot Execute', err, 'err'); return; }
+
+    const acct = allAccounts.find(a => a.account_id === accountId);
+    const isReal = acct && acct.account_type === 'real';
+
+    if (isReal) {
+        showApaModal(`
+            <div style="text-align:center;padding:10px;">
+                <div style="font-size:32px;margin-bottom:8px;">⚠️</div>
+                <div style="font-size:14px;font-weight:900;margin-bottom:8px;">Confirm REAL Account Execution</div>
+                <div style="font-size:12px;color:var(--muted);margin-bottom:16px;">You are about to execute <b style="color:var(--text);">${cfg.trades} trades</b> on your <b style="color:var(--red);">REAL</b> account. Total stake: <b style="color:var(--text);">$${cfg.totalStake.toFixed(2)}</b>.</div>
+                <button class="btn btn-red" style="width:100%;padding:12px;margin-bottom:8px;font-weight:900;" onclick="closeApaModal();runBulkExecution();">Confirm — Execute on REAL Account</button>
+                <button class="btn btn-ghost" style="width:100%;padding:10px;" onclick="closeApaModal();">Cancel</button>
+            </div>`);
+        return;
+    }
+    runBulkExecution();
+}
+
+async function runBulkExecution() {
+    if (bulkExecuting) return;
+    const cfg = getBulkConfig();
+    const err = validateBulkConfig(cfg);
+    if (err) { notify('Cannot Execute', err, 'err'); return; }
+
+    bulkExecuting = true;
+    const btn = document.getElementById('bulk-execute-btn');
+    if (btn) { btn.disabled = true; btn.textContent = `Executing 1 / ${cfg.trades} Trades...`; btn.style.opacity = '0.7'; }
+
+    const acct = allAccounts.find(a => a.account_id === accountId);
+    const batch = {
+        id: makeBulkBatchId(), createdAt: Date.now(), market: cfg.market, marketLabel: MKT[cfg.market] || cfg.market,
+        type: cfg.type, direction: cfg.direction, pred: cfg.pred, trades: cfg.trades,
+        stakePerTrade: cfg.stakePerTrade, totalStake: cfg.totalStake,
+        account: acct ? (acct.account_type === 'real' ? 'REAL' : 'DEMO') : '—',
+        status: 'RUNNING', results: []
+    };
+    bulkCurrentBatch = batch;
+    bulkBatches.push(batch);
+    saveBulkBatches();
+    renderBulkHistory();
+
+    const progressCard = document.getElementById('bulk-progress-card');
+    if (progressCard) progressCard.style.display = 'block';
+    renderBulkProgress(batch);
+
+    for (let i = 0; i < cfg.trades; i++) {
+        if (btn) btn.textContent = `Executing ${i+1} / ${cfg.trades} Trades...`;
+        try {
+            const result = await executeSingleBulkTrade(cfg);
+            batch.results.push({ index: i+1, ...result, status: 'Completed' });
+            log(`📦 Bulk trade ${i+1}/${cfg.trades} completed | ${result.isWin?'WIN':'LOSS'} $${result.profit.toFixed(2)}`, result.isWin ? 'w' : 'l');
+        } catch(e) {
+            batch.results.push({ index: i+1, status: 'Failed', error: e.message, timestamp: Date.now() });
+            log(`📦 Bulk trade ${i+1}/${cfg.trades} FAILED: ${e.message}`, 'x');
+        }
+        saveBulkBatches();
+        renderBulkProgress(batch);
+    }
+
+    batch.status = computeBatchStatus(batch);
+    saveBulkBatches();
+    bulkExecuting = false;
+    bulkCurrentBatch = null;
+    if (btn) { btn.disabled = false; btn.style.opacity = '1'; updateBulkPreview(); }
+
+    const wins = batch.results.filter(r => r.isWin).length;
+    const netResult = batch.results.reduce((s,r) => s + (r.profit || 0), 0);
+    notify(
+        batch.status === 'Completed' ? '✅ Bulk Trade Completed' : batch.status === 'Failed' ? '❌ Bulk Trade Failed' : '⚠️ Bulk Trade Partially Completed',
+        `${batch.trades} requested · ${batch.results.filter(r=>r.status==='Completed').length} executed · ${wins} wins · Net: ${netResult>=0?'+':''}$${netResult.toFixed(2)}`,
+        batch.status === 'Completed' ? 'ok' : batch.status === 'Failed' ? 'err' : 'warn'
+    );
+    renderBulkHistory();
+}
+
+function renderBulkProgress(batch) {
+    const total = batch.trades;
+    const done  = batch.results.length;
+    const success = batch.results.filter(r => r.status === 'Completed').length;
+    const failed  = batch.results.filter(r => r.status === 'Failed').length;
+    const pending = total - done;
+
+    const set = (id, v) => { const el = document.getElementById(id); if (el) el.textContent = v; };
+    set('bulk-progress-label', `${done} / ${total}`);
+    set('bulk-progress-status', done < total ? 'Running...' : (batch.status || 'Done'));
+    set('bulk-count-success', success);
+    set('bulk-count-failed', failed);
+    set('bulk-count-pending', pending);
+    const bar = document.getElementById('bulk-progress-bar');
+    if (bar) bar.style.width = `${total ? (done/total)*100 : 0}%`;
+
+    const body = document.getElementById('bulk-results-body');
+    if (body) {
+        body.innerHTML = batch.results.map(r => `
+            <div style="display:flex;align-items:center;padding:6px 0;border-bottom:1px solid var(--border);font-size:11px;">
+                <div style="width:32px;color:var(--muted);">${r.index}</div>
+                <div style="flex:1;">${r.contractType || batch.type}</div>
+                <div style="width:70px;font-family:monospace;">$${(r.stake ?? batch.stakePerTrade).toFixed(2)}</div>
+                <div style="width:90px;color:${r.status==='Completed'?'var(--green)':'var(--red)'};">${r.status}</div>
+                <div style="width:80px;text-align:right;font-family:monospace;font-weight:700;color:${r.status!=='Completed'?'var(--dim)':r.isWin?'var(--green)':'var(--red)'};">${r.status==='Completed' ? (r.isWin?'+':'')+'$'+r.profit.toFixed(2) : '—'}</div>
+            </div>`).join('')
+            + Array.from({length: Math.max(0, total-done)}).map((_,i) => `
+            <div style="display:flex;align-items:center;padding:6px 0;border-bottom:1px solid var(--border);font-size:11px;color:var(--dim);">
+                <div style="width:32px;">${done+i+1}</div><div style="flex:1;">Pending</div><div style="width:70px;">—</div><div style="width:90px;">Pending</div><div style="width:80px;text-align:right;">—</div>
+            </div>`).join('');
+    }
+}
+
+function renderBulkHistory() {
+    const body = document.getElementById('bulk-history-body');
+    if (!body) return;
+    const batches = bulkBatches.slice().sort((a,b) => b.createdAt - a.createdAt);
+    if (!batches.length) {
+        body.innerHTML = `<div style="font-size:11px;color:var(--dim);text-align:center;padding:16px;">No bulk trades executed yet.</div>`;
+        return;
+    }
+    body.innerHTML = batches.map(b => {
+        const wins   = b.results.filter(r => r.isWin).length;
+        const losses = b.results.filter(r => r.status === 'Completed' && !r.isWin).length;
+        const net    = b.results.reduce((s,r) => s + (r.profit || 0), 0);
+        const statusColor = b.status === 'Completed' ? 'var(--green)' : b.status === 'Failed' ? 'var(--red)' : b.status === 'RUNNING' ? 'var(--amber)' : 'var(--amber)';
+        return `
+        <div class="card-sm" style="padding:10px;">
+            <div style="display:flex;justify-content:space-between;align-items:center;cursor:pointer;" onclick="toggleBulkBatchDetail('${b.id}')">
+                <div>
+                    <div style="font-size:11px;font-weight:900;">Batch #${b.id}</div>
+                    <div style="font-size:9px;color:var(--muted);">${new Date(b.createdAt).toLocaleString()} · ${b.marketLabel} · ${b.direction.toUpperCase()}</div>
+                </div>
+                <span class="badge" style="background:${statusColor}22;color:${statusColor};border:1px solid ${statusColor}44;">${b.status}</span>
+            </div>
+            <div class="accu-row-3" style="margin-top:8px;">
+                <div style="text-align:center;"><div style="font-size:8px;color:var(--muted);">TRADES</div><div style="font-size:12px;font-weight:900;">${b.trades}</div></div>
+                <div style="text-align:center;"><div style="font-size:8px;color:var(--muted);">TOTAL STAKE</div><div style="font-size:12px;font-weight:900;">$${b.totalStake.toFixed(2)}</div></div>
+                <div style="text-align:center;"><div style="font-size:8px;color:var(--muted);">NET RESULT</div><div style="font-size:12px;font-weight:900;color:${net>=0?'var(--green)':'var(--red)'};">${net>=0?'+':''}$${net.toFixed(2)}</div></div>
+            </div>
+            <div style="font-size:9px;color:var(--muted);margin-top:6px;">Wins: <b style="color:var(--green);">${wins}</b> · Losses: <b style="color:var(--red);">${losses}</b> · Account: <b>${b.account}</b></div>
+            <div id="bulk-batch-detail-${b.id}" style="display:none;margin-top:8px;border-top:1px solid var(--border);padding-top:8px;">
+                ${b.results.map(r => `
+                <div style="display:flex;justify-content:space-between;font-size:10px;padding:3px 0;color:var(--muted);">
+                    <span>#${r.index} ${r.contractType || b.type}</span>
+                    <span>${new Date(r.timestamp).toLocaleTimeString()}</span>
+                    <span style="color:${r.status!=='Completed'?'var(--red)':r.isWin?'var(--green)':'var(--red)'};">${r.status==='Completed' ? (r.isWin?'+':'')+'$'+r.profit.toFixed(2) : (r.error || 'Failed')}</span>
+                </div>`).join('')}
+            </div>
+        </div>`;
+    }).join('');
+}
+function toggleBulkBatchDetail(id) {
+    const el = document.getElementById(`bulk-batch-detail-${id}`);
+    if (el) el.style.display = el.style.display === 'none' ? 'block' : 'none';
+}
+function clearBulkHistory() {
+    bulkBatches = [];
+    saveBulkBatches();
+    renderBulkHistory();
+    notify('🗑 Bulk History Cleared', 'All bulk trade batches have been removed from this browser.', 'ok');
+}
+
+function initBulkTab() {
+    loadBulkBatches();
+    onBulkTypeChange();
+    setBulkStakeMode(bulkStakeMode);
+    updateBulkPreview();
+    renderBulkHistory();
+    if (bulkCurrentBatch) { document.getElementById('bulk-progress-card').style.display = 'block'; renderBulkProgress(bulkCurrentBatch); }
+
+    const acct = allAccounts.find(a => a.account_id === accountId);
+    const accBadge = document.getElementById('bulk-account-badge');
+    const balBadge = document.getElementById('bulk-balance-badge');
+    if (accBadge) {
+        if (acct) { accBadge.style.display = 'inline-flex'; accBadge.textContent = acct.account_type === 'real' ? 'REAL' : 'DEMO'; accBadge.className = acct.account_type === 'real' ? 'badge badge-red' : 'badge badge-teal'; }
+        else accBadge.style.display = 'none';
+    }
+    if (balBadge) {
+        if (liveBalance !== null) { balBadge.style.display = 'inline-flex'; balBadge.textContent = `$${liveBalance.toFixed(2)}`; }
+        else balBadge.style.display = 'none';
+    }
+    const dot = document.getElementById('bulk-status-dot');
+    const txt = document.getElementById('bulk-status-text');
+    const live = derivWS && derivWS.readyState === WebSocket.OPEN;
+    if (dot) dot.classList.toggle('live', live);
+    if (txt) { txt.textContent = live ? 'LIVE' : 'OFFLINE'; txt.style.color = live ? 'var(--teal)' : 'var(--muted)'; }
 }
 
 // ================================================================
@@ -2753,10 +3216,16 @@ function runFullScan() {
                 <div style="font-size:10px;color:var(--muted);margin-bottom:4px;">${s.reason}</div>
                 <div style="font-size:10px;color:var(--teal);font-style:italic;margin-bottom:6px;">💡 ${s.entryHint}</div>
                 ${s.warning ? `<div style="font-size:9px;color:#f59e0b;">⚠️ ${s.warning}</div>` : ''}
-                <button onclick="applySignalToBot(${JSON.stringify(s).replace(/"/g,'&quot;')})"
-                    style="background:var(--teal);color:#000;border:none;border-radius:6px;padding:5px 12px;font-size:10px;font-weight:700;cursor:pointer;margin-top:4px;width:100%;">
-                    ✅ Apply to Bot
-                </button>
+                <div style="display:flex;gap:6px;margin-top:4px;">
+                    <button onclick="applySignalToBot(${JSON.stringify(s).replace(/"/g,'&quot;')})"
+                        style="flex:1;background:var(--teal);color:#000;border:none;border-radius:6px;padding:5px 8px;font-size:10px;font-weight:700;cursor:pointer;">
+                        ✅ Apply to Bot
+                    </button>
+                    <button onclick="applySignalToBulk(${JSON.stringify(s).replace(/"/g,'&quot;')})"
+                        style="flex:1;background:var(--bg2);color:var(--teal);border:1px solid var(--teal);border-radius:6px;padding:5px 8px;font-size:10px;font-weight:700;cursor:pointer;">
+                        📦 Use in Bulk
+                    </button>
+                </div>
             </div>`).join('');
 
         stratBox.innerHTML = `
@@ -2813,7 +3282,10 @@ function runFullScan() {
                     </div>` : ''}
                 </div>` : ''}
                 ${topSigs.length > 1 ? `<div style="font-size:10px;font-weight:700;color:var(--muted);text-transform:uppercase;margin-bottom:6px;">All Signals for this market:</div><div style="display:flex;flex-direction:column;gap:4px;">${sigsHtml}</div>` : ''}
-                <button onclick="applyBestSignal()" class="btn btn-teal" style="margin-top:12px;padding:8px 20px;font-size:12px;width:100%;">✅ Apply Best Signal to Bot</button>`;
+                <div style="display:flex;gap:8px;margin-top:12px;">
+                    <button onclick="applyBestSignal()" class="btn btn-teal" style="flex:1;padding:8px 20px;font-size:12px;">✅ Apply Best Signal to Bot</button>
+                    <button onclick="applyBestSignalToBulk()" class="btn btn-ghost" style="flex:1;padding:8px 20px;font-size:12px;border:1px solid var(--teal);color:var(--teal);">📦 Use in Bulk Trading</button>
+                </div>`;
         } else {
             bestBox.innerHTML = '<div style="color:var(--muted);font-size:12px;">Loading tick data... Each market needs 50+ ticks. Please wait.</div>';
         }
@@ -3416,28 +3888,39 @@ const APA_MARKETS = [
     { deriv:'1HZ50V',   mt5:'Volatility 50 (1s) Index', display:'Volatility 50 (1s) Index', cat:'volatility_1s', confirmed:true },
     { deriv:'1HZ75V',   mt5:'Volatility 75 (1s) Index', display:'Volatility 75 (1s) Index', cat:'volatility_1s', confirmed:true },
     { deriv:'1HZ100V',  mt5:'Volatility 100 (1s) Index',display:'Volatility 100 (1s) Index',cat:'volatility_1s', confirmed:true },
-    // Step Index — Deriv currently offers a single Step Index (not
-    // separate 100/200/300/400/500 variants). Listed once, honestly.
-    { deriv:'stpRNG',   mt5:'Step Index',               display:'Step Index',               cat:'step',          confirmed:true },
+    // Step Indices — Deriv's actual live symbol list only has ONE Step
+    // Index (stpRNG). "Step Index 200/300/400/500" are included below
+    // because they were requested, but they have no real Deriv symbol to
+    // fetch live data from — `deriv:null` means they can never pass the
+    // live-availability check and will always show as unavailable rather
+    // than being faked. See the chat write-up for the full explanation.
+    { deriv:'stpRNG',   mt5:'Step Index',       display:'Step Index',     cat:'step', confirmed:true },
+    { deriv:null,       mt5:'Step Index 100',   display:'Step Index 100', cat:'step', confirmed:false },
+    { deriv:null,       mt5:'Step Index 200',   display:'Step Index 200', cat:'step', confirmed:false },
+    { deriv:null,       mt5:'Step Index 300',   display:'Step Index 300', cat:'step', confirmed:false },
+    { deriv:null,       mt5:'Step Index 400',   display:'Step Index 400', cat:'step', confirmed:false },
+    { deriv:null,       mt5:'Step Index 500',   display:'Step Index 500', cat:'step', confirmed:false },
     // Boom / Crash — symbol codes below are validated live; anything not
     // confirmed by Deriv's own active_symbols response is shown as
     // unavailable rather than assumed to exist.
-    { deriv:'BOOM300N', mt5:'Boom 300 Index',   display:'Boom 300 Index',   cat:'boom_crash', confirmed:false },
-    { deriv:'BOOM500',  mt5:'Boom 500 Index',   display:'Boom 500 Index',   cat:'boom_crash', confirmed:false },
-    { deriv:'BOOM600',  mt5:'Boom 600 Index',   display:'Boom 600 Index',   cat:'boom_crash', confirmed:false },
-    { deriv:'BOOM900',  mt5:'Boom 900 Index',   display:'Boom 900 Index',   cat:'boom_crash', confirmed:false },
-    { deriv:'BOOM1000', mt5:'Boom 1000 Index',  display:'Boom 1000 Index',  cat:'boom_crash', confirmed:false },
-    { deriv:'CRASH300N',mt5:'Crash 300 Index',  display:'Crash 300 Index',  cat:'boom_crash', confirmed:false },
-    { deriv:'CRASH500', mt5:'Crash 500 Index',  display:'Crash 500 Index',  cat:'boom_crash', confirmed:false },
-    { deriv:'CRASH600', mt5:'Crash 600 Index',  display:'Crash 600 Index',  cat:'boom_crash', confirmed:false },
-    { deriv:'CRASH900', mt5:'Crash 900 Index',  display:'Crash 900 Index',  cat:'boom_crash', confirmed:false },
-    { deriv:'CRASH1000',mt5:'Crash 1000 Index', display:'Crash 1000 Index', cat:'boom_crash', confirmed:false },
+    { deriv:'BOOM300N', mt5:'Boom 300 Index',   display:'Boom 300 Index',   cat:'boom',  confirmed:false },
+    { deriv:'BOOM500',  mt5:'Boom 500 Index',   display:'Boom 500 Index',   cat:'boom',  confirmed:false },
+    { deriv:'BOOM600',  mt5:'Boom 600 Index',   display:'Boom 600 Index',   cat:'boom',  confirmed:false },
+    { deriv:'BOOM900',  mt5:'Boom 900 Index',   display:'Boom 900 Index',   cat:'boom',  confirmed:false },
+    { deriv:'BOOM1000', mt5:'Boom 1000 Index',  display:'Boom 1000 Index',  cat:'boom',  confirmed:false },
+    { deriv:'CRASH300N',mt5:'Crash 300 Index',  display:'Crash 300 Index',  cat:'crash', confirmed:false },
+    { deriv:'CRASH500', mt5:'Crash 500 Index',  display:'Crash 500 Index',  cat:'crash', confirmed:false },
+    { deriv:'CRASH600', mt5:'Crash 600 Index',  display:'Crash 600 Index',  cat:'crash', confirmed:false },
+    { deriv:'CRASH900', mt5:'Crash 900 Index',  display:'Crash 900 Index',  cat:'crash', confirmed:false },
+    { deriv:'CRASH1000',mt5:'Crash 1000 Index', display:'Crash 1000 Index', cat:'crash', confirmed:false },
 ];
+const APA_CATEGORY_LABEL = { volatility:'Volatility', volatility_1s:'Volatility 1s', step:'Step', boom:'Boom', crash:'Crash' };
 
 // A market is only ever presented as tradable once Deriv's own
 // active_symbols response has confirmed it (see connectPublicWS above).
 // Until then — or if Deriv never confirms it — it's shown as unavailable.
 function isMarketAvailable(mkt) {
+    if (!mkt.deriv) return false; // no real Deriv symbol to check at all
     return knownActiveSymbols.size > 0 && knownActiveSymbols.has(mkt.deriv);
 }
 
@@ -3452,7 +3935,6 @@ const GRAN_LABEL = { 60:'M1', 300:'M5', 900:'M15', 1800:'M30', 3600:'H1', 14400:
 
 let apaStyle          = 'day';
 let apaMarket         = 'R_75';
-let apaScannerFilter  = 'all';
 let apaCurrentSignal  = null;
 let apaNotifiedIds    = new Set();
 let apaAuditLog       = [];
@@ -3760,13 +4242,130 @@ async function computeApaSignal(sym, styleKey) {
 // ================================================================
 // UI — Style selector, scanner, setup card
 // ================================================================
+// ================================================================
+// MT5 SIGNAL LIFECYCLE ENGINE
+// Generated signals are never deleted when they go stale — they move
+// NEW -> ACTIVE -> EXPIRED and stay in Signal History. Persisted to
+// localStorage (no server DB exists in this app) so history survives a
+// page refresh. The underlying strategy math is untouched — this layer
+// just wraps computeApaSignal() with persistence, lifecycle and dedup.
+// ================================================================
+
+// Configurable, not hard-coded through the app — change these two knobs only.
+const MT5_SIGNAL_VALIDITY_MINUTES        = 15; // how long a signal stays ACTIVE
+const MT5_SIGNAL_HISTORY_RETENTION_DAYS  = 7;  // how long EXPIRED signals stay in History
+const MT5_SIGNAL_MIN_SCORE               = 70; // generation threshold (APA "Good Setup" or better)
+const MT5_SCAN_INTERVAL_MS               = 25000; // background re-scan cadence
+
+let mt5Signals        = [];          // the persisted signal list — single source of truth
+let mt5HistoryFilter   = { cat: 'all', instrument: 'all', status: 'all', range: 'all' };
+let mt5HistoryTab      = 'active';   // 'active' | 'history'
+let mt5ScanTimer       = null;
+let mt5ScanInFlight    = false;
+
+function loadMt5Signals() {
+    try { mt5Signals = JSON.parse(localStorage.getItem('bth_mt5_signals') || '[]'); }
+    catch(e) { mt5Signals = []; }
+    pruneMt5Signals();
+}
+function saveMt5Signals() {
+    try { localStorage.setItem('bth_mt5_signals', JSON.stringify(mt5Signals.slice(-500))); } catch(e) {}
+}
+function pruneMt5Signals() {
+    const cutoff = Date.now() - MT5_SIGNAL_HISTORY_RETENTION_DAYS * 86400000;
+    mt5Signals = mt5Signals.filter(s => s.generatedAt >= cutoff);
+}
+
+function makeSignalId(mkt, date) {
+    const code  = (mkt.display || mkt.mt5).replace(/[^A-Za-z0-9]/g, '').toUpperCase().slice(0, 8);
+    const stamp = date.toISOString().replace(/[-:]/g, '').replace('T', '-').slice(0, 15);
+    return `${code}-${stamp}`;
+}
+
+// Idempotent upsert — never creates a duplicate ACTIVE signal for the same
+// market+direction. A genuinely new signal event only happens when this
+// market currently has no ACTIVE signal, or the direction has reversed
+// (in which case the old one is expired immediately, not deleted).
+function upsertMt5Signal(mkt, sig) {
+    const existingActive = mt5Signals.find(s => s.market === mkt.deriv && s.status === 'ACTIVE');
+    if (existingActive) {
+        if (existingActive.direction === sig.direction) return; // same setup still developing — no duplicate
+        existingActive.status = 'EXPIRED'; // direction reversed — retire the old one into History
+    }
+    const now = new Date();
+    const record = {
+        id: makeSignalId(mkt, now),
+        market: mkt.deriv, mt5Symbol: mkt.mt5, display: mkt.display, category: mkt.cat,
+        direction: sig.direction, confidence: sig.score, strategy: 'Advanced Price Action (APA)',
+        style: sig.style, styleLabel: sig.styleLabel,
+        generatedAt: now.getTime(), expiresAt: now.getTime() + MT5_SIGNAL_VALIDITY_MINUTES * 60000,
+        status: 'ACTIVE',
+        entry: sig.entry, target: sig.tp1, target2: sig.tp2, invalidation: sig.sl, rr: sig.rr,
+        tags: sig.tags, htfBias: sig.htfBias
+    };
+    mt5Signals.push(record);
+    saveMt5Signals();
+    notify('🟢 NEW SIGNAL', `${mkt.display} ${sig.direction} — ${sig.score}% confidence`, 'ok');
+    return record;
+}
+
+function updateMt5SignalStatuses() {
+    let changed = false;
+    const now = Date.now();
+    mt5Signals.forEach(s => { if (s.status === 'ACTIVE' && now > s.expiresAt) { s.status = 'EXPIRED'; changed = true; } });
+    if (changed) { saveMt5Signals(); renderMt5SignalsUI(); }
+}
+
+// Background scan — evaluates every confirmed/available market on the
+// currently-selected style and lets upsertMt5Signal() decide whether a new
+// record is warranted. Runs independently of which internal tab is open.
+async function mt5BackgroundScan() {
+    if (mt5ScanInFlight) return;
+    mt5ScanInFlight = true;
+    try {
+        const markets = APA_MARKETS.filter(m => m.confirmed || isMarketAvailable(m));
+        for (const mkt of markets) {
+            try {
+                const sig = await computeApaSignal(mkt.deriv, apaStyle);
+                if (!sig.noTrade && sig.score >= MT5_SIGNAL_MIN_SCORE) upsertMt5Signal(mkt, sig);
+            } catch(e) {}
+            await new Promise(r => setTimeout(r, 150)); // pacing — avoid hammering the candle API
+        }
+    } finally {
+        mt5ScanInFlight = false;
+        renderMt5SignalsUI();
+    }
+}
+function startMt5BackgroundScan() {
+    if (mt5ScanTimer) return;
+    loadMt5Signals();
+    mt5BackgroundScan();
+    mt5ScanTimer = setInterval(mt5BackgroundScan, MT5_SCAN_INTERVAL_MS);
+}
+
+// Age ticks every second without a full re-render — just updates the text.
+setInterval(() => {
+    updateMt5SignalStatuses();
+    document.querySelectorAll('.mt5-age[data-t]').forEach(el => {
+        el.textContent = formatSignalAge(parseInt(el.dataset.t, 10));
+    });
+}, 1000);
+
+function formatSignalAge(sinceMs) {
+    const secs = Math.max(0, Math.floor((Date.now() - sinceMs) / 1000));
+    const m = Math.floor(secs / 60), s = secs % 60;
+    return `${String(m).padStart(2,'0')}m ${String(s).padStart(2,'0')}s`;
+}
+
+// ================================================================
+// UI — Style selector, market picker, on-demand setup card
+// ================================================================
 function selectApaStyle(styleKey, btn) {
     apaStyle = styleKey;
     document.querySelectorAll('.apa-style-btn').forEach(b => b.classList.remove('apa-style-active'));
     if (btn) btn.classList.add('apa-style-active');
     saveApaPrefs();
     runApaAnalysis();
-    renderApaScanner();
 }
 
 function onApaMarketChange(sym) {
@@ -3782,22 +4381,15 @@ async function runApaAnalysis() {
 
     const mkt = APA_MARKETS.find(m => m.deriv === apaMarket);
     if (mkt && !mkt.confirmed && !isMarketAvailable(mkt)) {
-        card.innerHTML = `<div style="font-size:12px;color:var(--red);text-align:center;padding:20px;">Market currently unavailable on your MT5 account.</div>`;
+        card.innerHTML = `<div style="font-size:12px;color:var(--red);text-align:center;padding:20px;">Market currently unavailable — Deriv hasn't confirmed a live symbol for this instrument.</div>`;
         apaCurrentSignal = null;
         return;
     }
 
     const sig = await computeApaSignal(apaMarket, apaStyle);
+    if (!sig.noTrade) { sig.style = apaStyle; sig.styleLabel = APA_STYLES[apaStyle].label; }
     apaCurrentSignal = sig.noTrade ? null : sig;
     renderApaSetupCard(sig);
-
-    if (!sig.noTrade && sig.score >= 85) {
-        const notifKey = `${sig.market}_${sig.style}_${sig.direction}_${Math.floor(Date.now()/60000)}`;
-        if (!apaNotifiedIds.has(notifKey)) {
-            apaNotifiedIds.add(notifKey);
-            notify('🟢 GREAT ENTRY', `${sig.display} ${sig.direction} — APA Score ${sig.score}/100`, 'ok');
-        }
-    }
 }
 
 function renderApaSetupCard(sig) {
@@ -3845,191 +4437,171 @@ function renderApaSetupCard(sig) {
             <div class="card-sm" style="padding:8px;text-align:center;"><div style="font-size:9px;color:var(--muted);">TAKE PROFIT 2</div><div style="font-size:13px;font-weight:900;font-family:monospace;color:var(--green);">${fmt(sig.tp2)}</div></div>
         </div>
         <div style="font-size:10px;color:var(--muted);margin-bottom:10px;">Setup: <b style="color:var(--text);">${sig.tags.join(' + ') || '—'}</b></div>
-        <button onclick="openApplyToMT5Modal()" class="btn btn-teal" style="width:100%;padding:12px;font-size:14px;font-weight:900;border-radius:8px;">📲 APPLY TO MT5</button>`;
+        <button onclick="copySignalText({display:'${sig.display.replace(/'/g,"\\'")}',direction:'${sig.direction}',confidence:${sig.score},generatedAt:${Date.now()},entry:${sig.entry},target:${sig.tp1},invalidation:${sig.sl},id:'ondemand-${Date.now()}'})" class="btn btn-teal" style="width:100%;padding:12px;font-size:14px;font-weight:900;border-radius:8px;">📋 COPY SIGNAL</button>
+        <div style="font-size:9px;color:var(--muted);text-align:center;margin-top:6px;">Deriv doesn't allow this site to place MT5 orders directly — copy these levels into the real MT5 terminal to enter manually.</div>`;
 }
 
-// ── Scanner — lighter-weight pass across the configured (and confirmed) market list ──
-async function renderApaScanner() {
-    const body = document.getElementById('apa-scanner-body');
-    if (!body) return;
-    const markets = APA_MARKETS.filter(m => apaScannerFilter === 'all' || m.cat === apaScannerFilter);
-    body.innerHTML = `<div style="font-size:11px;color:var(--muted);text-align:center;padding:16px;">Scanning ${markets.length} markets...</div>`;
-
-    const rows = [];
-    for (const mkt of markets) {
-        if (!mkt.confirmed && !isMarketAvailable(mkt)) {
-            rows.push({ mkt, unavailable: true });
-            continue;
-        }
-        try {
-            const sig = await computeApaSignal(mkt.deriv, apaStyle);
-            rows.push({ mkt, sig });
-        } catch(e) {
-            rows.push({ mkt, sig: { noTrade: true, reason: 'Data error', score: 0 } });
-        }
-        // small pacing delay so we don't hammer the public WS with rapid-fire candle requests
-        await new Promise(r => setTimeout(r, 120));
+// ================================================================
+// COPY SIGNAL — replaces the old "Apply to MT5" flow. Deriv's public API
+// cannot place or manage MT5 orders from a browser, so instead of a
+// misleading execute button, every signal offers a clean, copyable summary
+// for fast manual entry.
+// ================================================================
+function formatSignalText(sig) {
+    const fmt = (n) => n !== null && n !== undefined ? Number(n).toFixed(5) : '—';
+    const risk = document.getElementById('apa-risk')?.value;
+    return [
+        'BTraderHub Signal',
+        `Market: ${sig.display}`,
+        `Direction: ${sig.direction}`,
+        `Generated: ${new Date(sig.generatedAt).toLocaleString()}`,
+        `Confidence: ${sig.confidence}%`,
+        `Entry: ${fmt(sig.entry)}`,
+        `Target: ${fmt(sig.target)}`,
+        sig.target2 !== undefined ? `Target 2: ${fmt(sig.target2)}` : null,
+        `Invalidation: ${fmt(sig.invalidation)}`,
+        risk ? `Suggested risk: ${risk}%` : null,
+        `Signal ID: ${sig.id}`
+    ].filter(Boolean).join('\n');
+}
+function copySignalText(sig) {
+    const text = formatSignalText(sig);
+    if (navigator.clipboard && navigator.clipboard.writeText) {
+        navigator.clipboard.writeText(text)
+            .then(() => notify('📋 Signal Copied', 'Paste it into MT5 or your notes to enter the trade manually.', 'ok'))
+            .catch(() => window.prompt('Copy this signal:', text));
+    } else {
+        window.prompt('Copy this signal:', text);
     }
-
-    rows.sort((a,b) => (b.sig?.score || -1) - (a.sig?.score || -1));
-
-    body.innerHTML = rows.map(r => {
-        if (r.unavailable) {
-            return `<div style="display:flex;padding:8px 0;border-bottom:1px solid var(--border);font-size:11px;color:var(--dim);">
-                <div style="flex:1;">${r.mkt.display}</div><div style="width:110px;">Unavailable</div></div>`;
-        }
-        const sig = r.sig;
-        const dirColor = sig.direction === 'BUY' ? 'var(--green)' : sig.direction === 'SELL' ? 'var(--red)' : 'var(--muted)';
-        const setupLabel = sig.noTrade ? (sig.score >= 55 ? 'Watch' : 'No Trade') : (sig.score >= 85 ? 'Great Entry' : sig.score >= 70 ? 'Good Setup' : 'Watch');
-        return `<div style="display:flex;align-items:center;padding:8px 0;border-bottom:1px solid var(--border);font-size:11px;cursor:pointer;" onclick="onApaMarketChange('${r.mkt.deriv}');document.getElementById('apa-market-select').value='${r.mkt.deriv}';">
-            <div style="flex:1;font-weight:700;">${r.mkt.display}</div>
-            <div style="width:60px;color:${dirColor};font-weight:700;">${sig.direction || '—'}</div>
-            <div style="width:50px;font-weight:900;color:${sig.score>=85?'var(--green)':sig.score>=70?'var(--amber)':'var(--muted)'};">${sig.score}</div>
-            <div style="width:100px;color:var(--muted);">${setupLabel}</div>
-        </div>`;
-    }).join('') || '<div style="font-size:11px;color:var(--dim);text-align:center;padding:16px;">No markets in this filter.</div>';
 }
-
-function filterApaScanner(cat, btn) {
-    apaScannerFilter = cat;
-    document.querySelectorAll('#apa-scanner-filters .btn').forEach(b => { b.classList.remove('btn-teal'); b.classList.add('btn-ghost'); });
-    if (btn) { btn.classList.remove('btn-ghost'); btn.classList.add('btn-teal'); }
-    renderApaScanner();
-}
-
-function refreshApaScanner() {
-    apaCandleCache = {}; // force fresh candles
-    renderApaScanner();
-    runApaAnalysis();
+function copySignalById(id) {
+    const sig = mt5Signals.find(s => s.id === id);
+    if (sig) copySignalText(sig);
 }
 
 // ================================================================
-// APPLY TO MT5 — validated hand-off, never a faked execution
+// ACTIVE SIGNALS + SIGNAL HISTORY UI
 // ================================================================
-let apaMt5AccountChecked = false;
-let apaMt5HasAccount     = false;
-
-// Real Deriv API call — checks whether the user's authenticated session has
-// an MT5 trading account. If the call isn't supported by the current
-// connection or times out, we say so honestly rather than assume either way.
-function checkMt5Account() {
-    return new Promise((resolve) => {
-        if (!derivWS || derivWS.readyState !== WebSocket.OPEN) { resolve({ ok: false, reason: 'not_connected' }); return; }
-        const reqId = nextReqId();
-        const timeout = setTimeout(() => {
-            derivWS.removeEventListener('message', handler);
-            resolve({ ok: false, reason: 'timeout' });
-        }, 6000);
-        function handler(ev) {
-            let data; try { data = JSON.parse(ev.data); } catch(e) { return; }
-            if (data.req_id !== reqId) return;
-            clearTimeout(timeout);
-            derivWS.removeEventListener('message', handler);
-            if (data.error) { resolve({ ok: false, reason: 'unsupported', message: data.error.message }); return; }
-            const list = data.mt5_login_list || [];
-            const standard = list.filter(a => (a.account_type === 'real' || a.account_type === 'demo'));
-            resolve({ ok: true, accounts: list, hasAccount: standard.length > 0 });
-        }
-        derivWS.addEventListener('message', handler);
-        derivWS.send(JSON.stringify({ mt5_login_list: 1, req_id: reqId }));
+function switchMt5HistoryTab(tab, btn) {
+    mt5HistoryTab = tab;
+    document.querySelectorAll('.mt5-tab-btn').forEach(b => {
+        b.classList.remove('mt5-tab-active', 'btn-teal');
+        b.classList.add('btn-ghost');
     });
+    if (btn) { btn.classList.add('mt5-tab-active'); btn.classList.remove('btn-ghost'); btn.classList.add('btn-teal'); }
+    document.getElementById('mt5-active-section').style.display = tab === 'active' ? 'block' : 'none';
+    document.getElementById('mt5-history-section').style.display = tab === 'history' ? 'block' : 'none';
 }
 
-async function openApplyToMT5Modal() {
-    if (!apaCurrentSignal) return;
-    const sig = apaCurrentSignal;
-
-    // 1) Authenticated?
-    if (!accessToken || !accountId) {
-        showApaModal(`<div style="text-align:center;padding:10px;">
-            <div style="font-size:14px;font-weight:900;margin-bottom:8px;">Please log in to continue</div>
-            <div style="font-size:12px;color:var(--muted);margin-bottom:14px;">You need to connect your Deriv account before applying a setup to MT5.</div>
-            <button class="btn btn-teal" style="width:100%;padding:12px;" onclick="closeApaModal();loginWithDeriv();">✨ Connect My Deriv Account</button>
-        </div>`);
-        return;
-    }
-
-    // 2) Signal still valid / not expired?
-    if (Date.now() > sig.expiresAt) {
-        showApaModal(`<div style="text-align:center;padding:10px;">
-            <div style="font-size:32px;margin-bottom:8px;">⏱</div>
-            <div style="font-size:14px;font-weight:900;margin-bottom:8px;">Setup expired</div>
-            <div style="font-size:12px;color:var(--muted);margin-bottom:14px;">This setup is no longer current. Re-run the analysis for a fresh read.</div>
-            <button class="btn btn-teal" style="width:100%;padding:12px;" onclick="closeApaModal();runApaAnalysis();">🔄 Re-analyze</button>
-        </div>`);
-        return;
-    }
-
-    showApaModal(`<div style="text-align:center;padding:20px;"><div style="font-size:12px;color:var(--muted);">Checking your MT5 account...</div></div>`);
-    const acctCheck = await checkMt5Account();
-
-    if (!acctCheck.ok || !acctCheck.hasAccount) {
-        const note = acctCheck.reason === 'unsupported'
-            ? `We couldn't automatically verify your MT5 account (${acctCheck.message || 'the check is not available on this connection'}). You can still continue if you already have one.`
-            : `No Standard MT5 trading account was found on your Deriv login.`;
-        showApaModal(`<div style="text-align:center;padding:10px;">
-            <div style="font-size:14px;font-weight:900;margin-bottom:8px;">MT5 Account Required</div>
-            <div style="font-size:12px;color:var(--muted);margin-bottom:16px;">${note}</div>
-            <a href="https://app.deriv.com/mt5" target="_blank" class="btn btn-teal" style="display:block;width:100%;padding:12px;margin-bottom:8px;text-decoration:none;">➕ Create Standard MT5 Account</a>
-            <button class="btn btn-ghost" style="width:100%;padding:12px;" onclick="closeApaModal();confirmApplyToMT5(true);">✅ I already have an MT5 account — Connect</button>
-        </div>`);
-        return;
-    }
-
-    renderApaConfirm(sig);
+function setMt5HistoryFilter(key, value) {
+    mt5HistoryFilter[key] = value;
+    if (key === 'cat') mt5HistoryFilter.instrument = 'all'; // reset instrument when category changes
+    renderMt5SignalsUI();
+    if (key === 'cat') populateMt5InstrumentFilter();
 }
 
-// User asserted they already have an account (self-declared, since the
-// automated check was inconclusive) — still runs the same price/expiry
-// revalidation before handing off.
-function confirmApplyToMT5(skipAccountCheck) {
-    if (!apaCurrentSignal) return;
-    renderApaConfirm(apaCurrentSignal);
+function populateMt5InstrumentFilter() {
+    const sel = document.getElementById('mt5-filter-instrument');
+    if (!sel) return;
+    const markets = APA_MARKETS.filter(m => mt5HistoryFilter.cat === 'all' || m.cat === mt5HistoryFilter.cat);
+    sel.innerHTML = `<option value="all">All Instruments</option>` +
+        markets.map(m => `<option value="${m.deriv || m.mt5}">${m.display}</option>`).join('');
 }
 
-async function renderApaConfirm(sig) {
-    // Revalidate price hasn't drifted materially from the setup
-    let freshCandles;
-    try { freshCandles = await fetchCandles(sig.market, APA_STYLES[sig.style].entry, 2); } catch(e) { freshCandles = null; }
-    const livePrice = freshCandles && freshCandles.length ? freshCandles[freshCandles.length-1].close : sig.entry;
-    const deviation  = Math.abs(livePrice - sig.entry) / sig.entry;
-
-    if (deviation > 0.004) {
-        showApaModal(`<div style="text-align:center;padding:10px;">
-            <div style="font-size:14px;font-weight:900;color:var(--amber);margin-bottom:8px;">⚠️ Setup changed</div>
-            <div style="font-size:12px;color:var(--muted);margin-bottom:14px;">${sig.display} has moved away from the original entry (${sig.entry.toFixed(5)} → ${livePrice.toFixed(5)}). Please review the updated setup.</div>
-            <button class="btn btn-teal" style="width:100%;padding:12px;" onclick="closeApaModal();runApaAnalysis();">🔄 Re-analyze</button>
-        </div>`);
-        logApaAudit({ event: 'setup_changed', market: sig.market, style: sig.style, entry: sig.entry, livePrice });
-        return;
-    }
-
-    const risk = document.getElementById('apa-risk')?.value || '1';
-    showApaModal(`<div style="padding:6px 0;">
-        <div style="font-size:14px;font-weight:900;text-align:center;margin-bottom:12px;">Apply Trade to MT5?</div>
-        <div style="background:var(--bg);border:1px solid var(--border);border-radius:8px;padding:12px;margin-bottom:14px;font-size:12px;line-height:1.9;">
-            <div style="display:flex;justify-content:space-between;"><span style="color:var(--muted);">Direction</span><b style="color:${sig.direction==='BUY'?'var(--green)':'var(--red)'};">${sig.direction} ${sig.display}</b></div>
-            <div style="display:flex;justify-content:space-between;"><span style="color:var(--muted);">Entry</span><b style="font-family:monospace;">${sig.entry.toFixed(5)}</b></div>
-            <div style="display:flex;justify-content:space-between;"><span style="color:var(--muted);">Stop Loss</span><b style="font-family:monospace;color:var(--red);">${sig.sl.toFixed(5)}</b></div>
-            <div style="display:flex;justify-content:space-between;"><span style="color:var(--muted);">Take Profit 1</span><b style="font-family:monospace;color:var(--green);">${sig.tp1.toFixed(5)}</b></div>
-            <div style="display:flex;justify-content:space-between;"><span style="color:var(--muted);">Risk</span><b>${risk}%</b></div>
+function signalCardHtml(sig, opts) {
+    opts = opts || {};
+    const dirColor = sig.direction === 'BUY' ? 'var(--green)' : 'var(--red)';
+    const statusColor = sig.status === 'ACTIVE' ? 'var(--green)' : 'var(--muted)';
+    const fmt = (n) => n !== null && n !== undefined ? Number(n).toFixed(5) : '—';
+    return `
+    <div class="card-sm" style="padding:12px;">
+        <div style="display:flex;justify-content:space-between;align-items:flex-start;margin-bottom:6px;">
+            <div>
+                <div style="font-size:13px;font-weight:900;">${sig.display}</div>
+                <div style="font-size:9px;color:var(--muted);">${sig.strategy || 'APA'} · ${sig.styleLabel || ''}</div>
+            </div>
+            <span class="badge" style="background:${dirColor}22;color:${dirColor};border:1px solid ${dirColor}44;">${sig.direction === 'BUY' ? '📈' : '📉'} ${sig.direction}</span>
         </div>
-        <div style="font-size:10px;color:var(--muted);margin-bottom:14px;text-align:center;">Deriv's public API can't place MT5 orders directly — this opens the real MT5 terminal with ${sig.mt5Symbol} selected so you can place the trade with these levels.</div>
-        <button class="btn btn-teal" style="width:100%;padding:12px;margin-bottom:8px;font-weight:900;" onclick="finalizeApplyToMT5()">✅ CONFIRM &amp; OPEN IN MT5</button>
-        <button class="btn btn-ghost" style="width:100%;padding:10px;" onclick="closeApaModal()">Cancel</button>
-    </div>`);
+        <div style="display:flex;gap:6px;flex-wrap:wrap;margin-bottom:8px;">
+            <span class="badge badge-teal">Confidence: ${sig.confidence}%</span>
+            <span class="badge" style="background:${statusColor}22;color:${statusColor};border:1px solid ${statusColor}44;">● ${sig.status}</span>
+        </div>
+        <div style="font-size:10px;color:var(--muted);margin-bottom:4px;">Generated: ${new Date(sig.generatedAt).toLocaleString()}</div>
+        <div style="font-size:10px;color:var(--muted);margin-bottom:8px;">Age: <span class="mt5-age" data-t="${sig.generatedAt}">${formatSignalAge(sig.generatedAt)}</span></div>
+        ${opts.showLevels ? `
+        <div class="accu-row-3" style="margin-bottom:8px;">
+            <div style="text-align:center;"><div style="font-size:8px;color:var(--muted);">ENTRY</div><div style="font-size:10px;font-family:monospace;font-weight:700;">${fmt(sig.entry)}</div></div>
+            <div style="text-align:center;"><div style="font-size:8px;color:var(--muted);">TARGET</div><div style="font-size:10px;font-family:monospace;font-weight:700;color:var(--green);">${fmt(sig.target)}</div></div>
+            <div style="text-align:center;"><div style="font-size:8px;color:var(--muted);">INVALID.</div><div style="font-size:10px;font-family:monospace;font-weight:700;color:var(--red);">${fmt(sig.invalidation)}</div></div>
+        </div>` : ''}
+        <div style="display:flex;gap:6px;">
+            <button onclick="showSignalDetail('${sig.id}')" class="btn btn-ghost" style="flex:1;font-size:10px;padding:6px;">View</button>
+            <button onclick="copySignalById('${sig.id}')" class="btn btn-teal" style="flex:1;font-size:10px;padding:6px;">📋 Copy</button>
+        </div>
+    </div>`;
 }
 
-function finalizeApplyToMT5() {
-    const sig = apaCurrentSignal;
-    if (!sig) { closeApaModal(); return; }
-    closeApaModal();
-    window.open(`https://app.deriv.com/mt5?symbol=${encodeURIComponent(sig.mt5Symbol)}`, '_blank');
-    logApaAudit({
-        event: 'sent_to_mt5', signalId: sig.id, market: sig.market, style: sig.style,
-        direction: sig.direction, score: sig.score, entry: sig.entry, sl: sig.sl, tp1: sig.tp1, tp2: sig.tp2
+function applyMt5HistoryFilters(list) {
+    const now = Date.now();
+    const rangeMs = { '1h': 3600000, '6h': 21600000, '24h': 86400000 }[mt5HistoryFilter.range];
+    return list.filter(s => {
+        if (mt5HistoryFilter.cat !== 'all' && s.category !== mt5HistoryFilter.cat) return false;
+        if (mt5HistoryFilter.instrument !== 'all' && s.market !== mt5HistoryFilter.instrument && s.mt5Symbol !== mt5HistoryFilter.instrument) return false;
+        if (mt5HistoryFilter.status !== 'all' && s.status !== mt5HistoryFilter.status.toUpperCase()) return false;
+        if (rangeMs && (now - s.generatedAt) > rangeMs) return false;
+        return true;
     });
-    notify('📲 Opened in MT5', `${sig.display} ${sig.direction} — enter the shown levels in the MT5 terminal to place the trade.`, 'info');
+}
+
+function renderMt5SignalsUI() {
+    // ── Active Signals ──
+    const activeList = mt5Signals.filter(s => s.status === 'ACTIVE').sort((a,b) => b.generatedAt - a.generatedAt);
+    const activeBody  = document.getElementById('mt5-active-body');
+    const activeCount = document.getElementById('mt5-active-count');
+    if (activeCount) activeCount.textContent = `(${activeList.length})`;
+    if (activeBody) {
+        activeBody.innerHTML = activeList.length
+            ? `<div style="display:grid;grid-template-columns:repeat(auto-fill,minmax(260px,1fr));gap:10px;">${activeList.map(s => signalCardHtml(s, { showLevels: true })).join('')}</div>`
+            : `<div style="font-size:11px;color:var(--dim);text-align:center;padding:20px;">No active signals right now. The scanner keeps checking every ${Math.round(MT5_SCAN_INTERVAL_MS/1000)}s across all available markets.</div>`;
+    }
+
+    // ── Signal History ──
+    const historyAll = mt5Signals.slice().sort((a,b) => b.generatedAt - a.generatedAt);
+    const filtered = applyMt5HistoryFilters(historyAll);
+    const histBody  = document.getElementById('mt5-history-body');
+    const histCount = document.getElementById('mt5-history-count');
+    if (histCount) histCount.textContent = `${filtered.length} signal${filtered.length===1?'':'s'}`;
+    if (histBody) {
+        histBody.innerHTML = filtered.length
+            ? `<div style="display:grid;grid-template-columns:repeat(auto-fill,minmax(240px,1fr));gap:10px;">${filtered.slice(0,150).map(s => signalCardHtml(s, { showLevels: false })).join('')}</div>`
+            : `<div style="font-size:11px;color:var(--dim);text-align:center;padding:20px;">No signals match this filter.</div>`;
+    }
+}
+
+function showSignalDetail(id) {
+    const sig = mt5Signals.find(s => s.id === id);
+    if (!sig) return;
+    const fmt = (n) => n !== null && n !== undefined ? Number(n).toFixed(5) : '—';
+    const dirColor = sig.direction === 'BUY' ? 'var(--green)' : 'var(--red)';
+    showApaModal(`
+        <div style="font-size:14px;font-weight:900;text-align:center;margin-bottom:12px;">SIGNAL DETAILS</div>
+        <div style="background:var(--bg);border:1px solid var(--border);border-radius:8px;padding:12px;margin-bottom:14px;font-size:12px;line-height:2;">
+            <div style="display:flex;justify-content:space-between;"><span style="color:var(--muted);">Market</span><b>${sig.display}</b></div>
+            <div style="display:flex;justify-content:space-between;"><span style="color:var(--muted);">Direction</span><b style="color:${dirColor};">${sig.direction}</b></div>
+            <div style="display:flex;justify-content:space-between;"><span style="color:var(--muted);">Generated</span><b>${new Date(sig.generatedAt).toLocaleString()}</b></div>
+            <div style="display:flex;justify-content:space-between;"><span style="color:var(--muted);">Confidence</span><b>${sig.confidence}%</b></div>
+            <div style="display:flex;justify-content:space-between;"><span style="color:var(--muted);">Status</span><b>${sig.status}</b></div>
+            <div style="display:flex;justify-content:space-between;"><span style="color:var(--muted);">Signal Age</span><b class="mt5-age" data-t="${sig.generatedAt}">${formatSignalAge(sig.generatedAt)}</b></div>
+            <div style="display:flex;justify-content:space-between;"><span style="color:var(--muted);">Strategy</span><b>${sig.strategy}</b></div>
+            <div style="display:flex;justify-content:space-between;"><span style="color:var(--muted);">Entry</span><b style="font-family:monospace;">${fmt(sig.entry)}</b></div>
+            <div style="display:flex;justify-content:space-between;"><span style="color:var(--muted);">Target</span><b style="font-family:monospace;color:var(--green);">${fmt(sig.target)}</b></div>
+            <div style="display:flex;justify-content:space-between;"><span style="color:var(--muted);">Invalidation</span><b style="font-family:monospace;color:var(--red);">${fmt(sig.invalidation)}</b></div>
+            <div style="display:flex;justify-content:space-between;"><span style="color:var(--muted);">Setup</span><b style="text-align:right;max-width:60%;">${(sig.tags||[]).join(' + ') || '—'}</b></div>
+            <div style="display:flex;justify-content:space-between;"><span style="color:var(--muted);">Signal ID</span><b style="font-size:10px;">${sig.id}</b></div>
+        </div>
+        <button class="btn btn-teal" style="width:100%;padding:12px;margin-bottom:8px;font-weight:900;" onclick="copySignalById('${sig.id}')">📋 COPY SIGNAL</button>
+        <button class="btn btn-ghost" style="width:100%;padding:10px;" onclick="closeApaModal()">Close</button>
+    `);
 }
 
 function showApaModal(html) {
@@ -4038,7 +4610,7 @@ function showApaModal(html) {
         modal = document.createElement('div');
         modal.id = 'apa-modal';
         modal.style.cssText = 'display:flex;position:fixed;inset:0;z-index:99999;background:#000000cc;align-items:center;justify-content:center;padding:16px;';
-        modal.innerHTML = `<div style="background:var(--bg2);border:1px solid var(--border);border-radius:14px;width:100%;max-width:420px;padding:20px;" id="apa-modal-inner"></div>`;
+        modal.innerHTML = `<div style="background:var(--bg2);border:1px solid var(--border);border-radius:14px;width:100%;max-width:420px;max-height:88vh;overflow-y:auto;padding:20px;" id="apa-modal-inner"></div>`;
         document.body.appendChild(modal);
         modal.addEventListener('click', (e) => { if (e.target === modal) closeApaModal(); });
     }
@@ -4050,12 +4622,12 @@ function closeApaModal() {
     if (modal) modal.style.display = 'none';
 }
 
-// Auto-refresh the scanner + setup card every 45s when the MT5 tab is active —
-// gentle enough not to hammer the candle API, frequent enough to feel live.
+// Refresh the on-demand setup card every 45s when the MT5 tab is active.
+// The Active Signals / History engine itself runs independently via
+// startMt5BackgroundScan()/setInterval above, regardless of which tab is open.
 setInterval(() => {
-    if (document.getElementById('mt5-pane')?.classList.contains('active')) {
-        renderApaScanner();
-        if (apaCurrentSignal) runApaAnalysis();
+    if (document.getElementById('mt5-pane')?.classList.contains('active') && apaCurrentSignal) {
+        runApaAnalysis();
     }
 }, 45000);
 // ================================================================
