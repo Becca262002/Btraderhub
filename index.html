@@ -316,10 +316,11 @@ body{padding-bottom:60px;}
 <nav>
     <button id="tab-btn-dashboard" onclick="switchTab('dashboard')" class="tab-btn active">📊 Dashboard</button>
     <button id="tab-btn-accu"      onclick="switchTab('accu')"      class="tab-btn">📈 Accumulators</button>
+    <button id="tab-btn-bulk"      onclick="switchTab('bulk')"      class="tab-btn">📦 Bulk Trading</button>
+    <button id="tab-btn-scanner"   onclick="switchTab('scanner')"   class="tab-btn">🧠 AI Scanner</button>
     <button id="tab-btn-bot"       onclick="switchTab('bot')"       class="tab-btn">🤖 DBot</button>
     <button id="tab-btn-chart"     onclick="switchTab('chart')"     class="tab-btn">📈 Chart</button>
     <button id="tab-btn-digits"    onclick="switchTab('digits')"    class="tab-btn">0️⃣ D-Stats</button>
-    <button id="tab-btn-scanner"   onclick="switchTab('scanner')"   class="tab-btn">🧠 AI Scanner</button>
     <button id="tab-btn-mt5"       onclick="switchTab('mt5')"       class="tab-btn">📊 MT5 Signals</button>
 </nav>
 
@@ -1267,22 +1268,181 @@ body{padding-bottom:60px;}
     </div>
 </div>
 
+<!-- ── BULK TRADING ── -->
+<div id="bulk-pane" class="tab-pane scroll" style="padding:16px;">
+    <div style="max-width:900px;margin:0 auto;display:flex;flex-direction:column;gap:10px;">
+
+        <!-- Header -->
+        <div style="display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:10px;">
+            <div>
+                <h2 style="font-size:18px;font-weight:900;">📦 Bulk Trading</h2>
+                <p style="font-size:11px;color:var(--muted);margin-top:3px;">Configure a setup once and execute multiple trades from it — sequentially, safely, with no duplicates.</p>
+            </div>
+            <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap;">
+                <span class="status-dot" id="bulk-status-dot"></span>
+                <span id="bulk-status-text" style="font-size:11px;font-weight:700;color:var(--muted);">OFFLINE</span>
+                <span id="bulk-account-badge" class="badge badge-teal" style="display:none;">Demo</span>
+                <span id="bulk-balance-badge" class="badge badge-blue" style="display:none;">$0.00</span>
+            </div>
+        </div>
+
+        <!-- Config: Market / Type / Direction -->
+        <div class="card accu-card">
+            <div style="font-size:10px;font-weight:700;color:var(--muted);text-transform:uppercase;margin-bottom:10px;">⚙️ Trade Setup</div>
+            <div class="accu-row-2" style="margin-bottom:10px;">
+                <div>
+                    <div style="font-size:9px;color:var(--muted);font-weight:700;text-transform:uppercase;margin-bottom:4px;">Market</div>
+                    <select id="bulk-market" onchange="updateBulkPreview()">
+                        <optgroup label="Continuous Indices">
+                            <option value="R_10">Volatility 10 Index</option>
+                            <option value="R_25">Volatility 25 Index</option>
+                            <option value="R_50">Volatility 50 Index</option>
+                            <option value="R_75">Volatility 75 Index</option>
+                            <option value="R_100">Volatility 100 Index</option>
+                        </optgroup>
+                        <optgroup label="1s Indices">
+                            <option value="1HZ10V">Volatility 10 (1s)</option>
+                            <option value="1HZ25V">Volatility 25 (1s)</option>
+                            <option value="1HZ50V">Volatility 50 (1s)</option>
+                            <option value="1HZ75V">Volatility 75 (1s)</option>
+                            <option value="1HZ100V">Volatility 100 (1s)</option>
+                        </optgroup>
+                        <optgroup label="Jump Indices">
+                            <option value="jump_10">Jump 10 Index</option>
+                            <option value="jump_25">Jump 25 Index</option>
+                            <option value="jump_50">Jump 50 Index</option>
+                            <option value="jump_75">Jump 75 Index</option>
+                            <option value="jump_100">Jump 100 Index</option>
+                        </optgroup>
+                    </select>
+                </div>
+                <div>
+                    <div style="font-size:9px;color:var(--muted);font-weight:700;text-transform:uppercase;margin-bottom:4px;">Trade Type</div>
+                    <select id="bulk-type" onchange="onBulkTypeChange()">
+                        <option value="over_under">Over / Under</option>
+                        <option value="even_odd">Even / Odd</option>
+                        <option value="rise_fall">Rise / Fall</option>
+                        <option value="only_ups_downs">Only Ups / Only Downs</option>
+                    </select>
+                </div>
+            </div>
+
+            <div style="margin-bottom:10px;">
+                <div style="font-size:9px;color:var(--muted);font-weight:700;text-transform:uppercase;margin-bottom:6px;">Direction <span style="color:var(--red);">*</span></div>
+                <div id="bulk-dir-controls" style="display:flex;gap:6px;flex-wrap:wrap;"></div>
+            </div>
+
+            <div class="accu-row-2">
+                <div id="bulk-pred-wrap">
+                    <div style="font-size:9px;color:var(--muted);font-weight:700;text-transform:uppercase;margin-bottom:4px;">Prediction (0–9)</div>
+                    <input type="number" id="bulk-pred" value="5" min="0" max="9" onchange="updateBulkPreview()">
+                </div>
+                <div>
+                    <div style="font-size:9px;color:var(--muted);font-weight:700;text-transform:uppercase;margin-bottom:4px;">Duration (Ticks)</div>
+                    <input type="number" id="bulk-dur" value="1" min="1" max="10" onchange="updateBulkPreview()">
+                </div>
+            </div>
+            <div id="bulk-signal-note" style="display:none;font-size:10px;color:var(--teal);margin-top:8px;background:#00d2c814;border:1px solid #00d2c844;border-radius:6px;padding:8px;"></div>
+        </div>
+
+        <!-- Stake configuration -->
+        <div class="card accu-card">
+            <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:10px;">
+                <div style="font-size:10px;font-weight:700;color:var(--muted);text-transform:uppercase;">💰 Stake Configuration</div>
+                <div style="display:flex;gap:4px;">
+                    <button id="bulk-mode-per" onclick="setBulkStakeMode('per')" class="btn btn-teal" style="font-size:10px;padding:4px 10px;">Per Trade</button>
+                    <button id="bulk-mode-total" onclick="setBulkStakeMode('total')" class="btn btn-ghost" style="font-size:10px;padding:4px 10px;">Total Budget</button>
+                </div>
+            </div>
+
+            <div style="margin-bottom:10px;">
+                <div style="font-size:9px;color:var(--muted);font-weight:700;text-transform:uppercase;margin-bottom:4px;">Number of Trades</div>
+                <div style="display:flex;align-items:center;gap:8px;">
+                    <button onclick="stepBulkTrades(-1)" class="btn btn-ghost" style="padding:8px 14px;font-size:14px;">−</button>
+                    <input type="number" id="bulk-trades" value="10" min="1" max="100" style="text-align:center;font-size:15px;font-weight:900;" onchange="updateBulkPreview()">
+                    <button onclick="stepBulkTrades(1)" class="btn btn-ghost" style="padding:8px 14px;font-size:14px;">+</button>
+                </div>
+                <div style="display:flex;gap:6px;margin-top:6px;flex-wrap:wrap;">
+                    <button onclick="setBulkTrades(1)" class="btn btn-ghost" style="font-size:10px;padding:4px 8px;">1</button>
+                    <button onclick="setBulkTrades(5)" class="btn btn-ghost" style="font-size:10px;padding:4px 8px;">5</button>
+                    <button onclick="setBulkTrades(10)" class="btn btn-ghost" style="font-size:10px;padding:4px 8px;">10</button>
+                    <button onclick="setBulkTrades(20)" class="btn btn-ghost" style="font-size:10px;padding:4px 8px;">20</button>
+                    <button onclick="setBulkTrades(50)" class="btn btn-ghost" style="font-size:10px;padding:4px 8px;">50</button>
+                    <button onclick="setBulkTrades(100)" class="btn btn-ghost" style="font-size:10px;padding:4px 8px;">100</button>
+                </div>
+                <div style="font-size:9px;color:var(--dim);margin-top:4px;">Max 100 trades per batch — kept sequential to protect your connection and account.</div>
+            </div>
+
+            <div id="bulk-stake-label-wrap">
+                <div style="font-size:9px;color:var(--muted);font-weight:700;text-transform:uppercase;margin-bottom:4px;" id="bulk-stake-label">Stake per Trade (USD)</div>
+                <input type="number" id="bulk-stake" value="1.00" min="0.35" step="0.50" onchange="updateBulkPreview()">
+            </div>
+        </div>
+
+        <!-- Preview + Execute -->
+        <div class="card accu-card" style="border-color:var(--teal);">
+            <div style="font-size:10px;font-weight:700;color:var(--teal);text-transform:uppercase;margin-bottom:10px;">🧾 Bulk Trade Preview</div>
+            <div id="bulk-preview-body" style="display:flex;flex-direction:column;gap:4px;font-size:12px;margin-bottom:12px;"></div>
+            <button id="bulk-execute-btn" onclick="startBulkExecution()" class="btn btn-teal" style="width:100%;padding:14px;font-size:15px;font-weight:900;border-radius:10px;">EXECUTE 10 TRADES</button>
+        </div>
+
+        <!-- Live progress -->
+        <div class="card accu-card" id="bulk-progress-card" style="display:none;">
+            <div style="font-size:10px;font-weight:700;color:var(--muted);text-transform:uppercase;margin-bottom:10px;">⏱ Executing Bulk Trade</div>
+            <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:6px;">
+                <span style="font-size:13px;font-weight:900;" id="bulk-progress-label">0 / 0</span>
+                <span style="font-size:11px;color:var(--muted);" id="bulk-progress-status">Running...</span>
+            </div>
+            <div class="pbar" style="margin-bottom:10px;"><div id="bulk-progress-bar" class="pbar-fill" style="width:0%;background:var(--teal);"></div></div>
+            <div class="accu-row-3" style="margin-bottom:10px;">
+                <div class="card-sm" style="padding:8px;text-align:center;"><div style="font-size:9px;color:var(--green);">Successful</div><div id="bulk-count-success" style="font-size:18px;font-weight:900;color:var(--green);">0</div></div>
+                <div class="card-sm" style="padding:8px;text-align:center;"><div style="font-size:9px;color:var(--red);">Failed</div><div id="bulk-count-failed" style="font-size:18px;font-weight:900;color:var(--red);">0</div></div>
+                <div class="card-sm" style="padding:8px;text-align:center;"><div style="font-size:9px;color:var(--muted);">Pending</div><div id="bulk-count-pending" style="font-size:18px;font-weight:900;">0</div></div>
+            </div>
+            <div style="display:flex;padding:6px 0;border-bottom:1px solid var(--border);font-size:10px;font-weight:700;color:var(--muted);">
+                <div style="width:32px;">#</div>
+                <div style="flex:1;">Contract</div>
+                <div style="width:70px;">Stake</div>
+                <div style="width:90px;">Status</div>
+                <div style="width:80px;text-align:right;">Result</div>
+            </div>
+            <div id="bulk-results-body" style="max-height:260px;overflow-y:auto;"></div>
+        </div>
+
+        <!-- Bulk Trade History -->
+        <div class="card accu-card">
+            <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:10px;">
+                <div style="font-size:10px;font-weight:700;color:var(--muted);text-transform:uppercase;">📋 Bulk Trade History</div>
+                <button onclick="clearBulkHistory()" class="btn btn-ghost" style="font-size:10px;padding:4px 10px;">🗑 Clear</button>
+            </div>
+            <div id="bulk-history-body" style="display:flex;flex-direction:column;gap:8px;">
+                <div style="font-size:11px;color:var(--dim);text-align:center;padding:16px;">No bulk trades executed yet.</div>
+            </div>
+        </div>
+
+        <!-- Risk warning -->
+        <div style="padding:12px;background:#ff444f14;border:1px solid #ff444f44;border-radius:8px;">
+            <p style="font-size:10px;color:#f87171;line-height:1.6;">⚠️ <b>Bulk Trading Risk:</b> Each trade in a batch is a separate, independent contract — a losing streak multiplies across every trade in the batch. Trades execute one after another (never in parallel) to protect your connection; a batch of 50 can take a while to complete. History is stored in your browser only.</p>
+        </div>
+    </div>
+</div>
+
 <!-- ── MT5 + ADVANCED PRICE ACTION TRADING ── -->
 <div id="mt5-pane" class="tab-pane scroll" style="padding:16px;">
-    <div style="max-width:920px;margin:0 auto;">
+    <div style="max-width:960px;margin:0 auto;">
 
         <!-- Header -->
         <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:14px;flex-wrap:wrap;gap:10px;">
             <div>
-                <h2 style="font-size:18px;font-weight:900;">📊 MT5 — Advanced Price Action</h2>
-                <p style="font-size:11px;color:var(--muted);margin-top:3px;">Real multi-timeframe structure, liquidity &amp; displacement analysis. Applies a validated setup into the real MT5 terminal — never auto-executed.</p>
+                <h2 style="font-size:18px;font-weight:900;">📊 MT5 Signals — Advanced Price Action</h2>
+                <p style="font-size:11px;color:var(--muted);margin-top:3px;">Real multi-timeframe structure, liquidity &amp; displacement analysis. Signals stay visible until they expire — nothing disappears the moment a newer one appears.</p>
             </div>
             <a href="https://app.deriv.com/mt5" target="_blank" class="btn btn-ghost" style="font-size:11px;padding:7px 16px;text-decoration:none;">Open MT5 →</a>
         </div>
 
         <!-- Trading style selector -->
         <div class="card" style="padding:14px;margin-bottom:14px;">
-            <div style="font-size:10px;font-weight:700;color:var(--muted);text-transform:uppercase;margin-bottom:10px;">How do you trade?</div>
+            <div style="font-size:10px;font-weight:700;color:var(--muted);text-transform:uppercase;margin-bottom:10px;">How do you trade? (drives on-demand analysis + the background scanner)</div>
             <div class="accu-row-3">
                 <button class="btn btn-ghost apa-style-btn" onclick="selectApaStyle('quick',this)" style="padding:12px;text-align:left;flex-direction:column;align-items:flex-start;gap:2px;">
                     <span style="font-size:12px;font-weight:900;">⚡ Quick Profit</span>
@@ -1300,10 +1460,10 @@ body{padding-bottom:60px;}
         </div>
 
         <div class="accu-row-2">
-            <!-- Market select + Setup card -->
+            <!-- On-demand market analyzer -->
             <div class="card accu-card">
                 <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:10px;">
-                    <div style="font-size:10px;font-weight:700;color:var(--muted);text-transform:uppercase;">📈 APA Setup</div>
+                    <div style="font-size:10px;font-weight:700;color:var(--muted);text-transform:uppercase;">📈 Analyze a Market</div>
                     <button onclick="runApaAnalysis()" class="btn btn-ghost" style="font-size:10px;padding:4px 10px;">🔄 Re-analyze</button>
                 </div>
                 <select id="apa-market-select" onchange="onApaMarketChange(this.value)" style="font-size:12px;margin-bottom:10px;">
@@ -1322,14 +1482,16 @@ body{padding-bottom:60px;}
                         <option value="1HZ100V">Volatility 100 (1s) Index</option>
                     </optgroup>
                     <optgroup label="Step">
-                        <option value="stpRNG">Step Index</option>
+                        <option value="stpRNG">Step Index (only one confirmed by Deriv)</option>
                     </optgroup>
-                    <optgroup label="Boom &amp; Crash (validated live)">
+                    <optgroup label="Boom (validated live)">
                         <option value="BOOM300N">Boom 300 Index</option>
                         <option value="BOOM500">Boom 500 Index</option>
                         <option value="BOOM600">Boom 600 Index</option>
                         <option value="BOOM900">Boom 900 Index</option>
                         <option value="BOOM1000">Boom 1000 Index</option>
+                    </optgroup>
+                    <optgroup label="Crash (validated live)">
                         <option value="CRASH300N">Crash 300 Index</option>
                         <option value="CRASH500">Crash 500 Index</option>
                         <option value="CRASH600">Crash 600 Index</option>
@@ -1343,11 +1505,11 @@ body{padding-bottom:60px;}
                 </div>
             </div>
 
-            <!-- Risk + scanner filters -->
+            <!-- Signal history filters -->
             <div class="card accu-card">
-                <div style="font-size:10px;font-weight:700;color:var(--muted);text-transform:uppercase;margin-bottom:10px;">⚙️ Risk &amp; Scanner</div>
-                <div style="margin-bottom:12px;">
-                    <div style="font-size:9px;color:var(--muted);font-weight:700;text-transform:uppercase;margin-bottom:4px;">Risk per Trade</div>
+                <div style="font-size:10px;font-weight:700;color:var(--muted);text-transform:uppercase;margin-bottom:10px;">🔍 Signal Filters</div>
+                <div style="margin-bottom:10px;">
+                    <div style="font-size:9px;color:var(--muted);font-weight:700;text-transform:uppercase;margin-bottom:4px;">Suggested Risk (included in Copy Signal)</div>
                     <select id="apa-risk" onchange="saveApaPrefs()" style="font-size:12px;">
                         <option value="0.25">0.25%</option>
                         <option value="0.5">0.5%</option>
@@ -1355,35 +1517,70 @@ body{padding-bottom:60px;}
                         <option value="2">2%</option>
                     </select>
                 </div>
-                <div style="font-size:9px;color:var(--muted);font-weight:700;text-transform:uppercase;margin-bottom:6px;">Scanner Filter</div>
-                <div id="apa-scanner-filters" style="display:flex;gap:6px;flex-wrap:wrap;margin-bottom:10px;">
-                    <button onclick="filterApaScanner('all',this)"          class="btn btn-teal"  style="font-size:10px;padding:5px 10px;">All</button>
-                    <button onclick="filterApaScanner('volatility',this)"   class="btn btn-ghost" style="font-size:10px;padding:5px 10px;">Volatility</button>
-                    <button onclick="filterApaScanner('volatility_1s',this)"class="btn btn-ghost" style="font-size:10px;padding:5px 10px;">1s</button>
-                    <button onclick="filterApaScanner('step',this)"         class="btn btn-ghost" style="font-size:10px;padding:5px 10px;">Step</button>
-                    <button onclick="filterApaScanner('boom_crash',this)"   class="btn btn-ghost" style="font-size:10px;padding:5px 10px;">Boom/Crash</button>
+                <div style="margin-bottom:10px;">
+                    <div style="font-size:9px;color:var(--muted);font-weight:700;text-transform:uppercase;margin-bottom:4px;">Market Category</div>
+                    <select id="mt5-filter-cat" onchange="setMt5HistoryFilter('cat', this.value)" style="font-size:12px;">
+                        <option value="all">All Markets</option>
+                        <option value="step">Step Index</option>
+                        <option value="volatility">Volatility</option>
+                        <option value="volatility_1s">Volatility 1s</option>
+                        <option value="boom">Boom</option>
+                        <option value="crash">Crash</option>
+                    </select>
                 </div>
-                <button onclick="refreshApaScanner()" class="btn btn-ghost" style="width:100%;font-size:11px;padding:8px;">🔄 Refresh Scanner</button>
+                <div style="margin-bottom:10px;">
+                    <div style="font-size:9px;color:var(--muted);font-weight:700;text-transform:uppercase;margin-bottom:4px;">Specific Instrument</div>
+                    <select id="mt5-filter-instrument" onchange="setMt5HistoryFilter('instrument', this.value)" style="font-size:12px;">
+                        <option value="all">All Instruments</option>
+                    </select>
+                </div>
+                <div class="accu-row-2" style="margin-bottom:10px;">
+                    <div>
+                        <div style="font-size:9px;color:var(--muted);font-weight:700;text-transform:uppercase;margin-bottom:4px;">Status</div>
+                        <select id="mt5-filter-status" onchange="setMt5HistoryFilter('status', this.value)" style="font-size:12px;">
+                            <option value="all">All</option>
+                            <option value="active">Active</option>
+                            <option value="expired">Expired</option>
+                        </select>
+                    </div>
+                    <div>
+                        <div style="font-size:9px;color:var(--muted);font-weight:700;text-transform:uppercase;margin-bottom:4px;">Time Range</div>
+                        <select id="mt5-filter-range" onchange="setMt5HistoryFilter('range', this.value)" style="font-size:12px;">
+                            <option value="all">All time</option>
+                            <option value="1h">Last 1h</option>
+                            <option value="6h">Last 6h</option>
+                            <option value="24h">Last 24h</option>
+                        </select>
+                    </div>
+                </div>
+                <div style="font-size:9px;color:var(--muted);line-height:1.5;">Only Active/Expired are shown — this app can't automatically confirm a manually-placed trade's outcome, so Won/Lost/Invalidated status isn't tracked.</div>
             </div>
         </div>
 
-        <!-- APA Market Scanner -->
+        <!-- Active Signals / Signal History tabs -->
         <div class="card accu-card" style="margin-top:14px;">
-            <div style="font-size:10px;font-weight:700;color:var(--muted);text-transform:uppercase;margin-bottom:10px;">🔍 APA Market Scanner</div>
-            <div style="display:flex;padding:6px 0;border-bottom:1px solid var(--border);font-size:10px;font-weight:700;color:var(--muted);">
-                <div style="flex:1;">Market</div>
-                <div style="width:60px;">Dir</div>
-                <div style="width:50px;">Score</div>
-                <div style="width:100px;">Setup</div>
+            <div style="display:flex;gap:8px;margin-bottom:12px;border-bottom:1px solid var(--border);padding-bottom:10px;">
+                <button class="btn btn-teal mt5-tab-btn mt5-tab-active" onclick="switchMt5HistoryTab('active',this)" style="font-size:12px;padding:8px 16px;">Active Signals <span id="mt5-active-count">(0)</span></button>
+                <button class="btn btn-ghost mt5-tab-btn" onclick="switchMt5HistoryTab('history',this)" style="font-size:12px;padding:8px 16px;">Signal History</button>
             </div>
-            <div id="apa-scanner-body">
-                <div style="font-size:11px;color:var(--dim);text-align:center;padding:16px;">Open this tab to scan markets.</div>
+
+            <div id="mt5-active-section">
+                <div id="mt5-active-body">
+                    <div style="font-size:11px;color:var(--dim);text-align:center;padding:20px;">Open this tab to start scanning markets.</div>
+                </div>
+            </div>
+
+            <div id="mt5-history-section" style="display:none;">
+                <div style="font-size:10px;color:var(--muted);margin-bottom:10px;" id="mt5-history-count">0 signals</div>
+                <div id="mt5-history-body">
+                    <div style="font-size:11px;color:var(--dim);text-align:center;padding:20px;">No signal history yet.</div>
+                </div>
             </div>
         </div>
 
         <!-- Disclaimer -->
         <div style="margin-top:14px;padding:12px;background:var(--bg2);border:1px solid var(--border);border-radius:8px;">
-            <p style="font-size:10px;color:var(--muted);line-height:1.6;">⚠️ <b>Risk Warning:</b> This is a decision-support tool, not financial advice. Setups are generated by automated price-action analysis and can be wrong. Deriv's public API cannot place MT5 orders directly — "Apply to MT5" opens the real MT5 terminal with the setup's levels for you to place yourself, after you confirm. Always verify the account, market and price before trading.</p>
+            <p style="font-size:10px;color:var(--muted);line-height:1.6;">⚠️ <b>Risk Warning:</b> This is a decision-support tool, not financial advice. Setups are generated by automated price-action analysis and can be wrong. Deriv's public API does not allow this site to place or manage MT5 orders directly — every signal offers <b>Copy Signal</b> so you can enter it manually in the real MT5 terminal. Signals stay in your browser (no server database exists for this app) and are cleared if you clear your browser storage. Always verify the market and current price before trading.</p>
         </div>
     </div>
 </div>
