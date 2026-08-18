@@ -239,6 +239,15 @@ body{padding-bottom:60px;}
 .apa-style-btn.apa-style-active{border-color:var(--teal);background:#00d2c814;color:var(--teal);}
 .apa-style-btn.apa-style-active span{color:inherit;}
 
+/* ── MT5 Signals — Active Signals / Signal History grids ──
+   Desktop/tablet: multi-column, auto-fill. Mobile: single readable
+   column (see media query below) — these sections are core MT5 Signals
+   functionality and must render identically on every screen size, only
+   the column count changes. */
+.mt5-signal-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(260px,1fr));gap:10px;}
+.mt5-history-grid{grid-template-columns:repeat(auto-fill,minmax(240px,1fr));}
+.mt5-tab-btn{white-space:nowrap;}
+
 @media(max-width:768px){
     /* Hide sidebars by default on mobile */
     .sidebar,.sidebar-right{ display:none; }
@@ -275,6 +284,15 @@ body{padding-bottom:60px;}
     /* Accumulators — stack to single column on mobile */
     .accu-row-2,.accu-row-3{grid-template-columns:1fr;}
     #accu-pane{padding:10px;}
+
+    /* MT5 Signals — Active Signals and Signal History remain fully visible
+       and scrollable on mobile; only the grid drops to a single column so
+       nothing gets clipped by the page's overflow-x:hidden at narrow
+       widths. Nothing is hidden with display:none here. */
+    .mt5-signal-grid,.mt5-history-grid{grid-template-columns:1fr;}
+    #mt5-pane{padding:10px;}
+    #mt5-pane .accu-card{padding:10px;}
+    #mt5-pane select{font-size:12px;}
 }
 @media(min-width:769px){
     #mobile-bot-settings-btn { display: none !important; }
@@ -993,6 +1011,9 @@ body{padding-bottom:60px;}
             </div>
         </div>
 
+        <!-- 🔥 Bulk Entry Recommendation — shown once a signal reaches 79%+ confidence -->
+        <div id="bulk-recommend-banner" style="display:none;background:linear-gradient(135deg,#00d2c822,#00d2c808);border:2px solid var(--teal);border-radius:12px;padding:16px;margin-bottom:14px;"></div>
+
         <!-- Professional Strategy Signals — PRIORITY -->
         <div id="best-signal-box" class="card" style="padding:16px;margin-bottom:14px;border-color:var(--teal);box-shadow:0 0 20px #00d2c822;">
             <div style="font-size:10px;font-weight:700;color:var(--teal);text-transform:uppercase;margin-bottom:8px;">🎯 Professional Strategy Signals</div>
@@ -1383,14 +1404,72 @@ body{padding-bottom:60px;}
         <div class="card accu-card" style="border-color:var(--teal);">
             <div style="font-size:10px;font-weight:700;color:var(--teal);text-transform:uppercase;margin-bottom:10px;">🧾 Bulk Trade Preview</div>
             <div id="bulk-preview-body" style="display:flex;flex-direction:column;gap:4px;font-size:12px;margin-bottom:12px;"></div>
-            <button id="bulk-execute-btn" onclick="startBulkExecution()" class="btn btn-teal" style="width:100%;padding:14px;font-size:15px;font-weight:900;border-radius:10px;">EXECUTE 10 TRADES</button>
+            <div style="display:flex;gap:8px;">
+                <button onclick="resetBulkSetup()" class="btn btn-ghost" style="padding:14px 18px;font-size:13px;font-weight:900;border-radius:10px;" title="Clears the current setup — does not touch Bulk Trade History">RESET</button>
+                <button id="bulk-execute-btn" onclick="startBulkExecution()" class="btn btn-teal" style="flex:1;padding:14px;font-size:15px;font-weight:900;border-radius:10px;">EXECUTE 10 TRADES</button>
+            </div>
+        </div>
+
+        <!-- Auto Mode -->
+        <div class="card accu-card">
+            <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:10px;">
+                <div>
+                    <div style="font-size:11px;font-weight:900;color:var(--teal);">🤖 Auto Mode</div>
+                    <div style="font-size:9px;color:var(--muted);">Watches the AI Scanner and auto-executes a batch (using your Trades/Stake settings above) whenever a qualifying signal appears</div>
+                </div>
+                <div onclick="toggleBulkAuto()" id="bulk-auto-track"
+                     style="width:44px;height:24px;border-radius:20px;background:var(--border);cursor:pointer;position:relative;transition:.3s;flex-shrink:0;">
+                    <div id="bulk-auto-thumb" style="position:absolute;left:3px;top:3px;width:18px;height:18px;background:#fff;border-radius:50%;transition:.3s;"></div>
+                </div>
+            </div>
+            <div class="accu-row-3" style="margin-bottom:10px;">
+                <div>
+                    <div style="font-size:9px;color:var(--muted);font-weight:700;text-transform:uppercase;margin-bottom:4px;">Min. Signal Confidence %</div>
+                    <input type="number" id="bulk-auto-min-conf" value="79" min="50" max="99" style="text-align:center;">
+                </div>
+                <div>
+                    <div style="font-size:9px;color:var(--green);font-weight:700;text-transform:uppercase;margin-bottom:4px;">Take Profit $</div>
+                    <input type="number" id="bulk-auto-tp" value="20" min="0" step="1" style="text-align:center;color:var(--green);">
+                </div>
+                <div>
+                    <div style="font-size:9px;color:var(--red);font-weight:700;text-transform:uppercase;margin-bottom:4px;">Stop Loss $</div>
+                    <input type="number" id="bulk-auto-sl" value="10" min="0" step="1" style="text-align:center;color:var(--red);">
+                </div>
+            </div>
+            <div style="margin-bottom:10px;">
+                <div style="font-size:9px;color:var(--muted);font-weight:700;text-transform:uppercase;margin-bottom:4px;">Max Batches per Day</div>
+                <input type="number" id="bulk-auto-max-batches" value="5" min="1" max="50" style="text-align:center;">
+            </div>
+            <div id="bulk-auto-bar" style="display:none;background:#00d2c818;border:1px solid #00d2c844;border-radius:8px;padding:10px 14px;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:8px;">
+                <div style="display:flex;align-items:center;gap:8px;">
+                    <span style="width:8px;height:8px;border-radius:50%;background:var(--teal);display:inline-block;animation:pulse-dot 1s infinite;"></span>
+                    <span style="font-size:12px;font-weight:700;color:var(--teal);">🤖 AUTO MODE WATCHING</span>
+                </div>
+                <div style="display:flex;gap:14px;font-size:11px;color:var(--muted);">
+                    <span>Batches Today: <b id="bulk-auto-batches" style="color:var(--teal);">0</b></span>
+                    <span>Session P/L: <b id="bulk-auto-pl" style="color:var(--green);">$0.00</b></span>
+                </div>
+                <button onclick="stopBulkAuto()" class="btn btn-red" style="font-size:11px;padding:5px 14px;">⬛ Stop Auto</button>
+            </div>
         </div>
 
         <!-- Live progress -->
         <div class="card accu-card" id="bulk-progress-card" style="display:none;">
-            <div style="font-size:10px;font-weight:700;color:var(--muted);text-transform:uppercase;margin-bottom:10px;">⏱ Executing Bulk Trade</div>
-            <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:6px;">
-                <span style="font-size:13px;font-weight:900;" id="bulk-progress-label">0 / 0</span>
+            <div style="font-size:10px;font-weight:700;color:var(--muted);text-transform:uppercase;margin-bottom:10px;">⏱ Bulk Execution</div>
+
+            <!-- Stage 1: Entry status -->
+            <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:4px;">
+                <span style="font-size:11px;font-weight:700;color:var(--muted);">ENTRY STATUS</span>
+                <span style="font-size:12px;font-weight:900;" id="bulk-entry-status">0 / 0 Submitted</span>
+            </div>
+            <div class="pbar" style="margin-bottom:12px;"><div id="bulk-entry-bar" class="pbar-fill" style="width:0%;background:var(--blue);"></div></div>
+
+            <!-- Stage 2: Resolution status -->
+            <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:4px;">
+                <span style="font-size:11px;font-weight:700;color:var(--muted);">RESULT STATUS</span>
+                <span style="font-size:13px;font-weight:900;" id="bulk-progress-label">0 / 0 Resolved</span>
+            </div>
+            <div style="display:flex;justify-content:flex-end;margin-bottom:6px;">
                 <span style="font-size:11px;color:var(--muted);" id="bulk-progress-status">Running...</span>
             </div>
             <div class="pbar" style="margin-bottom:10px;"><div id="bulk-progress-bar" class="pbar-fill" style="width:0%;background:var(--teal);"></div></div>
@@ -1413,8 +1492,19 @@ body{padding-bottom:60px;}
         <div class="card accu-card">
             <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:10px;">
                 <div style="font-size:10px;font-weight:700;color:var(--muted);text-transform:uppercase;">📋 Bulk Trade History</div>
-                <button onclick="clearBulkHistory()" class="btn btn-ghost" style="font-size:10px;padding:4px 10px;">🗑 Clear</button>
+                <button onclick="clearBulkHistory()" class="btn btn-ghost" style="font-size:10px;padding:4px 10px;" title="Deletes historical batch records">🗑 Clear History</button>
             </div>
+
+            <!-- Overall statistics — computed from actual stored history -->
+            <div id="bulk-overall-stats" style="display:none;grid-template-columns:repeat(3,1fr);gap:8px;margin-bottom:12px;">
+                <div class="card-sm" style="padding:8px;text-align:center;"><div style="font-size:8px;color:var(--muted);">TOTAL BATCHES</div><div id="bulk-stat-batches" style="font-size:15px;font-weight:900;">0</div></div>
+                <div class="card-sm" style="padding:8px;text-align:center;"><div style="font-size:8px;color:var(--muted);">TOTAL TRADES</div><div id="bulk-stat-trades" style="font-size:15px;font-weight:900;">0</div></div>
+                <div class="card-sm" style="padding:8px;text-align:center;"><div style="font-size:8px;color:var(--muted);">WIN RATE</div><div id="bulk-stat-winrate" style="font-size:15px;font-weight:900;">0%</div></div>
+                <div class="card-sm" style="padding:8px;text-align:center;"><div style="font-size:8px;color:var(--muted);">WINS</div><div id="bulk-stat-wins" style="font-size:15px;font-weight:900;color:var(--green);">0</div></div>
+                <div class="card-sm" style="padding:8px;text-align:center;"><div style="font-size:8px;color:var(--muted);">LOSSES</div><div id="bulk-stat-losses" style="font-size:15px;font-weight:900;color:var(--red);">0</div></div>
+                <div class="card-sm" style="padding:8px;text-align:center;"><div style="font-size:8px;color:var(--muted);">TOTAL P/L</div><div id="bulk-stat-pl" style="font-size:15px;font-weight:900;">$0.00</div></div>
+            </div>
+
             <div id="bulk-history-body" style="display:flex;flex-direction:column;gap:8px;">
                 <div style="font-size:11px;color:var(--dim);text-align:center;padding:16px;">No bulk trades executed yet.</div>
             </div>
@@ -1559,7 +1649,7 @@ body{padding-bottom:60px;}
 
         <!-- Active Signals / Signal History tabs -->
         <div class="card accu-card" style="margin-top:14px;">
-            <div style="display:flex;gap:8px;margin-bottom:12px;border-bottom:1px solid var(--border);padding-bottom:10px;">
+            <div style="display:flex;gap:8px;margin-bottom:12px;border-bottom:1px solid var(--border);padding-bottom:10px;flex-wrap:wrap;">
                 <button class="btn btn-teal mt5-tab-btn mt5-tab-active" onclick="switchMt5HistoryTab('active',this)" style="font-size:12px;padding:8px 16px;">Active Signals <span id="mt5-active-count">(0)</span></button>
                 <button class="btn btn-ghost mt5-tab-btn" onclick="switchMt5HistoryTab('history',this)" style="font-size:12px;padding:8px 16px;">Signal History</button>
             </div>
