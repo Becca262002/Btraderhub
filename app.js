@@ -541,6 +541,9 @@ async function openWS() {
             if (accuAutoEnabled) {
                 stopAccuAuto('connection_lost');
             }
+            if (bulkAutoEnabled) {
+                stopBulkAuto('connection_lost');
+            }
             scheduleReconnect();
         };
 
@@ -1479,15 +1482,30 @@ Will return to ${originalDirection.toUpperCase()} ${originalPrediction} after wi
 // History persists to localStorage (this app has no backend/database).
 // ================================================================
 
-const BULK_MAX_TRADES      = 100;   // sensible hard cap on trades per batch
-const BULK_MAX_TOTAL_STAKE = 1000;  // sensible hard cap on total stake per batch
+const BULK_MAX_TRADES        = 100;   // sensible hard cap on trades per batch
+const BULK_MAX_TOTAL_STAKE   = 1000;  // sensible hard cap on total stake per batch
+const BULK_ENTRY_CONCURRENCY = 5;     // how many proposal->buy entries are in flight at once (controlled concurrency, not unlimited)
+const BULK_SIGNAL_STALE_MS   = 5 * 60000; // an imported AI Scanner signal older than this triggers a staleness warning
 
-let bulkDirection    = 'over';
-let bulkStakeMode    = 'per';   // 'per' = stake per trade | 'total' = total budget
-let bulkExecuting    = false;
-let bulkCurrentBatch = null;
-let bulkBatches      = [];
-let liveBalance       = null;   // tracked from the real balance stream, used for the insufficient-balance check
+let bulkDirection      = 'over';
+let bulkStakeMode      = 'per';   // 'per' = stake per trade | 'total' = total budget
+let bulkExecuting      = false;   // guards the ENTRY phase only — see runBulkExecution()
+let bulkCurrentBatch   = null;
+let bulkBatches        = [];
+let bulkImportedSignal = null;    // the AI Scanner signal currently populated into the form, with its own generatedAt
+let liveBalance         = null;   // tracked from the real balance stream, used for the insufficient-balance check
+
+// Bulk Auto Mode — watches the AI Scanner and, once enabled, automatically
+// runs a batch (using the Trades/Stake settings already configured) whenever
+// a qualifying signal appears. Mirrors the Accumulator's Auto Mode pattern:
+// runs until manually stopped, Take Profit, Stop Loss, max batches/day,
+// connection loss, or a batch that fails outright (treated as an API error).
+let bulkAutoEnabled   = false;
+let bulkAutoRunning   = false;
+let bulkAutoSessions  = 0;
+let bulkAutoPL        = 0;
+let bulkAutoDate      = null;
+let bulkAutoTimer     = null;
 
 function loadBulkBatches() {
     try { bulkBatches = JSON.parse(localStorage.getItem('bth_bulk_batches') || '[]'); }
@@ -1496,8 +1514,12 @@ function loadBulkBatches() {
 function saveBulkBatches() {
     try { localStorage.setItem('bth_bulk_batches', JSON.stringify(bulkBatches.slice(-100))); } catch(e) {}
 }
+// Unique per batch, e.g. BT-20260817-094123-ABC — every contract entered
+// under an execution belongs to this one batch ID.
 function makeBulkBatchId() {
-    return `BT-${Date.now().toString(36).toUpperCase()}`;
+    const stamp = new Date().toISOString().replace(/[-:]/g, '').replace('T', '-').slice(0, 15);
+    const rand  = Math.random().toString(36).slice(2, 5).toUpperCase();
+    return `BT-${stamp}-${rand}`;
 }
 
 // ── Direction controls (namespaced separately from the DBot's so the two
@@ -1601,23 +1623,33 @@ function updateBulkPreview() {
     if (btn && !bulkExecuting) btn.textContent = `EXECUTE ${cfg.trades} TRADE${cfg.trades===1?'':'S'}`;
 }
 
-// Populate from an AI Scanner signal — used by the two bridge functions below.
-function populateBulkFromSignal(sig) {
+// Populate from an AI Scanner signal — used by the bridge functions below
+// and by the 79%+ Bulk Entry Recommendation banner. `suggestedTrades` is a
+// pre-fill only — the user can always change it before executing.
+function populateBulkFromSignal(sig, suggestedTrades) {
     if (!sig) return;
     const marketSel = document.getElementById('bulk-market');
     const typeSel    = document.getElementById('bulk-type');
     const predEl     = document.getElementById('bulk-pred');
     const durEl      = document.getElementById('bulk-dur');
+    const tradesEl   = document.getElementById('bulk-trades');
     if (sig.symbol && marketSel) marketSel.value = sig.symbol;
     if (typeSel) { typeSel.value = sig.type; onBulkTypeChange(); }
     selectBulkDir(sig.botDirection);
     if (sig.pred !== null && sig.pred !== undefined && predEl) predEl.value = sig.pred;
     if (sig.ticks && durEl) durEl.value = sig.ticks;
+    if (suggestedTrades && tradesEl) tradesEl.value = Math.min(BULK_MAX_TRADES, suggestedTrades);
+
+    // This is THE source of truth for this signal's confidence — it comes
+    // straight from the AI Scanner's own generateSignal()/getTopSignals(),
+    // never recalculated here, so Bulk Trading can never disagree with the
+    // Scanner about what the confidence actually is.
+    bulkImportedSignal = { ...sig, generatedAt: sig.generatedAt || Date.now() };
 
     const note = document.getElementById('bulk-signal-note');
     if (note) {
         note.style.display = 'block';
-        note.textContent = `📡 Populated from AI Scanner: ${sig.label || MKT[sig.symbol] || sig.symbol || ''} — ${sig.direction} (${sig.confidence}% confidence). Review before executing.`;
+        note.textContent = `📡 From AI Scanner: ${sig.label || MKT[sig.symbol] || sig.symbol || ''} — ${sig.direction} (${sig.confidence}% confidence). Signal generated: ${new Date(bulkImportedSignal.generatedAt).toLocaleTimeString()}. Review before executing.`;
     }
     updateBulkPreview();
     switchTab('bulk');
@@ -1627,6 +1659,54 @@ function applySignalToBulk(sig) {
     if (typeof sig === 'string') { try { sig = JSON.parse(sig); } catch(e) { return; } }
     populateBulkFromSignal(sig);
 }
+function isBulkSignalStale() {
+    return !!(bulkImportedSignal && (Date.now() - bulkImportedSignal.generatedAt) > BULK_SIGNAL_STALE_MS);
+}
+
+// ================================================================
+// 79%+ CONFIDENCE — BULK ENTRY RECOMMENDATION
+// A recommendation only, never automatic — the user still has to open
+// Bulk Trading, review the setup, choose a trade count, and confirm.
+// Reuses the exact same signal object the AI Scanner already produced —
+// this is not a second, independent confidence calculation.
+// ================================================================
+function bulkConfidenceTier(conf) {
+    if (conf >= 90) return { label: '🔥 VERY STRONG BULK ENTRY', color: 'var(--green)', suggestedTrades: 15 };
+    if (conf >= 85) return { label: '🔥 STRONG BULK ENTRY',      color: 'var(--green)', suggestedTrades: 10 };
+    if (conf >= 79) return { label: '🔥 BULK ENTRY RECOMMENDED', color: 'var(--teal)',  suggestedTrades: 5  };
+    return null; // below 79% — no bulk recommendation, per spec
+}
+
+function renderBulkRecommendation(best) {
+    const el = document.getElementById('bulk-recommend-banner');
+    if (!el) return;
+    const sig = best?.signal;
+    const tier = sig ? bulkConfidenceTier(sig.confidence) : null;
+    if (!tier) { el.style.display = 'none'; return; }
+
+    // Stamp the moment this recommendation was generated — carried through
+    // to Bulk Trading's staleness check so a signal is never silently
+    // executed after the market has moved on.
+    sig.generatedAt = sig.generatedAt || Date.now();
+    sig.symbol = sig.symbol || best.sym;
+
+    const stakeDefault = 1;
+    const exposure = tier.suggestedTrades * stakeDefault;
+    el.style.display = 'block';
+    el.innerHTML = `
+        <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:10px;flex-wrap:wrap;gap:8px;">
+            <div style="font-size:14px;font-weight:900;color:${tier.color};">${tier.label}</div>
+            <div style="font-size:20px;font-weight:900;color:${tier.color};">${sig.confidence}%</div>
+        </div>
+        <div class="accu-row-3" style="margin-bottom:10px;">
+            <div class="card-sm" style="padding:8px;text-align:center;"><div style="font-size:8px;color:var(--muted);">MARKET</div><div style="font-size:12px;font-weight:900;">${sig.label || MKT[sig.symbol] || sig.symbol}</div></div>
+            <div class="card-sm" style="padding:8px;text-align:center;"><div style="font-size:8px;color:var(--muted);">DIRECTION</div><div style="font-size:12px;font-weight:900;color:${['under','odd','fall','downs'].includes(sig.botDirection)?'var(--red)':'var(--teal)'};">${sig.direction}</div></div>
+            <div class="card-sm" style="padding:8px;text-align:center;"><div style="font-size:8px;color:var(--muted);">SUGGESTED TRADES</div><div style="font-size:12px;font-weight:900;">${tier.suggestedTrades}</div></div>
+        </div>
+        <div style="font-size:10px;color:var(--muted);margin-bottom:10px;">Stake/Trade: <b style="color:var(--text);">$${stakeDefault.toFixed(2)}</b> (adjustable) · Total Exposure at suggested count: <b style="color:var(--text);">$${exposure.toFixed(2)}</b> · Signal generated: <b style="color:var(--text);">${new Date(sig.generatedAt).toLocaleTimeString()}</b></div>
+        <button onclick="populateBulkFromSignal(${JSON.stringify(sig).replace(/"/g,'&quot;')}, ${tier.suggestedTrades})" class="btn btn-teal" style="width:100%;padding:12px;font-size:13px;font-weight:900;">OPEN IN BULK TRADING</button>`;
+}
+
 function applyBestSignalToBulk() {
     const results = ALL_MKTS.map(sym => ({ sym, signal: generateSignal(sym) }))
         .sort((a,b) => (b.signal?.confidence||0) - (a.signal?.confidence||0));
@@ -1689,50 +1769,172 @@ function waitForBulkContractSettlement(contractId, timeoutMs = 120000) {
     });
 }
 
-// One fully round-tripped trade: proposal -> buy -> settlement. The caller
-// always awaits this before starting the next one, which is what makes the
-// whole batch sequential and duplicate-proof.
-async function executeSingleBulkTrade(cfg) {
-    const contractType = CONTRACT_MAP[cfg.type]?.[cfg.direction];
-    if (!contractType) throw new Error('Invalid contract configuration');
+// ================================================================
+// CONCURRENT ENTRY ENGINE
+// The core fix: entering N trades means submitting all N proposal->buy
+// round trips together (as a controlled-concurrency pool), NOT awaiting
+// each trade's full settlement before starting the next one. Settlement
+// (win/loss) is tracked separately and resolves independently per contract
+// — that's Stage 2, and it never blocks Stage 1 (entry) for the other trades.
+// ================================================================
 
-    const isDigit    = ['DIGITEVEN','DIGITODD','DIGITOVER','DIGITUNDER'].includes(contractType);
-    const isRunHL    = ['RUNHIGH','RUNLOW'].includes(contractType);
-    const isRiseFall = ['CALL','PUT'].includes(contractType);
+// Stage 1 for a single trade: proposal -> buy only. Resolves as soon as the
+// contract is bought (entered), then kicks off Stage 2 (settlement) as a
+// fire-and-forget continuation so it doesn't hold up the next entry.
+async function submitSingleBulkEntry(cfg, idx, batch) {
+    try {
+        const contractType = CONTRACT_MAP[cfg.type]?.[cfg.direction];
+        if (!contractType) throw new Error('Invalid contract configuration');
 
-    const proposalReq = {
-        proposal: 1, amount: parseFloat(cfg.stakePerTrade.toFixed(2)), basis: 'stake',
-        contract_type: contractType, currency: 'USD', underlying_symbol: cfg.market
-    };
-    if (isDigit)         { proposalReq.duration = Math.max(1, Math.min(10, cfg.duration)); proposalReq.duration_unit = 't'; }
-    else if (isRunHL)    { proposalReq.duration = Math.max(2, Math.min(10, cfg.duration)); proposalReq.duration_unit = 't'; }
-    else if (isRiseFall) { proposalReq.duration = Math.max(1, cfg.duration); proposalReq.duration_unit = 'm'; }
-    if (cfg.type === 'over_under') proposalReq.barrier = String(cfg.pred);
+        const isDigit    = ['DIGITEVEN','DIGITODD','DIGITOVER','DIGITUNDER'].includes(contractType);
+        const isRunHL    = ['RUNHIGH','RUNLOW'].includes(contractType);
+        const isRiseFall = ['CALL','PUT'].includes(contractType);
 
-    const proposalResp = await derivRequest(proposalReq);
-    const proposalId = proposalResp.proposal.id;
-    const askPrice    = parseFloat(proposalResp.proposal.ask_price);
+        const proposalReq = {
+            proposal: 1, amount: parseFloat(cfg.stakePerTrade.toFixed(2)), basis: 'stake',
+            contract_type: contractType, currency: 'USD', underlying_symbol: cfg.market
+        };
+        if (isDigit)         { proposalReq.duration = Math.max(1, Math.min(10, cfg.duration)); proposalReq.duration_unit = 't'; }
+        else if (isRunHL)    { proposalReq.duration = Math.max(2, Math.min(10, cfg.duration)); proposalReq.duration_unit = 't'; }
+        else if (isRiseFall) { proposalReq.duration = Math.max(1, cfg.duration); proposalReq.duration_unit = 'm'; }
+        if (cfg.type === 'over_under') proposalReq.barrier = String(cfg.pred);
 
-    const buyResp   = await derivRequest({ buy: proposalId, price: askPrice });
-    const contractId = buyResp.buy.contract_id;
-    const buyPrice    = parseFloat(buyResp.buy.buy_price);
+        const proposalResp = await derivRequest(proposalReq);
+        const proposalId = proposalResp.proposal.id;
+        const askPrice    = parseFloat(proposalResp.proposal.ask_price);
 
-    const settled = await waitForBulkContractSettlement(contractId);
-    const profit  = parseFloat(settled.profit || 0);
-    return { contractType, stake: buyPrice, contractId, profit, isWin: profit > 0, timestamp: Date.now() };
+        const buyResp    = await derivRequest({ buy: proposalId, price: askPrice });
+        const contractId = buyResp.buy.contract_id;
+        const buyPrice    = parseFloat(buyResp.buy.buy_price);
+
+        batch.entries[idx] = { index: idx+1, status: 'ENTERED', contractId, stake: buyPrice, contractType, timestamp: Date.now() };
+        log(`📦 Bulk entry ${idx+1}/${batch.trades} submitted | ${contractType} @ $${buyPrice.toFixed(2)}`, 'i');
+
+        // Stage 2 — settlement — fire-and-forget, does NOT block the entry pool.
+        waitForBulkContractSettlement(contractId).then(settled => {
+            const profit = parseFloat(settled.profit || 0);
+            batch.results[idx] = { index: idx+1, status: 'Completed', contractType, stake: buyPrice, contractId, profit, isWin: profit > 0, timestamp: Date.now() };
+            log(`📦 Bulk trade ${idx+1}/${batch.trades} resolved | ${profit>0?'WIN':'LOSS'} $${profit.toFixed(2)}`, profit>0?'w':'l');
+            saveBulkBatches(); renderBulkProgress(batch); renderBulkHistory();
+            checkBulkBatchFullyResolved(batch);
+        }).catch(e => {
+            batch.results[idx] = { index: idx+1, status: 'Failed', error: e.message, timestamp: Date.now() };
+            log(`📦 Bulk trade ${idx+1}/${batch.trades} settlement error: ${e.message}`, 'x');
+            saveBulkBatches(); renderBulkProgress(batch); renderBulkHistory();
+            checkBulkBatchFullyResolved(batch);
+        });
+    } catch(e) {
+        // Entry itself failed (proposal/buy rejected) — this slot is already
+        // final; it was never entered, so there's nothing to wait on.
+        batch.entries[idx] = { index: idx+1, status: 'ENTRY_FAILED', error: e.message, timestamp: Date.now() };
+        batch.results[idx] = { index: idx+1, status: 'Failed', error: e.message, timestamp: Date.now() };
+        log(`📦 Bulk entry ${idx+1}/${batch.trades} FAILED: ${e.message}`, 'x');
+        checkBulkBatchFullyResolved(batch);
+    }
+}
+
+// Runs the whole batch's entry stage through a small worker pool
+// (BULK_ENTRY_CONCURRENCY at a time) so all N trades are submitted
+// together rather than one-at-a-time, while still respecting the
+// WebSocket connection instead of firing everything at once.
+async function runConcurrentEntries(cfg, batch) {
+    batch.entries = new Array(cfg.trades).fill(null);
+    batch.results = new Array(cfg.trades).fill(null);
+    let cursor = 0;
+    async function worker() {
+        while (cursor < cfg.trades) {
+            const idx = cursor++;
+            await submitSingleBulkEntry(cfg, idx, batch);
+            renderBulkProgress(batch);
+        }
+    }
+    const workerCount = Math.min(BULK_ENTRY_CONCURRENCY, cfg.trades);
+    await Promise.all(Array.from({ length: workerCount }, worker));
+    saveBulkBatches();
+    renderBulkProgress(batch);
 }
 
 function computeBatchStatus(batch) {
-    const done   = batch.results.filter(r => r.status === 'Completed').length;
-    const failed = batch.results.filter(r => r.status === 'Failed').length;
-    if (done === batch.trades) return 'Completed';
-    if (done === 0 && failed > 0) return 'Failed';
+    const results  = batch.results || [];
+    const completed = results.filter(r => r && r.status === 'Completed').length;
+    if (completed === batch.trades) return 'Completed';
+    if (completed === 0) return 'Failed';
     return 'Partially Completed';
 }
 
+// Called after every single result lands. Only finalizes the batch once
+// EVERY requested slot has a final outcome (won, lost, or failed to enter)
+// — being "fully submitted" is not the same as being "fully completed".
+function checkBulkBatchFullyResolved(batch) {
+    if (!batch.results || batch.results.some(r => r === null)) return; // still waiting on at least one
+    if (batch._finalized) return; // idempotent — only finalize once
+    batch._finalized = true;
+    batch.status = computeBatchStatus(batch);
+    batch.completedAt = Date.now();
+    saveBulkBatches();
+    renderBulkHistory();
+    if (bulkCurrentBatch === batch) renderBulkProgress(batch);
+
+    const wins = batch.results.filter(r => r.isWin).length;
+    const net  = batch.results.reduce((s,r) => s + (r.profit || 0), 0);
+    notify(
+        batch.status === 'Completed' ? '✅ Bulk Trade Completed' : batch.status === 'Failed' ? '❌ Bulk Trade Failed' : '⚠️ Bulk Trade Partially Completed',
+        `${batch.trades} requested · ${batch.results.filter(r=>r.status==='Completed').length} resolved · ${wins} wins · Net: ${net>=0?'+':''}$${net.toFixed(2)}`,
+        batch.status === 'Completed' ? 'ok' : batch.status === 'Failed' ? 'err' : 'warn'
+    );
+    if (batch._resolveDone) batch._resolveDone(batch);
+}
+
+// ── Reset the current setup/execution area — does NOT touch history ──
+function resetBulkSetup() {
+    if (bulkExecuting) { notify('Cannot Reset', 'Wait for entry submission to finish first (settlement can continue in the background).', 'warn'); return; }
+    const set = (id, v) => { const el = document.getElementById(id); if (el) el.value = v; };
+    set('bulk-market', 'R_10');
+    set('bulk-type', 'over_under');
+    onBulkTypeChange();
+    set('bulk-pred', 5);
+    set('bulk-dur', 1);
+    set('bulk-trades', 10);
+    set('bulk-stake', '1.00');
+    setBulkStakeMode('per');
+
+    bulkImportedSignal = null;
+    const note = document.getElementById('bulk-signal-note');
+    if (note) { note.style.display = 'none'; note.textContent = ''; }
+
+    bulkCurrentBatch = null; // detach the UI from any batch — history already has its own persisted copy
+    const progressCard = document.getElementById('bulk-progress-card');
+    if (progressCard) progressCard.style.display = 'none';
+    const resultsBody = document.getElementById('bulk-results-body');
+    if (resultsBody) resultsBody.innerHTML = '';
+
+    updateBulkPreview();
+    notify('🔄 Bulk Setup Reset', 'Configuration cleared. Bulk trade history was not affected.', 'ok');
+}
+
 // ── Main entry point — guarded against double-click / re-entrant calls ──
-async function startBulkExecution() {
-    if (bulkExecuting) return; // idempotency guard — a second click while running does nothing
+function startBulkExecution() {
+    if (bulkExecuting) return; // idempotency guard — a second click while entries are being submitted does nothing
+    const cfg = getBulkConfig();
+    const err = validateBulkConfig(cfg);
+    if (err) { notify('Cannot Execute', err, 'err'); return; }
+
+    if (isBulkSignalStale()) {
+        const ageMin = Math.round((Date.now() - bulkImportedSignal.generatedAt) / 60000);
+        showApaModal(`
+            <div style="text-align:center;padding:10px;">
+                <div style="font-size:32px;margin-bottom:8px;">⚠️</div>
+                <div style="font-size:14px;font-weight:900;margin-bottom:8px;">Signal No Longer Fresh</div>
+                <div style="font-size:12px;color:var(--muted);margin-bottom:16px;">This AI signal was generated ${ageMin} minute${ageMin===1?'':'s'} ago. Please rescan the market before executing, or continue with the current setup anyway.</div>
+                <button class="btn btn-teal" style="width:100%;padding:12px;margin-bottom:8px;font-weight:900;" onclick="closeApaModal();switchTab('scanner');">🔄 Rescan Market</button>
+                <button class="btn btn-ghost" style="width:100%;padding:10px;" onclick="closeApaModal();proceedBulkExecution();">Continue Anyway</button>
+            </div>`);
+        return;
+    }
+    proceedBulkExecution();
+}
+
+function proceedBulkExecution() {
     const cfg = getBulkConfig();
     const err = validateBulkConfig(cfg);
     if (err) { notify('Cannot Execute', err, 'err'); return; }
@@ -1754,15 +1956,21 @@ async function startBulkExecution() {
     runBulkExecution();
 }
 
+// Submits the whole batch concurrently (Stage 1), then returns a promise
+// that resolves once every trade has fully settled (Stage 2) — useful for
+// Auto Mode's batch-by-batch pacing. The UI itself does not wait for this:
+// the Execute button re-enables as soon as entry submission finishes, since
+// starting another batch doesn't need to wait for the previous one's
+// contracts to resolve.
 async function runBulkExecution() {
-    if (bulkExecuting) return;
+    if (bulkExecuting) return null;
     const cfg = getBulkConfig();
     const err = validateBulkConfig(cfg);
-    if (err) { notify('Cannot Execute', err, 'err'); return; }
+    if (err) { notify('Cannot Execute', err, 'err'); return null; }
 
     bulkExecuting = true;
     const btn = document.getElementById('bulk-execute-btn');
-    if (btn) { btn.disabled = true; btn.textContent = `Executing 1 / ${cfg.trades} Trades...`; btn.style.opacity = '0.7'; }
+    if (btn) { btn.disabled = true; btn.textContent = `Submitting ${cfg.trades} Trades...`; btn.style.opacity = '0.7'; }
 
     const acct = allAccounts.find(a => a.account_id === accountId);
     const batch = {
@@ -1770,8 +1978,12 @@ async function runBulkExecution() {
         type: cfg.type, direction: cfg.direction, pred: cfg.pred, trades: cfg.trades,
         stakePerTrade: cfg.stakePerTrade, totalStake: cfg.totalStake,
         account: acct ? (acct.account_type === 'real' ? 'REAL' : 'DEMO') : '—',
-        status: 'RUNNING', results: []
+        status: 'RUNNING', entries: [], results: [], _finalized: false
     };
+    let resolveDone;
+    const donePromise = new Promise(resolve => { resolveDone = resolve; });
+    batch._resolveDone = resolveDone;
+
     bulkCurrentBatch = batch;
     bulkBatches.push(batch);
     saveBulkBatches();
@@ -1781,71 +1993,96 @@ async function runBulkExecution() {
     if (progressCard) progressCard.style.display = 'block';
     renderBulkProgress(batch);
 
-    for (let i = 0; i < cfg.trades; i++) {
-        if (btn) btn.textContent = `Executing ${i+1} / ${cfg.trades} Trades...`;
-        try {
-            const result = await executeSingleBulkTrade(cfg);
-            batch.results.push({ index: i+1, ...result, status: 'Completed' });
-            log(`📦 Bulk trade ${i+1}/${cfg.trades} completed | ${result.isWin?'WIN':'LOSS'} $${result.profit.toFixed(2)}`, result.isWin ? 'w' : 'l');
-        } catch(e) {
-            batch.results.push({ index: i+1, status: 'Failed', error: e.message, timestamp: Date.now() });
-            log(`📦 Bulk trade ${i+1}/${cfg.trades} FAILED: ${e.message}`, 'x');
-        }
-        saveBulkBatches();
-        renderBulkProgress(batch);
-    }
+    await runConcurrentEntries(cfg, batch); // all N entries submitted together (controlled concurrency)
 
-    batch.status = computeBatchStatus(batch);
-    saveBulkBatches();
     bulkExecuting = false;
-    bulkCurrentBatch = null;
     if (btn) { btn.disabled = false; btn.style.opacity = '1'; updateBulkPreview(); }
+    checkBulkBatchFullyResolved(batch); // covers the edge case where everything already resolved/failed synchronously
 
-    const wins = batch.results.filter(r => r.isWin).length;
-    const netResult = batch.results.reduce((s,r) => s + (r.profit || 0), 0);
-    notify(
-        batch.status === 'Completed' ? '✅ Bulk Trade Completed' : batch.status === 'Failed' ? '❌ Bulk Trade Failed' : '⚠️ Bulk Trade Partially Completed',
-        `${batch.trades} requested · ${batch.results.filter(r=>r.status==='Completed').length} executed · ${wins} wins · Net: ${netResult>=0?'+':''}$${netResult.toFixed(2)}`,
-        batch.status === 'Completed' ? 'ok' : batch.status === 'Failed' ? 'err' : 'warn'
-    );
-    renderBulkHistory();
+    return donePromise;
 }
 
 function renderBulkProgress(batch) {
-    const total = batch.trades;
-    const done  = batch.results.length;
-    const success = batch.results.filter(r => r.status === 'Completed').length;
-    const failed  = batch.results.filter(r => r.status === 'Failed').length;
-    const pending = total - done;
+    if (!batch || bulkCurrentBatch !== batch) return; // don't paint a reset UI with a stale batch's data
+    const total    = batch.trades;
+    const entries  = batch.entries || [];
+    const results  = batch.results || [];
+    const entered     = entries.filter(e => e && e.status === 'ENTERED').length;
+    const entryFailed = entries.filter(e => e && e.status === 'ENTRY_FAILED').length;
+    const attempted   = entered + entryFailed;
+    const resolved    = results.filter(r => r !== null).length;
+    const pending      = total - resolved;
+    const success      = results.filter(r => r && r.status === 'Completed').length;
+    const failedFinal  = results.filter(r => r && r.status === 'Failed').length;
 
     const set = (id, v) => { const el = document.getElementById(id); if (el) el.textContent = v; };
-    set('bulk-progress-label', `${done} / ${total}`);
-    set('bulk-progress-status', done < total ? 'Running...' : (batch.status || 'Done'));
+    set('bulk-entry-status', `${attempted} / ${total} Submitted${entryFailed ? ` (${entryFailed} failed)` : ''}`);
+    set('bulk-progress-label', `${resolved} / ${total} Resolved`);
+    set('bulk-progress-status', pending > 0 ? `${pending} Pending` : (batch.status || 'Done'));
     set('bulk-count-success', success);
-    set('bulk-count-failed', failed);
+    set('bulk-count-failed', failedFinal);
     set('bulk-count-pending', pending);
+
+    const entryBar = document.getElementById('bulk-entry-bar');
+    if (entryBar) entryBar.style.width = `${total ? (attempted/total)*100 : 0}%`;
     const bar = document.getElementById('bulk-progress-bar');
-    if (bar) bar.style.width = `${total ? (done/total)*100 : 0}%`;
+    if (bar) bar.style.width = `${total ? (resolved/total)*100 : 0}%`;
 
     const body = document.getElementById('bulk-results-body');
     if (body) {
-        body.innerHTML = batch.results.map(r => `
-            <div style="display:flex;align-items:center;padding:6px 0;border-bottom:1px solid var(--border);font-size:11px;">
+        body.innerHTML = Array.from({ length: total }, (_, i) => {
+            const r = results[i];
+            const e = entries[i];
+            if (!r) {
+                const status = e && e.status === 'ENTERED' ? 'Entered — resolving' : 'Submitting';
+                return `<div style="display:flex;align-items:center;padding:6px 0;border-bottom:1px solid var(--border);font-size:11px;color:var(--dim);">
+                    <div style="width:32px;">${i+1}</div><div style="flex:1;">${status}</div><div style="width:70px;">—</div><div style="width:90px;">Pending</div><div style="width:80px;text-align:right;">—</div>
+                </div>`;
+            }
+            return `<div style="display:flex;align-items:center;padding:6px 0;border-bottom:1px solid var(--border);font-size:11px;">
                 <div style="width:32px;color:var(--muted);">${r.index}</div>
                 <div style="flex:1;">${r.contractType || batch.type}</div>
                 <div style="width:70px;font-family:monospace;">$${(r.stake ?? batch.stakePerTrade).toFixed(2)}</div>
                 <div style="width:90px;color:${r.status==='Completed'?'var(--green)':'var(--red)'};">${r.status}</div>
                 <div style="width:80px;text-align:right;font-family:monospace;font-weight:700;color:${r.status!=='Completed'?'var(--dim)':r.isWin?'var(--green)':'var(--red)'};">${r.status==='Completed' ? (r.isWin?'+':'')+'$'+r.profit.toFixed(2) : '—'}</div>
-            </div>`).join('')
-            + Array.from({length: Math.max(0, total-done)}).map((_,i) => `
-            <div style="display:flex;align-items:center;padding:6px 0;border-bottom:1px solid var(--border);font-size:11px;color:var(--dim);">
-                <div style="width:32px;">${done+i+1}</div><div style="flex:1;">Pending</div><div style="width:70px;">—</div><div style="width:90px;">Pending</div><div style="width:80px;text-align:right;">—</div>
-            </div>`).join('');
+            </div>`;
+        }).join('');
     }
+}
+
+// ── Overall Bulk Trading statistics — computed from actual stored history,
+// never mocked. ──
+function computeBulkOverallStats() {
+    let totalTrades = 0, wins = 0, losses = 0, pl = 0;
+    bulkBatches.forEach(b => {
+        totalTrades += b.trades;
+        (b.results || []).forEach(r => {
+            if (r && r.status === 'Completed') {
+                pl += (r.profit || 0);
+                if (r.isWin) wins++; else losses++;
+            }
+        });
+    });
+    const decided = wins + losses;
+    return { totalBatches: bulkBatches.length, totalTrades, wins, losses, pl, winRate: decided ? (wins/decided*100) : 0 };
+}
+function renderBulkStatsCards() {
+    const wrap = document.getElementById('bulk-overall-stats');
+    if (!wrap) return;
+    const s = computeBulkOverallStats();
+    const set = (id, v, col) => { const el = document.getElementById(id); if (el) { el.textContent = v; if (col) el.style.color = col; } };
+    set('bulk-stat-batches', s.totalBatches);
+    set('bulk-stat-trades', s.totalTrades);
+    set('bulk-stat-wins', s.wins, 'var(--green)');
+    set('bulk-stat-losses', s.losses, 'var(--red)');
+    set('bulk-stat-pl', `${s.pl>=0?'+':''}$${s.pl.toFixed(2)}`, s.pl >= 0 ? 'var(--green)' : 'var(--red)');
+    set('bulk-stat-winrate', `${s.winRate.toFixed(2)}%`);
+    wrap.style.display = s.totalBatches > 0 ? 'grid' : 'none';
 }
 
 function renderBulkHistory() {
     const body = document.getElementById('bulk-history-body');
+    renderBulkStatsCards();
     if (!body) return;
     const batches = bulkBatches.slice().sort((a,b) => b.createdAt - a.createdAt);
     if (!batches.length) {
@@ -1853,9 +2090,12 @@ function renderBulkHistory() {
         return;
     }
     body.innerHTML = batches.map(b => {
-        const wins   = b.results.filter(r => r.isWin).length;
-        const losses = b.results.filter(r => r.status === 'Completed' && !r.isWin).length;
-        const net    = b.results.reduce((s,r) => s + (r.profit || 0), 0);
+        const results = (b.results || []).filter(Boolean); // exclude still-pending slots
+        const wins    = results.filter(r => r.isWin).length;
+        const losses  = results.filter(r => r.status === 'Completed' && !r.isWin).length;
+        const failed  = results.filter(r => r.status === 'Failed').length;
+        const net     = results.reduce((s,r) => s + (r.profit || 0), 0);
+        const resolved = results.length;
         const statusColor = b.status === 'Completed' ? 'var(--green)' : b.status === 'Failed' ? 'var(--red)' : b.status === 'RUNNING' ? 'var(--amber)' : 'var(--amber)';
         return `
         <div class="card-sm" style="padding:10px;">
@@ -1864,21 +2104,21 @@ function renderBulkHistory() {
                     <div style="font-size:11px;font-weight:900;">Batch #${b.id}</div>
                     <div style="font-size:9px;color:var(--muted);">${new Date(b.createdAt).toLocaleString()} · ${b.marketLabel} · ${b.direction.toUpperCase()}</div>
                 </div>
-                <span class="badge" style="background:${statusColor}22;color:${statusColor};border:1px solid ${statusColor}44;">${b.status}</span>
+                <span class="badge" style="background:${statusColor}22;color:${statusColor};border:1px solid ${statusColor}44;">${b.status}${b.status==='RUNNING' ? ` (${resolved}/${b.trades})` : ''}</span>
             </div>
             <div class="accu-row-3" style="margin-top:8px;">
                 <div style="text-align:center;"><div style="font-size:8px;color:var(--muted);">TRADES</div><div style="font-size:12px;font-weight:900;">${b.trades}</div></div>
                 <div style="text-align:center;"><div style="font-size:8px;color:var(--muted);">TOTAL STAKE</div><div style="font-size:12px;font-weight:900;">$${b.totalStake.toFixed(2)}</div></div>
-                <div style="text-align:center;"><div style="font-size:8px;color:var(--muted);">NET RESULT</div><div style="font-size:12px;font-weight:900;color:${net>=0?'var(--green)':'var(--red)'};">${net>=0?'+':''}$${net.toFixed(2)}</div></div>
+                <div style="text-align:center;"><div style="font-size:8px;color:var(--muted);">TOTAL P/L</div><div style="font-size:12px;font-weight:900;color:${net>0?'var(--green)':net<0?'var(--red)':'var(--muted)'};">${net===0?'0.00':(net>0?'+':'')+'$'+net.toFixed(2)}</div></div>
             </div>
-            <div style="font-size:9px;color:var(--muted);margin-top:6px;">Wins: <b style="color:var(--green);">${wins}</b> · Losses: <b style="color:var(--red);">${losses}</b> · Account: <b>${b.account}</b></div>
+            <div style="font-size:9px;color:var(--muted);margin-top:6px;">Wins: <b style="color:var(--green);">${wins}</b> · Losses: <b style="color:var(--red);">${losses}</b>${failed?` · Failed: <b style="color:var(--red);">${failed}</b>`:''} · Account: <b>${b.account}</b></div>
             <div id="bulk-batch-detail-${b.id}" style="display:none;margin-top:8px;border-top:1px solid var(--border);padding-top:8px;">
-                ${b.results.map(r => `
+                ${results.map(r => `
                 <div style="display:flex;justify-content:space-between;font-size:10px;padding:3px 0;color:var(--muted);">
                     <span>#${r.index} ${r.contractType || b.type}</span>
                     <span>${new Date(r.timestamp).toLocaleTimeString()}</span>
                     <span style="color:${r.status!=='Completed'?'var(--red)':r.isWin?'var(--green)':'var(--red)'};">${r.status==='Completed' ? (r.isWin?'+':'')+'$'+r.profit.toFixed(2) : (r.error || 'Failed')}</span>
-                </div>`).join('')}
+                </div>`).join('') || '<div style="font-size:10px;color:var(--dim);">Still resolving...</div>'}
             </div>
         </div>`;
     }).join('');
@@ -1918,6 +2158,120 @@ function initBulkTab() {
     const live = derivWS && derivWS.readyState === WebSocket.OPEN;
     if (dot) dot.classList.toggle('live', live);
     if (txt) { txt.textContent = live ? 'LIVE' : 'OFFLINE'; txt.style.color = live ? 'var(--teal)' : 'var(--muted)'; }
+    updateBulkAutoUI();
+}
+
+// ================================================================
+// BULK AUTO MODE
+// Watches the AI Scanner and, once enabled, automatically executes a batch
+// (using the currently configured Trades/Stake) whenever a qualifying
+// signal appears — same shape as the Accumulator's Auto Mode: runs until
+// manually stopped, Take Profit, Stop Loss, max batches/day, connection
+// loss, or a batch that fails outright.
+// ================================================================
+function resetBulkAutoDayIfNeeded() {
+    const today = new Date().toDateString();
+    if (bulkAutoDate !== today) { bulkAutoDate = today; bulkAutoSessions = 0; bulkAutoPL = 0; }
+}
+
+function updateBulkAutoUI() {
+    const track = document.getElementById('bulk-auto-track');
+    const thumb = document.getElementById('bulk-auto-thumb');
+    const bar   = document.getElementById('bulk-auto-bar');
+    if (track) track.style.background = bulkAutoEnabled ? 'var(--teal)' : 'var(--border)';
+    if (thumb) thumb.style.left       = bulkAutoEnabled ? '23px' : '3px';
+    if (bar)   bar.style.display      = bulkAutoEnabled ? 'flex' : 'none';
+    const set = (id, v, col) => { const el = document.getElementById(id); if (el) { el.textContent = v; if (col) el.style.color = col; } };
+    set('bulk-auto-batches', bulkAutoSessions);
+    set('bulk-auto-pl', `${bulkAutoPL>=0?'+':''}$${bulkAutoPL.toFixed(2)}`, bulkAutoPL >= 0 ? 'var(--green)' : 'var(--red)');
+}
+
+function toggleBulkAuto() {
+    if (!bulkAutoEnabled) {
+        // Turning ON
+        const acct = allAccounts.find(a => a.account_id === accountId);
+        const isReal = acct && acct.account_type === 'real';
+        if (isReal) {
+            showApaModal(`
+                <div style="text-align:center;padding:10px;">
+                    <div style="font-size:32px;margin-bottom:8px;">⚠️</div>
+                    <div style="font-size:14px;font-weight:900;margin-bottom:8px;">Enable Auto Mode on REAL Account?</div>
+                    <div style="font-size:12px;color:var(--muted);margin-bottom:16px;">Once enabled, Bulk Auto Mode will automatically execute batches on your <b style="color:var(--red);">REAL</b> account whenever a qualifying signal appears — without a confirmation prompt for each batch. It stops at your Take Profit, Stop Loss, max batches/day, or when you turn it off.</div>
+                    <button class="btn btn-red" style="width:100%;padding:12px;margin-bottom:8px;font-weight:900;" onclick="closeApaModal();enableBulkAutoConfirmed();">Confirm — Enable on REAL Account</button>
+                    <button class="btn btn-ghost" style="width:100%;padding:10px;" onclick="closeApaModal();">Cancel</button>
+                </div>`);
+            return;
+        }
+        enableBulkAutoConfirmed();
+    } else {
+        stopBulkAuto();
+    }
+}
+
+function enableBulkAutoConfirmed() {
+    resetBulkAutoDayIfNeeded();
+    bulkAutoEnabled = true;
+    updateBulkAutoUI();
+    startBulkAutoWatch();
+    log('🤖 Bulk Auto Mode: ON', 'i');
+    notify('🤖 Bulk Auto Mode ON', `Watching the AI Scanner for signals ≥ ${document.getElementById('bulk-auto-min-conf')?.value || 75}% confidence. Batches will run automatically until stopped.`, 'ok');
+}
+
+// reason: undefined (manual) | 'take_profit' | 'stop_loss' | 'max_batches' | 'connection_lost' | 'api_error'
+function stopBulkAuto(reason) {
+    bulkAutoEnabled = false;
+    bulkAutoRunning = false;
+    if (bulkAutoTimer) { clearInterval(bulkAutoTimer); bulkAutoTimer = null; }
+    updateBulkAutoUI();
+
+    const summary = `Batches today: ${bulkAutoSessions} | Session P/L: ${bulkAutoPL>=0?'+':''}$${bulkAutoPL.toFixed(2)}`;
+    log(`🤖 Bulk Auto Mode stopped${reason ? ' ('+reason+')' : ''}. ${summary}`, 'i');
+    if (reason === 'take_profit')      notify('🏆 Take Profit Reached', `Bulk Auto Mode stopped.\n${summary}`, 'ok');
+    else if (reason === 'stop_loss')   notify('⛔ Stop Loss Reached', `Bulk Auto Mode stopped.\n${summary}`, 'err');
+    else if (reason === 'max_batches') notify('🔢 Max Batches Reached', `Bulk Auto Mode stopped.\n${summary}`, 'ok');
+    else if (reason === 'connection_lost') notify('📡 Connection Lost', `Bulk Auto Mode stopped.\n${summary}`, 'err');
+    else if (reason === 'api_error')   notify('⚠️ Batch Failed', `Bulk Auto Mode stopped — a batch failed outright.\n${summary}`, 'err');
+    else notify('🤖 Bulk Auto Mode Stopped', summary, 'ok');
+}
+
+function startBulkAutoWatch() {
+    if (bulkAutoTimer) return;
+    bulkAutoTimer = setInterval(bulkAutoTick, 20000);
+    bulkAutoTick();
+}
+
+async function bulkAutoTick() {
+    if (!bulkAutoEnabled || bulkAutoRunning || bulkExecuting) return;
+    resetBulkAutoDayIfNeeded();
+
+    if (!derivWS || derivWS.readyState !== WebSocket.OPEN) { stopBulkAuto('connection_lost'); return; }
+
+    const maxBatches = parseInt(document.getElementById('bulk-auto-max-batches')?.value || 5);
+    if (bulkAutoSessions >= maxBatches) { stopBulkAuto('max_batches'); return; }
+
+    const tp = parseFloat(document.getElementById('bulk-auto-tp')?.value || 0);
+    const sl = parseFloat(document.getElementById('bulk-auto-sl')?.value || 0);
+    if (tp > 0 && bulkAutoPL >= tp) { stopBulkAuto('take_profit'); return; }
+    if (sl > 0 && bulkAutoPL <= -sl) { stopBulkAuto('stop_loss'); return; }
+
+    const minConf = parseFloat(document.getElementById('bulk-auto-min-conf')?.value || 75);
+    const results = ALL_MKTS.map(sym => ({ sym, signal: generateSignal(sym) }))
+        .sort((a,b) => (b.signal?.confidence||0) - (a.signal?.confidence||0));
+    const best = results[0];
+    if (!best?.signal || best.signal.confidence < minConf) return; // nothing qualifying yet — wait for next tick
+
+    populateBulkFromSignal(best.signal);
+    bulkAutoRunning = true;
+    const batch = await runBulkExecution(); // awaits full settlement of this batch before the next tick can start another
+    bulkAutoRunning = false;
+
+    if (batch) {
+        bulkAutoSessions++;
+        const net = batch.results.reduce((s,r) => s + (r.profit || 0), 0);
+        bulkAutoPL += net;
+        updateBulkAutoUI();
+        if (batch.status === 'Failed') { stopBulkAuto('api_error'); return; }
+    }
 }
 
 // ================================================================
@@ -3185,6 +3539,8 @@ function runFullScan() {
         data:       digitData[sym] || { ticks: 0 },
         state:      classifyMarket(sym)
     })).sort((a,b) => (b.signal?.confidence||0) - (a.signal?.confidence||0));
+
+    renderBulkRecommendation(results[0]);
 
     // ── Strategy signals box (priority) ──
     // Scan all markets for professional strategy conditions
@@ -4561,7 +4917,7 @@ function renderMt5SignalsUI() {
     if (activeCount) activeCount.textContent = `(${activeList.length})`;
     if (activeBody) {
         activeBody.innerHTML = activeList.length
-            ? `<div style="display:grid;grid-template-columns:repeat(auto-fill,minmax(260px,1fr));gap:10px;">${activeList.map(s => signalCardHtml(s, { showLevels: true })).join('')}</div>`
+            ? `<div class="mt5-signal-grid">${activeList.map(s => signalCardHtml(s, { showLevels: true })).join('')}</div>`
             : `<div style="font-size:11px;color:var(--dim);text-align:center;padding:20px;">No active signals right now. The scanner keeps checking every ${Math.round(MT5_SCAN_INTERVAL_MS/1000)}s across all available markets.</div>`;
     }
 
@@ -4573,7 +4929,7 @@ function renderMt5SignalsUI() {
     if (histCount) histCount.textContent = `${filtered.length} signal${filtered.length===1?'':'s'}`;
     if (histBody) {
         histBody.innerHTML = filtered.length
-            ? `<div style="display:grid;grid-template-columns:repeat(auto-fill,minmax(240px,1fr));gap:10px;">${filtered.slice(0,150).map(s => signalCardHtml(s, { showLevels: false })).join('')}</div>`
+            ? `<div class="mt5-signal-grid mt5-history-grid">${filtered.slice(0,150).map(s => signalCardHtml(s, { showLevels: false })).join('')}</div>`
             : `<div style="font-size:11px;color:var(--dim);text-align:center;padding:20px;">No signals match this filter.</div>`;
     }
 }
