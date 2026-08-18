@@ -1484,7 +1484,7 @@ Will return to ${originalDirection.toUpperCase()} ${originalPrediction} after wi
 
 const BULK_MAX_TRADES        = 100;   // sensible hard cap on trades per batch
 const BULK_MAX_TOTAL_STAKE   = 1000;  // sensible hard cap on total stake per batch
-const BULK_ENTRY_CONCURRENCY = 5;     // how many proposal->buy entries are in flight at once (controlled concurrency, not unlimited)
+const BULK_ENTRY_CONCURRENCY = 3;     // how many proposal->buy entries are in flight at once (controlled concurrency, not unlimited — Deriv rate-limits proposal calls, so this stays modest and staggered rather than maxed out)
 const BULK_SIGNAL_STALE_MS   = 5 * 60000; // an imported AI Scanner signal older than this triggers a staleness warning
 
 let bulkDirection      = 'over';
@@ -1693,6 +1693,21 @@ function renderBulkRecommendation(best) {
     const stakeDefault = 1;
     const exposure = tier.suggestedTrades * stakeDefault;
     el.style.display = 'block';
+
+    // IMPORTANT: `sig` (the AI Scanner's "best overall" signal) carries an
+    // `allSignals` field that includes itself — generateSignal() sets
+    // `best.allSignals = signals.slice(0,5)` where `best` is `signals[0]`,
+    // so `sig.allSignals[0] === sig`. JSON.stringify(sig) on that circular
+    // object throws, which was silently aborting this function (and the
+    // rest of runFullScan() with it) — exactly why the banner rendered as
+    // an empty box and the Scanner's other panels never populated. Only
+    // pass the handful of plain fields the button actually needs.
+    const payload = {
+        symbol: sig.symbol, type: sig.type, botDirection: sig.botDirection,
+        direction: sig.direction, pred: sig.pred, ticks: sig.ticks,
+        confidence: sig.confidence, label: sig.label, generatedAt: sig.generatedAt
+    };
+
     el.innerHTML = `
         <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:10px;flex-wrap:wrap;gap:8px;">
             <div style="font-size:14px;font-weight:900;color:${tier.color};">${tier.label}</div>
@@ -1704,7 +1719,7 @@ function renderBulkRecommendation(best) {
             <div class="card-sm" style="padding:8px;text-align:center;"><div style="font-size:8px;color:var(--muted);">SUGGESTED TRADES</div><div style="font-size:12px;font-weight:900;">${tier.suggestedTrades}</div></div>
         </div>
         <div style="font-size:10px;color:var(--muted);margin-bottom:10px;">Stake/Trade: <b style="color:var(--text);">$${stakeDefault.toFixed(2)}</b> (adjustable) · Total Exposure at suggested count: <b style="color:var(--text);">$${exposure.toFixed(2)}</b> · Signal generated: <b style="color:var(--text);">${new Date(sig.generatedAt).toLocaleTimeString()}</b></div>
-        <button onclick="populateBulkFromSignal(${JSON.stringify(sig).replace(/"/g,'&quot;')}, ${tier.suggestedTrades})" class="btn btn-teal" style="width:100%;padding:12px;font-size:13px;font-weight:900;">OPEN IN BULK TRADING</button>`;
+        <button onclick="populateBulkFromSignal(${JSON.stringify(payload).replace(/"/g,'&quot;')}, ${tier.suggestedTrades})" class="btn btn-teal" style="width:100%;padding:12px;font-size:13px;font-weight:900;">OPEN IN BULK TRADING</button>`;
 }
 
 function applyBestSignalToBulk() {
@@ -1782,8 +1797,8 @@ function waitForBulkContractSettlement(contractId, timeoutMs = 120000) {
 // contract is bought (entered), then kicks off Stage 2 (settlement) as a
 // fire-and-forget continuation so it doesn't hold up the next entry.
 async function submitSingleBulkEntry(cfg, idx, batch) {
+    const contractType = CONTRACT_MAP[cfg.type]?.[cfg.direction]; // computed up front so even a failed entry shows what it tried to trade
     try {
-        const contractType = CONTRACT_MAP[cfg.type]?.[cfg.direction];
         if (!contractType) throw new Error('Invalid contract configuration');
 
         const isDigit    = ['DIGITEVEN','DIGITODD','DIGITOVER','DIGITUNDER'].includes(contractType);
@@ -1818,17 +1833,20 @@ async function submitSingleBulkEntry(cfg, idx, batch) {
             saveBulkBatches(); renderBulkProgress(batch); renderBulkHistory();
             checkBulkBatchFullyResolved(batch);
         }).catch(e => {
-            batch.results[idx] = { index: idx+1, status: 'Failed', error: e.message, timestamp: Date.now() };
+            batch.results[idx] = { index: idx+1, status: 'Failed', error: e.message, contractType, stake: buyPrice, timestamp: Date.now() };
             log(`📦 Bulk trade ${idx+1}/${batch.trades} settlement error: ${e.message}`, 'x');
             saveBulkBatches(); renderBulkProgress(batch); renderBulkHistory();
             checkBulkBatchFullyResolved(batch);
         });
     } catch(e) {
         // Entry itself failed (proposal/buy rejected) — this slot is already
-        // final; it was never entered, so there's nothing to wait on.
-        batch.entries[idx] = { index: idx+1, status: 'ENTRY_FAILED', error: e.message, timestamp: Date.now() };
-        batch.results[idx] = { index: idx+1, status: 'Failed', error: e.message, timestamp: Date.now() };
+        // final; it was never entered, so there's nothing to wait on. The
+        // real rejection reason (e.g. a Deriv error message) is kept so the
+        // user can actually see why, instead of a bare "Failed".
+        batch.entries[idx] = { index: idx+1, status: 'ENTRY_FAILED', error: e.message, contractType, timestamp: Date.now() };
+        batch.results[idx] = { index: idx+1, status: 'Failed', error: e.message, contractType, timestamp: Date.now() };
         log(`📦 Bulk entry ${idx+1}/${batch.trades} FAILED: ${e.message}`, 'x');
+        saveBulkBatches(); renderBulkProgress(batch);
         checkBulkBatchFullyResolved(batch);
     }
 }
@@ -1836,12 +1854,17 @@ async function submitSingleBulkEntry(cfg, idx, batch) {
 // Runs the whole batch's entry stage through a small worker pool
 // (BULK_ENTRY_CONCURRENCY at a time) so all N trades are submitted
 // together rather than one-at-a-time, while still respecting the
-// WebSocket connection instead of firing everything at once.
+// WebSocket connection instead of firing everything at once. Each worker
+// starts with a small stagger — Deriv's API rate-limits `proposal` calls,
+// and firing several in the exact same instant was causing most of a
+// batch to come back rejected; spacing them by ~120ms keeps the batch
+// fast while staying under that limit.
 async function runConcurrentEntries(cfg, batch) {
     batch.entries = new Array(cfg.trades).fill(null);
     batch.results = new Array(cfg.trades).fill(null);
     let cursor = 0;
-    async function worker() {
+    async function worker(startDelay) {
+        if (startDelay) await new Promise(r => setTimeout(r, startDelay));
         while (cursor < cfg.trades) {
             const idx = cursor++;
             await submitSingleBulkEntry(cfg, idx, batch);
@@ -1849,7 +1872,7 @@ async function runConcurrentEntries(cfg, batch) {
         }
     }
     const workerCount = Math.min(BULK_ENTRY_CONCURRENCY, cfg.trades);
-    await Promise.all(Array.from({ length: workerCount }, worker));
+    await Promise.all(Array.from({ length: workerCount }, (_, i) => worker(i * 120)));
     saveBulkBatches();
     renderBulkProgress(batch);
 }
@@ -2039,12 +2062,18 @@ function renderBulkProgress(batch) {
                     <div style="width:32px;">${i+1}</div><div style="flex:1;">${status}</div><div style="width:70px;">—</div><div style="width:90px;">Pending</div><div style="width:80px;text-align:right;">—</div>
                 </div>`;
             }
-            return `<div style="display:flex;align-items:center;padding:6px 0;border-bottom:1px solid var(--border);font-size:11px;">
-                <div style="width:32px;color:var(--muted);">${r.index}</div>
-                <div style="flex:1;">${r.contractType || batch.type}</div>
-                <div style="width:70px;font-family:monospace;">$${(r.stake ?? batch.stakePerTrade).toFixed(2)}</div>
-                <div style="width:90px;color:${r.status==='Completed'?'var(--green)':'var(--red)'};">${r.status}</div>
-                <div style="width:80px;text-align:right;font-family:monospace;font-weight:700;color:${r.status!=='Completed'?'var(--dim)':r.isWin?'var(--green)':'var(--red)'};">${r.status==='Completed' ? (r.isWin?'+':'')+'$'+r.profit.toFixed(2) : '—'}</div>
+            const errLine = r.status === 'Failed' && r.error
+                ? `<div style="font-size:9px;color:var(--red);padding-left:32px;margin-top:-2px;margin-bottom:2px;">↳ ${r.error}</div>`
+                : '';
+            return `<div style="border-bottom:1px solid var(--border);">
+                <div style="display:flex;align-items:center;padding:6px 0;font-size:11px;">
+                    <div style="width:32px;color:var(--muted);">${r.index}</div>
+                    <div style="flex:1;">${r.contractType || batch.type}</div>
+                    <div style="width:70px;font-family:monospace;">$${(r.stake ?? batch.stakePerTrade).toFixed(2)}</div>
+                    <div style="width:90px;color:${r.status==='Completed'?'var(--green)':'var(--red)'};" title="${r.error||''}">${r.status}</div>
+                    <div style="width:80px;text-align:right;font-family:monospace;font-weight:700;color:${r.status!=='Completed'?'var(--dim)':r.isWin?'var(--green)':'var(--red)'};">${r.status==='Completed' ? (r.isWin?'+':'')+'$'+r.profit.toFixed(2) : '—'}</div>
+                </div>
+                ${errLine}
             </div>`;
         }).join('');
     }
@@ -3540,7 +3569,7 @@ function runFullScan() {
         state:      classifyMarket(sym)
     })).sort((a,b) => (b.signal?.confidence||0) - (a.signal?.confidence||0));
 
-    renderBulkRecommendation(results[0]);
+    try { renderBulkRecommendation(results[0]); } catch(e) { console.error('renderBulkRecommendation failed:', e); }
 
     // ── Strategy signals box (priority) ──
     // Scan all markets for professional strategy conditions
