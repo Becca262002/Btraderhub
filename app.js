@@ -144,6 +144,16 @@ let pendingProposalPrice = null;
 let reqIdCounter         = 1;
 function nextReqId() { return ++reqIdCounter; }
 
+// Bulk Trading message isolation — every request Bulk Trading sends via
+// derivRequest() is tagged here for the lifetime of that single request,
+// and every contract it buys is tagged here for the lifetime of that
+// contract. routeMsg() checks these before running its own DBot/Accumulator
+// logic so a Bulk Trading proposal/buy/contract can never be double-handled
+// (bought twice, or folded into DBot's Summary/Journal). See derivRequest()
+// and waitForBulkContractSettlement() in the Bulk Trading engine below.
+let bulkPendingReqIds      = new Set();
+let bulkTrackedContractIds = new Set();
+
 // Pip sizes per symbol — populated from active_symbols
 let activePipSizes = {};
 
@@ -659,7 +669,12 @@ function routeMsg(r) {
     }
 
     // STEP 2: Proposal response — extract ID and ask_price, then buy
-    if (r.msg_type === 'proposal') {
+    // NOTE: skip entirely if this proposal belongs to Bulk Trading (see
+    // bulkPendingReqIds below) — otherwise this legacy auto-buy logic can
+    // buy the SAME proposal Bulk Trading's own derivRequest() is about to
+    // buy, which is the actual root cause of "Unknown contract proposal":
+    // Deriv rejects the second buy attempt on an already-consumed proposal.
+    if (r.msg_type === 'proposal' && !bulkPendingReqIds.has(r.req_id)) {
         clearProposalTimeout();
         if (r.error) {
             pendingContract = false;
@@ -692,8 +707,11 @@ function routeMsg(r) {
         }
     }
 
-    // STEP 3: Buy response
-    if (r.msg_type === 'buy') handleBuyResponse(r);
+    // STEP 3: Buy response — same isolation: a Bulk Trading buy response
+    // must never fall into DBot's handleBuyResponse (which would inflate
+    // totalRuns, hijack lastContractId, and open a second, redundant
+    // proposal_open_contract subscription for the same contract).
+    if (r.msg_type === 'buy' && !bulkPendingReqIds.has(r.req_id)) handleBuyResponse(r);
 
     // Sell response (for accumulator manual sell)
     if (r.msg_type === 'sell') {
@@ -729,8 +747,14 @@ function routeMsg(r) {
                 .join(' | ');
             log(`📋 Spots: ${found || 'NO SPOT FIELDS FOUND'}`, 'd');
         }
-        // Route to accumulator handler or bot handler
-        if (c.contract_type === 'ACCU' || (accuContractId && c.contract_id === accuContractId)) {
+        // A contract bought by Bulk Trading is tracked in
+        // bulkTrackedContractIds — its own subscription listener
+        // (waitForBulkContractSettlement) owns it end to end. Routing it
+        // into DBot's handleContractResult as well was corrupting DBot's
+        // Summary/Journal/Transactions with bulk trade results.
+        if (bulkTrackedContractIds.has(c.contract_id)) {
+            // owned by Bulk Trading — nothing to do here
+        } else if (c.contract_type === 'ACCU' || (accuContractId && c.contract_id === accuContractId)) {
             accuContractId = c.contract_id;
             handleAccuContractUpdate(c);
         } else {
@@ -1744,16 +1768,26 @@ function validateBulkConfig(cfg) {
 // ── Low-level, self-contained request helpers — decoupled from the DBot's
 // global pendingContract/lastContractId state so Bulk Trading can never
 // interfere with (or be interfered with by) the DBot or Accumulator. ──
+// Every proposal/buy request Bulk Trading makes goes through here, and
+// every one is tagged in bulkPendingReqIds for its exact lifetime (added
+// right before send, removed the instant its own response arrives) so
+// routeMsg() can recognize and skip it before its own legacy logic runs.
 function derivRequest(payload, timeoutMs = 10000) {
     return new Promise((resolve, reject) => {
         if (!derivWS || derivWS.readyState !== WebSocket.OPEN) { reject(new Error('Not connected')); return; }
         const reqId = nextReqId();
-        const timer = setTimeout(() => { derivWS.removeEventListener('message', handler); reject(new Error('Request timed out')); }, timeoutMs);
+        bulkPendingReqIds.add(reqId);
+        const timer = setTimeout(() => {
+            derivWS.removeEventListener('message', handler);
+            bulkPendingReqIds.delete(reqId);
+            reject(new Error('Request timed out'));
+        }, timeoutMs);
         function handler(ev) {
             let data; try { data = JSON.parse(ev.data); } catch(e) { return; }
             if (data.req_id !== reqId) return;
             clearTimeout(timer);
             derivWS.removeEventListener('message', handler);
+            bulkPendingReqIds.delete(reqId);
             if (data.error) { reject(new Error(data.error.message || 'API error')); return; }
             resolve(data);
         }
@@ -1761,14 +1795,20 @@ function derivRequest(payload, timeoutMs = 10000) {
         derivWS.send(JSON.stringify({ ...payload, req_id: reqId }));
     });
 }
+// contractId is tagged in bulkTrackedContractIds for the contract's whole
+// open lifetime (added before the subscribe request, removed once settled
+// or on timeout) so routeMsg() never folds a bulk contract's updates into
+// DBot's handleContractResult.
 function waitForBulkContractSettlement(contractId, timeoutMs = 120000) {
     return new Promise((resolve, reject) => {
         if (!derivWS || derivWS.readyState !== WebSocket.OPEN) { reject(new Error('Not connected')); return; }
+        bulkTrackedContractIds.add(contractId);
         let subId = null;
         const timer = setTimeout(() => { cleanup(); reject(new Error('Settlement timed out')); }, timeoutMs);
         function cleanup() {
             clearTimeout(timer);
             derivWS.removeEventListener('message', handler);
+            bulkTrackedContractIds.delete(contractId);
             if (subId && derivWS.readyState === WebSocket.OPEN) derivWS.send(JSON.stringify({ forget: subId }));
         }
         function handler(ev) {
@@ -1821,19 +1861,31 @@ async function submitSingleBulkEntry(cfg, idx, batch) {
         const buyResp    = await derivRequest({ buy: proposalId, price: askPrice });
         const contractId = buyResp.buy.contract_id;
         const buyPrice    = parseFloat(buyResp.buy.buy_price);
+        // Entry spot — same fields D-Bot's own journal uses, straight from the buy response
+        const entrySpot   = buyResp.buy.entry_tick_display_value ?? buyResp.buy.entry_spot ?? null;
+        const entryTime   = Date.now();
 
-        batch.entries[idx] = { index: idx+1, status: 'ENTERED', contractId, stake: buyPrice, contractType, timestamp: Date.now() };
+        batch.entries[idx] = { index: idx+1, status: 'ENTERED', contractId, stake: buyPrice, contractType, entrySpot, entryTime, timestamp: entryTime };
         log(`📦 Bulk entry ${idx+1}/${batch.trades} submitted | ${contractType} @ $${buyPrice.toFixed(2)}`, 'i');
+        batch.status = 'RUNNING';
 
         // Stage 2 — settlement — fire-and-forget, does NOT block the entry pool.
         waitForBulkContractSettlement(contractId).then(settled => {
-            const profit = parseFloat(settled.profit || 0);
-            batch.results[idx] = { index: idx+1, status: 'Completed', contractType, stake: buyPrice, contractId, profit, isWin: profit > 0, timestamp: Date.now() };
-            log(`📦 Bulk trade ${idx+1}/${batch.trades} resolved | ${profit>0?'WIN':'LOSS'} $${profit.toFixed(2)}`, profit>0?'w':'l');
+            const profit  = parseFloat(settled.profit || 0);
+            // Exit spot / payout — actual Deriv contract fields, same ones
+            // D-Bot's journal reads (never fabricated or estimated).
+            const exitSpot = settled.exit_tick_display_value ?? settled.exit_spot ?? settled.sell_spot_display_value ?? settled.sell_spot ?? null;
+            const payout   = parseFloat(settled.payout ?? settled.sell_price ?? (buyPrice + profit));
+            batch.results[idx] = {
+                index: idx+1, status: 'Completed', contractType, stake: buyPrice, contractId,
+                entrySpot, exitSpot, payout, profit, isWin: profit > 0,
+                entryTime, exitTime: Date.now(), timestamp: Date.now()
+            };
+            log(`📦 Bulk trade ${idx+1}/${batch.trades} resolved | ${profit>0?'WIN':'LOSS'} $${profit.toFixed(2)} | Entry: ${entrySpot ?? '—'} Exit: ${exitSpot ?? '—'}`, profit>0?'w':'l');
             saveBulkBatches(); renderBulkProgress(batch); renderBulkHistory();
             checkBulkBatchFullyResolved(batch);
         }).catch(e => {
-            batch.results[idx] = { index: idx+1, status: 'Failed', error: e.message, contractType, stake: buyPrice, timestamp: Date.now() };
+            batch.results[idx] = { index: idx+1, status: 'Failed', error: e.message, contractType, stake: buyPrice, contractId, entrySpot, entryTime, timestamp: Date.now() };
             log(`📦 Bulk trade ${idx+1}/${batch.trades} settlement error: ${e.message}`, 'x');
             saveBulkBatches(); renderBulkProgress(batch); renderBulkHistory();
             checkBulkBatchFullyResolved(batch);
@@ -1860,6 +1912,7 @@ async function submitSingleBulkEntry(cfg, idx, batch) {
 // batch to come back rejected; spacing them by ~120ms keeps the batch
 // fast while staying under that limit.
 async function runConcurrentEntries(cfg, batch) {
+    batch.status = 'ENTERING';
     batch.entries = new Array(cfg.trades).fill(null);
     batch.results = new Array(cfg.trades).fill(null);
     let cursor = 0;
@@ -2001,7 +2054,7 @@ async function runBulkExecution() {
         type: cfg.type, direction: cfg.direction, pred: cfg.pred, trades: cfg.trades,
         stakePerTrade: cfg.stakePerTrade, totalStake: cfg.totalStake,
         account: acct ? (acct.account_type === 'real' ? 'REAL' : 'DEMO') : '—',
-        status: 'RUNNING', entries: [], results: [], _finalized: false
+        status: 'PREPARING', entries: [], results: [], _finalized: false
     };
     let resolveDone;
     const donePromise = new Promise(resolve => { resolveDone = resolve; });
@@ -2020,6 +2073,10 @@ async function runBulkExecution() {
 
     bulkExecuting = false;
     if (btn) { btn.disabled = false; btn.style.opacity = '1'; updateBulkPreview(); }
+    if (batch.status === 'ENTERING' || batch.status === 'PREPARING') batch.status = 'RUNNING'; // entries are in, at least some are awaiting settlement (or all failed — checkBulkBatchFullyResolved below will correct that)
+    saveBulkBatches();
+    renderBulkHistory();
+    if (bulkCurrentBatch === batch) renderBulkProgress(batch);
     checkBulkBatchFullyResolved(batch); // covers the edge case where everything already resolved/failed synchronously
 
     return donePromise;
@@ -2082,18 +2139,24 @@ function renderBulkProgress(batch) {
 // ── Overall Bulk Trading statistics — computed from actual stored history,
 // never mocked. ──
 function computeBulkOverallStats() {
-    let totalTrades = 0, wins = 0, losses = 0, pl = 0;
+    let totalTrades = 0, entered = 0, rejected = 0, resolved = 0, wins = 0, losses = 0, pl = 0;
     bulkBatches.forEach(b => {
         totalTrades += b.trades;
+        (b.entries || []).forEach(e => {
+            if (e && e.status === 'ENTERED') entered++;
+            if (e && e.status === 'ENTRY_FAILED') rejected++;
+        });
         (b.results || []).forEach(r => {
-            if (r && r.status === 'Completed') {
+            if (!r) return;
+            resolved++;
+            if (r.status === 'Completed') {
                 pl += (r.profit || 0);
                 if (r.isWin) wins++; else losses++;
             }
         });
     });
     const decided = wins + losses;
-    return { totalBatches: bulkBatches.length, totalTrades, wins, losses, pl, winRate: decided ? (wins/decided*100) : 0 };
+    return { totalBatches: bulkBatches.length, totalTrades, entered, rejected, resolved, wins, losses, pl, winRate: decided ? (wins/decided*100) : 0 };
 }
 function renderBulkStatsCards() {
     const wrap = document.getElementById('bulk-overall-stats');
@@ -2102,6 +2165,9 @@ function renderBulkStatsCards() {
     const set = (id, v, col) => { const el = document.getElementById(id); if (el) { el.textContent = v; if (col) el.style.color = col; } };
     set('bulk-stat-batches', s.totalBatches);
     set('bulk-stat-trades', s.totalTrades);
+    set('bulk-stat-entered', s.entered);
+    set('bulk-stat-rejected', s.rejected, s.rejected ? 'var(--red)' : undefined);
+    set('bulk-stat-resolved', s.resolved);
     set('bulk-stat-wins', s.wins, 'var(--green)');
     set('bulk-stat-losses', s.losses, 'var(--red)');
     set('bulk-stat-pl', `${s.pl>=0?'+':''}$${s.pl.toFixed(2)}`, s.pl >= 0 ? 'var(--green)' : 'var(--red)');
@@ -2119,13 +2185,16 @@ function renderBulkHistory() {
         return;
     }
     body.innerHTML = batches.map(b => {
-        const results = (b.results || []).filter(Boolean); // exclude still-pending slots
-        const wins    = results.filter(r => r.isWin).length;
-        const losses  = results.filter(r => r.status === 'Completed' && !r.isWin).length;
-        const failed  = results.filter(r => r.status === 'Failed').length;
-        const net     = results.reduce((s,r) => s + (r.profit || 0), 0);
+        const entries  = (b.entries || []).filter(Boolean);
+        const entered  = entries.filter(e => e.status === 'ENTERED').length;
+        const rejected = entries.filter(e => e.status === 'ENTRY_FAILED').length;
+        const results  = (b.results || []).filter(Boolean); // exclude still-pending slots
+        const wins     = results.filter(r => r.isWin).length;
+        const losses   = results.filter(r => r.status === 'Completed' && !r.isWin).length;
         const resolved = results.length;
-        const statusColor = b.status === 'Completed' ? 'var(--green)' : b.status === 'Failed' ? 'var(--red)' : b.status === 'RUNNING' ? 'var(--amber)' : 'var(--amber)';
+        const net      = results.reduce((s,r) => s + (r.profit || 0), 0);
+        const inProgress = ['PREPARING','ENTERING','RUNNING'].includes(b.status);
+        const statusColor = b.status === 'Completed' ? 'var(--green)' : (b.status === 'Failed') ? 'var(--red)' : inProgress ? 'var(--amber)' : 'var(--amber)';
         return `
         <div class="card-sm" style="padding:10px;">
             <div style="display:flex;justify-content:space-between;align-items:center;cursor:pointer;" onclick="toggleBulkBatchDetail('${b.id}')">
@@ -2133,20 +2202,35 @@ function renderBulkHistory() {
                     <div style="font-size:11px;font-weight:900;">Batch #${b.id}</div>
                     <div style="font-size:9px;color:var(--muted);">${new Date(b.createdAt).toLocaleString()} · ${b.marketLabel} · ${b.direction.toUpperCase()}</div>
                 </div>
-                <span class="badge" style="background:${statusColor}22;color:${statusColor};border:1px solid ${statusColor}44;">${b.status}${b.status==='RUNNING' ? ` (${resolved}/${b.trades})` : ''}</span>
+                <span class="badge" style="background:${statusColor}22;color:${statusColor};border:1px solid ${statusColor}44;">${b.status}${inProgress ? ` (${resolved}/${b.trades})` : ''}</span>
             </div>
             <div class="accu-row-3" style="margin-top:8px;">
-                <div style="text-align:center;"><div style="font-size:8px;color:var(--muted);">TRADES</div><div style="font-size:12px;font-weight:900;">${b.trades}</div></div>
+                <div style="text-align:center;"><div style="font-size:8px;color:var(--muted);">REQUESTED</div><div style="font-size:12px;font-weight:900;">${b.trades}</div></div>
+                <div style="text-align:center;"><div style="font-size:8px;color:var(--muted);">ENTERED / REJECTED</div><div style="font-size:12px;font-weight:900;">${entered} / <span style="color:${rejected?'var(--red)':'var(--muted)'};">${rejected}</span></div></div>
+                <div style="text-align:center;"><div style="font-size:8px;color:var(--muted);">RESOLVED</div><div style="font-size:12px;font-weight:900;">${resolved} / ${b.trades}</div></div>
+            </div>
+            <div class="accu-row-3" style="margin-top:6px;">
                 <div style="text-align:center;"><div style="font-size:8px;color:var(--muted);">TOTAL STAKE</div><div style="font-size:12px;font-weight:900;">$${b.totalStake.toFixed(2)}</div></div>
+                <div style="text-align:center;"><div style="font-size:8px;color:var(--muted);">WINS / LOSSES</div><div style="font-size:12px;font-weight:900;"><span style="color:var(--green);">${wins}</span> / <span style="color:var(--red);">${losses}</span></div></div>
                 <div style="text-align:center;"><div style="font-size:8px;color:var(--muted);">TOTAL P/L</div><div style="font-size:12px;font-weight:900;color:${net>0?'var(--green)':net<0?'var(--red)':'var(--muted)'};">${net===0?'0.00':(net>0?'+':'')+'$'+net.toFixed(2)}</div></div>
             </div>
-            <div style="font-size:9px;color:var(--muted);margin-top:6px;">Wins: <b style="color:var(--green);">${wins}</b> · Losses: <b style="color:var(--red);">${losses}</b>${failed?` · Failed: <b style="color:var(--red);">${failed}</b>`:''} · Account: <b>${b.account}</b></div>
+            <div style="font-size:9px;color:var(--muted);margin-top:6px;">Account: <b>${b.account}</b> ${resolved < b.trades && !inProgress ? ' · <span style="color:var(--amber);">Some trades never resolved</span>' : ''}</div>
             <div id="bulk-batch-detail-${b.id}" style="display:none;margin-top:8px;border-top:1px solid var(--border);padding-top:8px;">
+                <div style="display:flex;justify-content:flex-end;margin-bottom:6px;">
+                    <span style="font-size:9px;color:var(--teal);cursor:pointer;" onclick="event.stopPropagation();">VIEW ${results.length} TRADE${results.length===1?'':'S'}</span>
+                </div>
                 ${results.map(r => `
-                <div style="display:flex;justify-content:space-between;font-size:10px;padding:3px 0;color:var(--muted);">
-                    <span>#${r.index} ${r.contractType || b.type}</span>
-                    <span>${new Date(r.timestamp).toLocaleTimeString()}</span>
-                    <span style="color:${r.status!=='Completed'?'var(--red)':r.isWin?'var(--green)':'var(--red)'};">${r.status==='Completed' ? (r.isWin?'+':'')+'$'+r.profit.toFixed(2) : (r.error || 'Failed')}</span>
+                <div style="padding:5px 0;border-bottom:1px solid var(--border);font-size:10px;color:var(--muted);">
+                    <div style="display:flex;justify-content:space-between;">
+                        <span style="color:var(--text);font-weight:700;">#${r.index} ${r.contractType || b.type}</span>
+                        <span style="color:${r.status!=='Completed'?'var(--red)':r.isWin?'var(--green)':'var(--red)'};font-weight:700;">${r.status==='Completed' ? (r.isWin?'+':'')+'$'+r.profit.toFixed(2) : (r.error || 'Failed')}</span>
+                    </div>
+                    ${r.status==='Completed' ? `<div style="display:flex;justify-content:space-between;margin-top:2px;font-size:9px;">
+                        <span>Entry: <b style="color:var(--text);font-family:monospace;">${r.entrySpot ?? '—'}</b></span>
+                        <span>Exit: <b style="color:var(--text);font-family:monospace;">${r.exitSpot ?? '—'}</b></span>
+                        <span>ID: <span style="font-family:monospace;">${r.contractId ?? '—'}</span></span>
+                        <span>${r.exitTime ? new Date(r.exitTime).toLocaleTimeString() : ''}</span>
+                    </div>` : ''}
                 </div>`).join('') || '<div style="font-size:10px;color:var(--dim);">Still resolving...</div>'}
             </div>
         </div>`;
