@@ -206,6 +206,16 @@ window.addEventListener('load', async () => {
     loadMt5Signals();
     setTimeout(startMt5BackgroundScan, 4000);
 
+    // Bulk Trading history is loaded from storage exactly ONCE, here, at
+    // startup. It must never be reloaded during the session — bulkBatches
+    // is the live, in-memory source of truth from this point on (kept in
+    // sync with storage via saveBulkBatches() on every change). Reloading
+    // it later (e.g. every time the Bulk tab is opened) was overwriting
+    // an actively-running batch's live object with a stale snapshot from
+    // disk, permanently detaching it from further updates — that was the
+    // cause of batches stuck showing "PREPARING (0/5)" forever.
+    loadBulkBatches();
+
     const params     = new URLSearchParams(window.location.search);
     const code       = params.get('code');
     const oauthState = params.get('state');
@@ -644,7 +654,13 @@ function routeMsg(r) {
         const el = document.getElementById('balance');
         if (el) el.textContent = `${parseFloat(r.balance.balance).toFixed(2)} ${r.balance.currency}`;
         liveBalance = parseFloat(r.balance.balance); // tracked for Bulk Trading's insufficient-balance check
-        if (document.getElementById('bulk-pane')?.classList.contains('active')) initBulkTab();
+        // NOTE: this used to call initBulkTab() here, which fires on every
+        // balance change — i.e. every single time ANY contract settles,
+        // including mid-batch. That reloaded bulk history from storage
+        // (see the startup loadBulkBatches() comment) and silently reset
+        // the user's chosen Direction back to its default. Only the
+        // account/balance badges need to react to a balance tick.
+        if (document.getElementById('bulk-pane')?.classList.contains('active')) updateBulkAccountBadges();
     }
 
     // Tick and history from authenticated WS — routed to stub
@@ -1772,6 +1788,21 @@ function validateBulkConfig(cfg) {
 // every one is tagged in bulkPendingReqIds for its exact lifetime (added
 // right before send, removed the instant its own response arrives) so
 // routeMsg() can recognize and skip it before its own legacy logic runs.
+// A simple async mutex — only one proposal->buy handshake for Bulk Trading
+// is ever in flight at a time (see submitSingleBulkEntry for why). Callers
+// `await` a release function and MUST call it exactly once when their
+// critical section is done (success or failure) so the next queued entry
+// can proceed. A stuck/never-released lock would deadlock every subsequent
+// entry, so every call site uses try/finally.
+let bulkEntryLockChain = Promise.resolve();
+function acquireBulkEntryLock() {
+    let release;
+    const myTurn = new Promise(res => { release = res; });
+    const acquired = bulkEntryLockChain.then(() => release);
+    bulkEntryLockChain = bulkEntryLockChain.then(() => myTurn);
+    return acquired;
+}
+
 function derivRequest(payload, timeoutMs = 10000) {
     return new Promise((resolve, reject) => {
         if (!derivWS || derivWS.readyState !== WebSocket.OPEN) { reject(new Error('Not connected')); return; }
@@ -1854,11 +1885,39 @@ async function submitSingleBulkEntry(cfg, idx, batch) {
         else if (isRiseFall) { proposalReq.duration = Math.max(1, cfg.duration); proposalReq.duration_unit = 'm'; }
         if (cfg.type === 'over_under') proposalReq.barrier = String(cfg.pred);
 
-        const proposalResp = await derivRequest(proposalReq);
-        const proposalId = proposalResp.proposal.id;
-        const askPrice    = parseFloat(proposalResp.proposal.ask_price);
+        // ── CRITICAL SECTION ──
+        // ROOT CAUSE of "Unknown contract proposal": every trade in a batch
+        // shares identical parameters (same market/type/barrier/stake), so
+        // running several proposal+buy round trips concurrently meant
+        // multiple near-identical `proposal` requests were in flight on the
+        // same Deriv session at once. Deriv only reliably honors the most
+        // recent one-shot proposal per session for a given contract spec —
+        // an older still-outstanding proposal_id can be invalidated the
+        // moment a newer identical one is requested, so whichever `buy`
+        // arrived after that got rejected as "Unknown contract proposal".
+        // The fix: serialize ONLY the proposal->buy handshake itself across
+        // all workers (a lock, not a delay) so no two proposals for this
+        // batch are ever outstanding at the same time. Settlement (which
+        // can take many seconds) stays fully concurrent — it's released
+        // from the lock immediately after buy confirms, below.
+        const releaseLock = await acquireBulkEntryLock();
+        let proposalId, askPrice;
+        try {
+            const proposalResp = await derivRequest(proposalReq);
+            proposalId = proposalResp.proposal.id;
+            askPrice    = parseFloat(proposalResp.proposal.ask_price);
+            if (!proposalId) throw new Error('Proposal response had no ID — refusing to buy');
+        } catch(proposalErr) {
+            releaseLock();
+            throw proposalErr;
+        }
 
-        const buyResp    = await derivRequest({ buy: proposalId, price: askPrice });
+        let buyResp;
+        try {
+            buyResp = await derivRequest({ buy: proposalId, price: askPrice });
+        } finally {
+            releaseLock(); // buy attempted (succeeded or failed) — the next queued entry can now request its proposal
+        }
         const contractId = buyResp.buy.contract_id;
         const buyPrice    = parseFloat(buyResp.buy.buy_price);
         // Entry spot — same fields D-Bot's own journal uses, straight from the buy response
@@ -2248,13 +2307,27 @@ function clearBulkHistory() {
 }
 
 function initBulkTab() {
-    loadBulkBatches();
-    onBulkTypeChange();
+    // NOTE: intentionally does NOT call loadBulkBatches() here — see the
+    // comment at the startup call site. bulkBatches is already the live,
+    // in-memory state; re-reading storage on every tab visit was the bug.
+    // Also only populate Direction the FIRST time (it's empty until then) —
+    // calling onBulkTypeChange() on every visit was silently resetting the
+    // user's chosen Direction back to its default whenever they left and
+    // returned to this tab.
+    const dirControls = document.getElementById('bulk-dir-controls');
+    if (dirControls && dirControls.children.length === 0) onBulkTypeChange();
     setBulkStakeMode(bulkStakeMode);
     updateBulkPreview();
     renderBulkHistory();
     if (bulkCurrentBatch) { document.getElementById('bulk-progress-card').style.display = 'block'; renderBulkProgress(bulkCurrentBatch); }
+    updateBulkAccountBadges();
+    updateBulkAutoUI();
+}
 
+// Lightweight refresh — just the connection/account/balance badges. Safe to
+// call as often as needed (e.g. on every balance tick) since, unlike
+// initBulkTab(), it never touches history, form state, or Direction.
+function updateBulkAccountBadges() {
     const acct = allAccounts.find(a => a.account_id === accountId);
     const accBadge = document.getElementById('bulk-account-badge');
     const balBadge = document.getElementById('bulk-balance-badge');
@@ -2271,7 +2344,6 @@ function initBulkTab() {
     const live = derivWS && derivWS.readyState === WebSocket.OPEN;
     if (dot) dot.classList.toggle('live', live);
     if (txt) { txt.textContent = live ? 'LIVE' : 'OFFLINE'; txt.style.color = live ? 'var(--teal)' : 'var(--muted)'; }
-    updateBulkAutoUI();
 }
 
 // ================================================================
