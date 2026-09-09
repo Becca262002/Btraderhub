@@ -4050,11 +4050,11 @@ function updateDigitStats(symbol) {
 
     const set = (id,v) => { const el=document.getElementById(id); if(el) el.textContent=v; };
 
-    // Update text values
-    set('d-even',  `${evenPct}%`);
-    set('d-odd',   `${oddPct}%`);
-    set('d-over',  `${overPct}%`);
-    set('d-under', `${underPct}%`);
+    // Update text values — shown in brackets, e.g. "Over 4 (65%)"
+    set('d-even',  `(${evenPct}%)`);
+    set('d-odd',   `(${oddPct}%)`);
+    set('d-over',  `(${overPct}%)`);
+    set('d-under', `(${underPct}%)`);
 
     // Update Even/Odd bar widths
     const evenBar  = document.getElementById('d-even-bar');
@@ -4454,8 +4454,36 @@ const APA_MARKETS = [
     { deriv:'CRASH600', mt5:'Crash 600 Index',  display:'Crash 600 Index',  cat:'crash', confirmed:false },
     { deriv:'CRASH900', mt5:'Crash 900 Index',  display:'Crash 900 Index',  cat:'crash', confirmed:false },
     { deriv:'CRASH1000',mt5:'Crash 1000 Index', display:'Crash 1000 Index', cat:'crash', confirmed:false },
+    // Forex — Deriv's real forex symbols use an "frx" prefix (e.g.
+    // frxEURUSD). Marked unconfirmed like Boom/Crash above: each one is
+    // only ever treated as tradable once Deriv's own active_symbols
+    // response confirms it for THIS account/session. If a pair isn't
+    // confirmed, it shows "Unavailable" — never a fake signal.
+    { deriv:'frxXAUUSD', mt5:'Gold vs USD',        display:'XAUUSD', cat:'forex_majors', confirmed:false },
+    { deriv:'frxEURUSD', mt5:'Euro vs USD',        display:'EURUSD', cat:'forex_majors', confirmed:false },
+    { deriv:'frxGBPUSD', mt5:'Pound vs USD',       display:'GBPUSD', cat:'forex_majors', confirmed:false },
+    { deriv:'frxUSDJPY', mt5:'USD vs Yen',         display:'USDJPY', cat:'forex_majors', confirmed:false },
+    { deriv:'frxUSDCHF', mt5:'USD vs Franc',       display:'USDCHF', cat:'forex_majors', confirmed:false },
+    { deriv:'frxUSDCAD', mt5:'USD vs CAD',         display:'USDCAD', cat:'forex_majors', confirmed:false },
+    { deriv:'frxAUDUSD', mt5:'Aussie vs USD',      display:'AUDUSD', cat:'forex_majors', confirmed:false },
+    { deriv:'frxNZDUSD', mt5:'Kiwi vs USD',        display:'NZDUSD', cat:'forex_majors', confirmed:false },
+    { deriv:'frxEURGBP', mt5:'Euro vs Pound',      display:'EURGBP', cat:'forex_crosses', confirmed:false },
+    { deriv:'frxEURJPY', mt5:'Euro vs Yen',        display:'EURJPY', cat:'forex_crosses', confirmed:false },
+    { deriv:'frxGBPJPY', mt5:'Pound vs Yen',       display:'GBPJPY', cat:'forex_crosses', confirmed:false },
+    { deriv:'frxEURAUD', mt5:'Euro vs Aussie',     display:'EURAUD', cat:'forex_crosses', confirmed:false },
+    { deriv:'frxEURCAD', mt5:'Euro vs CAD',        display:'EURCAD', cat:'forex_crosses', confirmed:false },
+    { deriv:'frxAUDJPY', mt5:'Aussie vs Yen',      display:'AUDJPY', cat:'forex_crosses', confirmed:false },
+    { deriv:'frxAUDCAD', mt5:'Aussie vs CAD',      display:'AUDCAD', cat:'forex_crosses', confirmed:false },
+    { deriv:'frxCADJPY', mt5:'CAD vs Yen',         display:'CADJPY', cat:'forex_crosses', confirmed:false },
+    { deriv:'frxCHFJPY', mt5:'Franc vs Yen',       display:'CHFJPY', cat:'forex_crosses', confirmed:false },
+    { deriv:'frxGBPCHF', mt5:'Pound vs Franc',     display:'GBPCHF', cat:'forex_crosses', confirmed:false },
+    { deriv:'frxGBPAUD', mt5:'Pound vs Aussie',    display:'GBPAUD', cat:'forex_crosses', confirmed:false },
+    { deriv:'frxGBPCAD', mt5:'Pound vs CAD',       display:'GBPCAD', cat:'forex_crosses', confirmed:false },
+    { deriv:'frxEURNZD', mt5:'Euro vs Kiwi',       display:'EURNZD', cat:'forex_crosses', confirmed:false },
+    { deriv:'frxAUDNZD', mt5:'Aussie vs Kiwi',     display:'AUDNZD', cat:'forex_crosses', confirmed:false },
+    { deriv:'frxNZDJPY', mt5:'Kiwi vs Yen',        display:'NZDJPY', cat:'forex_crosses', confirmed:false },
 ];
-const APA_CATEGORY_LABEL = { volatility:'Volatility', volatility_1s:'Volatility 1s', step:'Step', boom:'Boom', crash:'Crash' };
+const APA_CATEGORY_LABEL = { volatility:'Volatility', volatility_1s:'Volatility 1s', step:'Step', boom:'Boom', crash:'Crash', forex_majors:'Forex Majors', forex_crosses:'Forex Crosses' };
 
 // A market is only ever presented as tradable once Deriv's own
 // active_symbols response has confirmed it (see connectPublicWS above).
@@ -5550,13 +5578,16 @@ function calcAccuConfidence(sym) {
         structureScore      * w.structure
     );
 
-    const effectiveThreshold = 75 + regimeInfo.thresholdAdj; // baseline "Good Entry" bar, shifted by regime
+    // GREAT ENTRY requires 83%+ — this exact bar is also what Auto Mode's
+    // effectiveThreshold below uses to decide whether to trade, so the
+    // label shown to the user and the actual entry logic can never disagree.
+    const effectiveThreshold = 83 + regimeInfo.thresholdAdj;
 
     let label, color;
-    if (score >= 90)      { label = '🟢 Excellent Entry'; color = 'var(--green)'; }
-    else if (score >= 80) { label = '🟢 Great Entry';     color = 'var(--green)'; }
-    else if (score >= 75) { label = '🟡 Good Entry';      color = 'var(--amber)'; }
-    else                  { label = '🔴 No Trade';        color = 'var(--red)';   }
+    if (score >= 83)      { label = '🟢 GREAT ENTRY';   color = 'var(--green)'; }
+    else if (score >= 70) { label = '🟡 Good / Watch';  color = 'var(--amber)'; }
+    else if (score >= 60) { label = '🟠 Weak / Caution'; color = '#f97316'; }
+    else                   { label = '🔴 Poor / Avoid';  color = 'var(--red)';   }
 
     // Loss-prevention overrides — these can block a trade even if the
     // weighted score alone looks acceptable.
@@ -5931,9 +5962,9 @@ function addAccuHistory(market, growth, stake, ticks, profit, isWin, confidence)
 function getAccuEntryQuality(sym) {
     const conf = calcAccuConfidence(sym);
     if (!conf.ready) return 'loading';
-    if (conf.score >= 90) return 'excellent';
-    if (conf.score >= 80) return 'great';
-    if (conf.score >= 75) return 'good';
+    if (conf.score >= 83) return 'great';   // GREAT ENTRY threshold — kept in sync with calcAccuConfidence()
+    if (conf.score >= 70) return 'good';
+    if (conf.score >= 60) return 'weak';
     return 'bad';
 }
 
