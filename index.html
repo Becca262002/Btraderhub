@@ -230,7 +230,7 @@ body{padding-bottom:60px;}
 
 /* ── Accumulators — compact responsive layout ── */
 #accu-pane{padding:12px;}
-#accu-pane .accu-wrap{max-width:900px;margin:0 auto;display:flex;flex-direction:column;gap:10px;}
+#accu-pane .accu-wrap{max-width:clamp(900px, 76vw, 1400px);margin:0 auto;display:flex;flex-direction:column;gap:10px;}
 .accu-row-2{display:grid;grid-template-columns:1fr 1fr;gap:10px;}
 .accu-row-3{display:grid;grid-template-columns:1fr 1fr 1fr;gap:8px;}
 .accu-card{padding:12px;}
@@ -247,6 +247,21 @@ body{padding-bottom:60px;}
 .mt5-signal-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(260px,1fr));gap:10px;}
 .mt5-history-grid{grid-template-columns:repeat(auto-fill,minmax(240px,1fr));}
 .mt5-tab-btn{white-space:nowrap;}
+
+/* ── Large desktop — a little extra breathing room, not a redesign.
+   Panes use responsive clamp() max-widths already (see inline styles /
+   .accu-wrap above), so wide monitors get a genuinely wider workspace
+   with more auto-fill grid columns, instead of one narrow centered
+   column with empty space on both sides. This tier just adds padding
+   comfort on top of that — mobile is completely untouched. ── */
+@media(min-width:1440px){
+    #dashboard-pane,#digits-pane,#scanner-pane,#bulk-pane,#mt5-pane{padding:24px 32px;}
+    #accu-pane{padding:24px 32px;}
+}
+@media(min-width:1920px){
+    #dashboard-pane,#digits-pane,#scanner-pane,#bulk-pane,#mt5-pane{padding:28px 48px;}
+    #accu-pane{padding:28px 48px;}
+}
 
 @media(max-width:768px){
     /* Hide sidebars by default on mobile */
@@ -347,7 +362,7 @@ body{padding-bottom:60px;}
 
 <!-- ── DASHBOARD ── -->
 <div id="dashboard-pane" class="tab-pane scroll active" style="padding:16px;">
-    <div style="max-width:680px;margin:0 auto;">
+    <div style="max-width:clamp(680px, 68vw, 1100px);margin:0 auto;">
 
         <!-- Auth card -->
         <div id="auth-card" class="card" style="padding:40px;text-align:center;margin-bottom:16px;">
@@ -928,7 +943,7 @@ body{padding-bottom:60px;}
 
 <!-- ── D-STATS ── -->
 <div id="digits-pane" class="tab-pane scroll" style="padding:16px;">
-    <div style="max-width:700px;margin:0 auto;">
+    <div style="max-width:clamp(700px, 72vw, 1320px);margin:0 auto;">
         <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:14px;flex-wrap:wrap;gap:10px;">
             <div>
                 <h2 style="font-size:16px;font-weight:900;">0️⃣ Digit Statistics</h2>
@@ -999,7 +1014,7 @@ body{padding-bottom:60px;}
 
 <!-- ── AI SCANNER ── -->
 <div id="scanner-pane" class="tab-pane scroll" style="padding:16px;">
-    <div style="max-width:780px;margin:0 auto;">
+    <div style="max-width:clamp(780px, 74vw, 1320px);margin:0 auto;">
         <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:16px;">
             <div>
                 <h2 style="font-size:16px;font-weight:900;">🧠 AI Market Scanner</h2>
@@ -1043,6 +1058,70 @@ body{padding-bottom:60px;}
             </div>
             <div class="badge badge-teal" style="font-size:11px;padding:6px 12px;">🔴 LIVE on Deriv API</div>
         </div>
+
+        <!-- ═══ TOP PRIORITY — the things you need at a glance, before scrolling ═══ -->
+
+        <!-- Market Health -->
+        <div class="card accu-card" style="border-color:var(--teal);">
+            <div style="font-size:10px;font-weight:700;color:var(--teal);text-transform:uppercase;margin-bottom:10px;">🏥 Market Health</div>
+            <div id="accu-signal-box" style="background:var(--bg);border:1px solid var(--border);border-radius:8px;padding:12px;text-align:center;">
+                <div style="font-size:11px;color:var(--muted);">Analyzing market...</div>
+            </div>
+        </div>
+
+        <!-- Live Price / Count + Profit Accumulated -->
+        <div class="accu-row-2">
+            <div class="card accu-card">
+                <div style="font-size:10px;font-weight:700;color:var(--muted);text-transform:uppercase;margin-bottom:8px;">📡 Live Price</div>
+                <div style="display:flex;align-items:center;justify-content:space-between;">
+                    <div>
+                        <div id="accu-price" style="font-size:24px;font-weight:900;font-family:monospace;color:var(--teal);">—</div>
+                        <div id="accu-last-digit" style="font-size:11px;color:var(--muted);">Last digit: —</div>
+                    </div>
+                    <div style="text-align:right;">
+                        <div id="accu-tick-count" style="font-size:28px;font-weight:900;color:var(--green);">0</div>
+                        <div style="font-size:10px;color:var(--muted);">ticks in range</div>
+                    </div>
+                </div>
+            </div>
+
+            <div class="card accu-card">
+                <div style="font-size:10px;font-weight:700;color:var(--muted);text-transform:uppercase;margin-bottom:8px;">💰 Profit Accumulated</div>
+                <div id="accu-current-profit" style="font-size:28px;font-weight:900;color:var(--green);">$0.00</div>
+                <div style="font-size:10px;color:var(--muted);margin-top:4px;">Current running contract</div>
+            </div>
+        </div>
+
+        <!-- Start / Sell / Reset -->
+        <div style="display:grid;grid-template-columns:1fr 1fr auto;gap:10px;">
+            <button id="accu-run-btn" onclick="toggleAccumulator()" class="btn btn-teal" style="padding:14px;font-size:15px;font-weight:900;border-radius:10px;box-shadow:0 4px 20px #00d2c844;">
+                ▶ Start Accumulator
+            </button>
+            <button onclick="sellAccumulator()" id="accu-sell-btn" class="btn btn-ghost" style="padding:14px;font-size:13px;font-weight:900;border-radius:10px;display:none;">
+                💰 Sell Now
+            </button>
+            <button onclick="resetAccumulator()" id="accu-reset-btn" class="btn btn-ghost" title="Reset accumulator session — clears stats, history and current contract without reloading the page" style="padding:14px 18px;font-size:13px;font-weight:900;border-radius:10px;">
+                🔄 Reset
+            </button>
+        </div>
+        <!-- Auto mode status bar -->
+        <div id="accu-auto-bar" style="display:none;background:#00d2c818;border:1px solid #00d2c844;border-radius:8px;padding:10px 14px;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:8px;">
+            <div style="display:flex;align-items:center;gap:8px;">
+                <span style="width:8px;height:8px;border-radius:50%;background:var(--teal);display:inline-block;animation:pulse-dot 1s infinite;"></span>
+                <span style="font-size:12px;font-weight:700;color:var(--teal);">🤖 AUTO MODE RUNNING</span>
+            </div>
+            <div style="display:flex;gap:14px;font-size:11px;color:var(--muted);">
+                <span>Sessions: <b id="accu-auto-sessions" style="color:var(--teal);">0</b></span>
+                <span>TP Hits: <b id="accu-tp-hits" style="color:var(--green);">0</b></span>
+                <span>Total P/L: <b id="accu-auto-pl" style="color:var(--green);">$0.00</b></span>
+            </div>
+            <button onclick="stopAccuAuto()" class="btn btn-red" style="font-size:11px;padding:5px 14px;">⬛ Stop Auto</button>
+        </div>
+        <style>
+            @keyframes pulse-dot { 0%,100%{opacity:1;} 50%{opacity:.4;} }
+        </style>
+
+        <!-- ═══ Detailed analysis + configuration ═══ -->
 
         <!-- Market + Settings row -->
         <div class="accu-row-2">
@@ -1140,11 +1219,6 @@ body{padding-bottom:60px;}
                         <div id="accu-micro-trend" style="font-size:13px;font-weight:900;color:var(--muted);">—</div>
                     </div>
                 </div>
-
-                <!-- Entry signal / Confidence score -->
-                <div id="accu-signal-box" style="background:var(--bg);border:1px solid var(--border);border-radius:8px;padding:12px;text-align:center;">
-                    <div style="font-size:11px;color:var(--muted);">Analyzing market...</div>
-                </div>
             </div>
 
             <!-- Right: Trade settings -->
@@ -1181,7 +1255,7 @@ body{padding-bottom:60px;}
 
                 <div style="margin-bottom:10px;">
                     <div style="font-size:9px;color:var(--muted);font-weight:700;text-transform:uppercase;margin-bottom:4px;">AI Confidence Threshold (Auto Mode) %</div>
-                    <input type="number" id="accu-conf-threshold" value="75" min="50" max="99" style="text-align:center;">
+                    <input type="number" id="accu-conf-threshold" value="83" min="50" max="99" style="text-align:center;">
                 </div>
 
                 <!-- Auto mode toggle -->
@@ -1211,62 +1285,13 @@ body{padding-bottom:60px;}
             </div>
         </div>
 
-        <!-- Live price + current contract -->
-        <div class="accu-row-2">
-            <div class="card accu-card">
-                <div style="font-size:10px;font-weight:700;color:var(--muted);text-transform:uppercase;margin-bottom:8px;">📡 Live Price</div>
-                <div style="display:flex;align-items:center;justify-content:space-between;">
-                    <div>
-                        <div id="accu-price" style="font-size:24px;font-weight:900;font-family:monospace;color:var(--teal);">—</div>
-                        <div id="accu-last-digit" style="font-size:11px;color:var(--muted);">Last digit: —</div>
-                    </div>
-                    <div style="text-align:right;">
-                        <div id="accu-tick-count" style="font-size:28px;font-weight:900;color:var(--green);">0</div>
-                        <div style="font-size:10px;color:var(--muted);">ticks in range</div>
-                    </div>
-                </div>
-            </div>
-
-            <div class="card accu-card">
-                <div style="font-size:10px;font-weight:700;color:var(--muted);text-transform:uppercase;margin-bottom:8px;">📋 Current Contract</div>
-                <div id="accu-contract-info" style="font-size:12px;color:var(--muted);">No active contract</div>
-                <div style="margin-top:8px;">
-                    <div style="font-size:10px;color:var(--muted);margin-bottom:4px;">Current Profit</div>
-                    <div id="accu-current-profit" style="font-size:22px;font-weight:900;color:var(--green);">$0.00</div>
-                </div>
-            </div>
+        <!-- Current Contract -->
+        <div class="card accu-card">
+            <div style="font-size:10px;font-weight:700;color:var(--muted);text-transform:uppercase;margin-bottom:8px;">📋 Current Contract</div>
+            <div id="accu-contract-info" style="font-size:12px;color:var(--muted);">No active contract</div>
         </div>
 
-        <!-- Run/Stop/Reset buttons -->
-        <div style="display:grid;grid-template-columns:1fr 1fr auto;gap:10px;">
-            <button id="accu-run-btn" onclick="toggleAccumulator()" class="btn btn-teal" style="padding:14px;font-size:15px;font-weight:900;border-radius:10px;box-shadow:0 4px 20px #00d2c844;">
-                ▶ Start Accumulator
-            </button>
-            <button onclick="sellAccumulator()" id="accu-sell-btn" class="btn btn-ghost" style="padding:14px;font-size:13px;font-weight:900;border-radius:10px;display:none;">
-                💰 Sell Now
-            </button>
-            <button onclick="resetAccumulator()" id="accu-reset-btn" class="btn btn-ghost" title="Reset accumulator session — clears stats, history and current contract without reloading the page" style="padding:14px 18px;font-size:13px;font-weight:900;border-radius:10px;">
-                🔄 Reset
-            </button>
-        </div>
-        <!-- Auto mode status bar -->
-        <div id="accu-auto-bar" style="display:none;background:#00d2c818;border:1px solid #00d2c844;border-radius:8px;padding:10px 14px;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:8px;">
-            <div style="display:flex;align-items:center;gap:8px;">
-                <span style="width:8px;height:8px;border-radius:50%;background:var(--teal);display:inline-block;animation:pulse-dot 1s infinite;"></span>
-                <span style="font-size:12px;font-weight:700;color:var(--teal);">🤖 AUTO MODE RUNNING</span>
-            </div>
-            <div style="display:flex;gap:14px;font-size:11px;color:var(--muted);">
-                <span>Sessions: <b id="accu-auto-sessions" style="color:var(--teal);">0</b></span>
-                <span>TP Hits: <b id="accu-tp-hits" style="color:var(--green);">0</b></span>
-                <span>Total P/L: <b id="accu-auto-pl" style="color:var(--green);">$0.00</b></span>
-            </div>
-            <button onclick="stopAccuAuto()" class="btn btn-red" style="font-size:11px;padding:5px 14px;">⬛ Stop Auto</button>
-        </div>
-        <style>
-            @keyframes pulse-dot { 0%,100%{opacity:1;} 50%{opacity:.4;} }
-        </style>
-
-        <!-- Transaction history -->
+        <!-- Accumulator History -->
         <div class="card accu-card">
             <div style="font-size:10px;font-weight:700;color:var(--muted);text-transform:uppercase;margin-bottom:10px;">📋 Accumulator History</div>
             <div style="display:flex;padding:6px 0;border-bottom:1px solid var(--border);font-size:10px;font-weight:700;color:var(--muted);">
@@ -1291,7 +1316,7 @@ body{padding-bottom:60px;}
 
 <!-- ── BULK TRADING ── -->
 <div id="bulk-pane" class="tab-pane scroll" style="padding:16px;">
-    <div style="max-width:900px;margin:0 auto;display:flex;flex-direction:column;gap:10px;">
+    <div style="max-width:clamp(900px, 76vw, 1400px);margin:0 auto;display:flex;flex-direction:column;gap:10px;">
 
         <!-- Header -->
         <div style="display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:10px;">
@@ -1522,7 +1547,7 @@ body{padding-bottom:60px;}
 
 <!-- ── MT5 + ADVANCED PRICE ACTION TRADING ── -->
 <div id="mt5-pane" class="tab-pane scroll" style="padding:16px;">
-    <div style="max-width:960px;margin:0 auto;">
+    <div style="max-width:clamp(960px, 80vw, 1500px);margin:0 auto;">
 
         <!-- Header -->
         <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:14px;flex-wrap:wrap;gap:10px;">
@@ -1591,6 +1616,33 @@ body{padding-bottom:60px;}
                         <option value="CRASH900">Crash 900 Index</option>
                         <option value="CRASH1000">Crash 1000 Index</option>
                     </optgroup>
+                    <optgroup label="Forex Majors (validated live)">
+                        <option value="frxXAUUSD">XAUUSD (Gold)</option>
+                        <option value="frxEURUSD">EURUSD</option>
+                        <option value="frxGBPUSD">GBPUSD</option>
+                        <option value="frxUSDJPY">USDJPY</option>
+                        <option value="frxUSDCHF">USDCHF</option>
+                        <option value="frxUSDCAD">USDCAD</option>
+                        <option value="frxAUDUSD">AUDUSD</option>
+                        <option value="frxNZDUSD">NZDUSD</option>
+                    </optgroup>
+                    <optgroup label="Forex Crosses (validated live)">
+                        <option value="frxEURGBP">EURGBP</option>
+                        <option value="frxEURJPY">EURJPY</option>
+                        <option value="frxGBPJPY">GBPJPY</option>
+                        <option value="frxEURAUD">EURAUD</option>
+                        <option value="frxEURCAD">EURCAD</option>
+                        <option value="frxAUDJPY">AUDJPY</option>
+                        <option value="frxAUDCAD">AUDCAD</option>
+                        <option value="frxCADJPY">CADJPY</option>
+                        <option value="frxCHFJPY">CHFJPY</option>
+                        <option value="frxGBPCHF">GBPCHF</option>
+                        <option value="frxGBPAUD">GBPAUD</option>
+                        <option value="frxGBPCAD">GBPCAD</option>
+                        <option value="frxEURNZD">EURNZD</option>
+                        <option value="frxAUDNZD">AUDNZD</option>
+                        <option value="frxNZDJPY">NZDJPY</option>
+                    </optgroup>
                 </select>
 
                 <div id="apa-setup-card">
@@ -1619,6 +1671,8 @@ body{padding-bottom:60px;}
                         <option value="volatility_1s">Volatility 1s</option>
                         <option value="boom">Boom</option>
                         <option value="crash">Crash</option>
+                        <option value="forex_majors">Forex Majors</option>
+                        <option value="forex_crosses">Forex Crosses</option>
                     </select>
                 </div>
                 <div style="margin-bottom:10px;">
