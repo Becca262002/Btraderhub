@@ -164,9 +164,11 @@ let sessionBasePL = 0; // PL at the start of current session
 // Tracks consecutive losses and switches to high-probability recovery trade
 let consecutiveLosses  = 0;
 let isInRecoveryMode   = false;
-let originalDirection  = null;  // what user originally set
-let originalPrediction = null;  // what user originally set
-const RECOVERY_TRIGGER = 2;     // losses before switching to recovery
+let originalDirection  = null;  // the BASE contract (what the user configured)
+let originalPrediction = null;  // the BASE barrier
+let recoveryDirection  = null;  // the RECOVERY contract, computed once when recovery activates
+let recoveryPrediction = null;  // the RECOVERY barrier
+const RECOVERY_TRIGGER = 1;     // losses before switching to recovery — ONE loss activates it, not two
 // Recovery map: if trading Over X, recover with Under (9-X) and vice versa
 // e.g. Over 1 → recover with Under 8 | Over 2 → recover with Under 7
 function getRecoveryTrade(direction, pred) {
@@ -1147,6 +1149,8 @@ function toggleBot() {
             isInRecoveryMode   = false;
             originalDirection  = null;
             originalPrediction = null;
+            recoveryDirection  = null;
+            recoveryPrediction = null;
             renderDirButtons();
             updateInfoBar();
             log('🔄 Recovery mode reset — original settings restored', 'i');
@@ -1402,7 +1406,7 @@ function handleContractResult(c) {
         // Reset stake on win
         currentStake = baseStake;
 
-        // If in recovery mode — switch BACK to original trade after win
+        // If in recovery mode — a WIN ends recovery and returns to the base trade
         const currentType = document.getElementById('bot-type')?.value;
         if (currentType === 'over_under' && isInRecoveryMode && originalDirection !== null) {
             isInRecoveryMode  = false;
@@ -1411,6 +1415,8 @@ function handleContractResult(c) {
             if (predEl && originalPrediction !== null) predEl.value = originalPrediction;
             originalDirection  = null;
             originalPrediction = null;
+            recoveryDirection  = null;
+            recoveryPrediction = null;
             consecutiveLosses  = 0;
             renderDirButtons();
             updateInfoBar();
@@ -1433,39 +1439,65 @@ Switched back to original: ${botDirection.toUpperCase()} ${document.getElementBy
         log(`📐 Martingale: next stake $${currentStake.toFixed(2)}`, 'x');
 
         // ── SMART RECOVERY — only for over_under ──
-        // After 2 consecutive losses, switch to high-probability recovery trade
-        // Over 1/2 → recover with Under 8/7 and vice versa
+        // ONE loss activates recovery immediately (no longer waits for two
+        // consecutive losses). Once active, every further loss ALTERNATES
+        // between the two configured contracts (base <-> recovery) rather
+        // than repeatedly re-trading the same recovery side — a WIN on
+        // either side is what ends recovery, handled in the win branch above.
         const currentType2 = document.getElementById('bot-type')?.value;
-        if (currentType2 === 'over_under' &&
-            consecutiveLosses >= RECOVERY_TRIGGER &&
-            !isInRecoveryMode) {
+        const predEl        = document.getElementById('bot-pred');
 
-            const currentPred = parseInt(document.getElementById('bot-pred')?.value || 0);
+        if (currentType2 === 'over_under' && !isInRecoveryMode) {
+            // First loss on the base trade — activate recovery immediately.
+            const currentPred = parseInt(predEl?.value || 0);
             const recovery    = getRecoveryTrade(botDirection, currentPred);
 
             if (recovery) {
-                // Save original settings before switching
+                // Save the base contract so a WIN can return to it, and save
+                // the recovery contract so subsequent losses can alternate
+                // back to it without recomputing (recomputing from a shifted
+                // barrier could drift instead of returning to the same pair).
                 originalDirection  = botDirection;
                 originalPrediction = currentPred;
+                recoveryDirection  = recovery.direction;
+                recoveryPrediction = recovery.pred;
                 isInRecoveryMode   = true;
 
-                // Apply recovery trade
-                botDirection = recovery.direction;
-                const predEl = document.getElementById('bot-pred');
-                if (predEl) predEl.value = recovery.pred;
+                botDirection = recoveryDirection;
+                if (predEl) predEl.value = recoveryPrediction;
 
                 renderDirButtons();
                 updateInfoBar();
 
-                log(`🚨 ${consecutiveLosses} losses! RECOVERY MODE: ${recovery.direction.toUpperCase()} ${recovery.pred}`, 'x');
+                log(`🚨 LOSS! RECOVERY MODE: ${recoveryDirection.toUpperCase()} ${recoveryPrediction}`, 'x');
                 notify(
                     '🚨 Recovery Mode Activated',
-                    `${consecutiveLosses} consecutive losses!
-Switching to ${recovery.direction.toUpperCase()} ${recovery.pred} to recover.
-Will return to ${originalDirection.toUpperCase()} ${originalPrediction} after win.`,
+                    `Loss on ${originalDirection.toUpperCase()} ${originalPrediction}.
+Switching to ${recoveryDirection.toUpperCase()} ${recoveryPrediction} to recover.
+Will alternate between the two on further losses, and return to ${originalDirection.toUpperCase()} ${originalPrediction} after a win.`,
                     'warn'
                 );
             }
+        } else if (currentType2 === 'over_under' && isInRecoveryMode) {
+            // Already in recovery and lost again — alternate to the OTHER
+            // configured side (base <-> recovery), not a third new value.
+            const onRecoverySide = botDirection === recoveryDirection;
+            const nextDirection  = onRecoverySide ? originalDirection  : recoveryDirection;
+            const nextPred       = onRecoverySide ? originalPrediction : recoveryPrediction;
+
+            botDirection = nextDirection;
+            if (predEl) predEl.value = nextPred;
+
+            renderDirButtons();
+            updateInfoBar();
+
+            log(`🔄 Recovery loss — alternating to ${nextDirection.toUpperCase()} ${nextPred}`, 'x');
+            notify(
+                '🔄 Recovery Alternating',
+                `Loss on ${(onRecoverySide ? recoveryDirection : originalDirection).toUpperCase()}.
+Switching to ${nextDirection.toUpperCase()} ${nextPred}.`,
+                'warn'
+            );
         }
     }
     updateAllStats();
@@ -1880,9 +1912,31 @@ async function submitSingleBulkEntry(cfg, idx, batch) {
             proposal: 1, amount: parseFloat(cfg.stakePerTrade.toFixed(2)), basis: 'stake',
             contract_type: contractType, currency: 'USD', underlying_symbol: cfg.market
         };
+        // ── BATCH-LEVEL EXPIRY SYNCHRONIZATION ──
+        // Only Rise/Fall (CALL/PUT) contracts use a wall-clock duration, so
+        // it's the only type where Deriv's API actually supports a shared
+        // absolute expiry: passing `date_expiry` (a fixed Unix timestamp)
+        // instead of a relative `duration` makes every trade in the batch
+        // target the EXACT same expiry moment, computed once in
+        // runBulkExecution() and stored on the batch (batch.targetExpiry).
+        // Digit contracts (DIGITOVER/UNDER/EVEN/ODD) and Only-Ups/Downs
+        // (RUNHIGH/RUNLOW) are tick-duration contracts by design — Deriv has
+        // no absolute-expiry mechanism for them, a contract simply lasts N
+        // ticks from ITS OWN entry. No client-side trick can force two
+        // independently-entered tick contracts to share an expiry, so for
+        // these we don't fake it — we just keep entries as tight together
+        // as the proposal-collision fix (above) safely allows, and record
+        // the actual entry-time spread on the batch for transparency
+        // (see batch.firstEntryTime/lastEntryTime, surfaced in the UI).
         if (isDigit)         { proposalReq.duration = Math.max(1, Math.min(10, cfg.duration)); proposalReq.duration_unit = 't'; }
         else if (isRunHL)    { proposalReq.duration = Math.max(2, Math.min(10, cfg.duration)); proposalReq.duration_unit = 't'; }
-        else if (isRiseFall) { proposalReq.duration = Math.max(1, cfg.duration); proposalReq.duration_unit = 'm'; }
+        else if (isRiseFall) {
+            if (batch.targetExpiry) {
+                proposalReq.date_expiry = batch.targetExpiry; // same absolute timestamp for every trade in this batch
+            } else {
+                proposalReq.duration = Math.max(1, cfg.duration); proposalReq.duration_unit = 'm';
+            }
+        }
         if (cfg.type === 'over_under') proposalReq.barrier = String(cfg.pred);
 
         // ── CRITICAL SECTION ──
@@ -1925,6 +1979,11 @@ async function submitSingleBulkEntry(cfg, idx, batch) {
         const entryTime   = Date.now();
 
         batch.entries[idx] = { index: idx+1, status: 'ENTERED', contractId, stake: buyPrice, contractType, entrySpot, entryTime, timestamp: entryTime };
+        // Track the actual entry-time spread across the batch — the honest
+        // "how synchronized were these trades" metric for tick-based
+        // contract types where Deriv has no absolute-expiry mechanism.
+        if (batch.firstEntryTime === null || entryTime < batch.firstEntryTime) batch.firstEntryTime = entryTime;
+        if (batch.lastEntryTime === null || entryTime > batch.lastEntryTime) batch.lastEntryTime = entryTime;
         log(`📦 Bulk entry ${idx+1}/${batch.trades} submitted | ${contractType} @ $${buyPrice.toFixed(2)}`, 'i');
         batch.status = 'RUNNING';
 
@@ -2006,6 +2065,7 @@ function checkBulkBatchFullyResolved(batch) {
     batch._finalized = true;
     batch.status = computeBatchStatus(batch);
     batch.completedAt = Date.now();
+    trimBulkBatchesMemory(); // now that batches are unlimited, keep memory bounded — see comment below
     saveBulkBatches();
     renderBulkHistory();
     if (bulkCurrentBatch === batch) renderBulkProgress(batch);
@@ -2018,6 +2078,26 @@ function checkBulkBatchFullyResolved(batch) {
         batch.status === 'Completed' ? 'ok' : batch.status === 'Failed' ? 'err' : 'warn'
     );
     if (batch._resolveDone) batch._resolveDone(batch);
+}
+
+// Bulk Trading now runs an unlimited number of batches per session (see
+// bulkAutoTick — no more artificial max-batch stop). Without a bound, the
+// in-memory bulkBatches array (and the DOM cards rendered from it) would
+// grow forever over a long-running session. This keeps the live view to
+// the most recent 100 — matching the existing localStorage retention in
+// saveBulkBatches() — while NEVER dropping a batch that hasn't finished
+// (RUNNING/ENTERING/PREPARING trades are always kept, full stop).
+function trimBulkBatchesMemory() {
+    const KEEP = 100;
+    if (bulkBatches.length <= KEEP) return;
+    const excess = bulkBatches.length - KEEP;
+    let dropped = 0;
+    const kept = [];
+    for (const b of bulkBatches) {
+        if (dropped < excess && b._finalized) { dropped++; continue; } // drop oldest finalized batches only
+        kept.push(b);
+    }
+    bulkBatches = kept;
 }
 
 // ── Reset the current setup/execution area — does NOT touch history ──
@@ -2113,7 +2193,11 @@ async function runBulkExecution() {
         type: cfg.type, direction: cfg.direction, pred: cfg.pred, trades: cfg.trades,
         stakePerTrade: cfg.stakePerTrade, totalStake: cfg.totalStake,
         account: acct ? (acct.account_type === 'real' ? 'REAL' : 'DEMO') : '—',
-        status: 'PREPARING', entries: [], results: [], _finalized: false
+        status: 'PREPARING', entries: [], results: [], _finalized: false,
+        // Batch-level expiry sync (see submitSingleBulkEntry): only Rise/Fall
+        // can genuinely share one absolute expiry via Deriv's date_expiry.
+        targetExpiry: cfg.type === 'rise_fall' ? Math.floor(Date.now()/1000) + Math.max(60, cfg.duration * 60) : null,
+        firstEntryTime: null, lastEntryTime: null // actual spread, tracked as entries land — for tick-based types this is the honest "how close together" metric
     };
     let resolveDone;
     const donePromise = new Promise(resolve => { resolveDone = resolve; });
@@ -2273,7 +2357,7 @@ function renderBulkHistory() {
                 <div style="text-align:center;"><div style="font-size:8px;color:var(--muted);">WINS / LOSSES</div><div style="font-size:12px;font-weight:900;"><span style="color:var(--green);">${wins}</span> / <span style="color:var(--red);">${losses}</span></div></div>
                 <div style="text-align:center;"><div style="font-size:8px;color:var(--muted);">TOTAL P/L</div><div style="font-size:12px;font-weight:900;color:${net>0?'var(--green)':net<0?'var(--red)':'var(--muted)'};">${net===0?'0.00':(net>0?'+':'')+'$'+net.toFixed(2)}</div></div>
             </div>
-            <div style="font-size:9px;color:var(--muted);margin-top:6px;">Account: <b>${b.account}</b> ${resolved < b.trades && !inProgress ? ' · <span style="color:var(--amber);">Some trades never resolved</span>' : ''}</div>
+            <div style="font-size:9px;color:var(--muted);margin-top:6px;">Account: <b>${b.account}</b> ${b.targetExpiry ? ` · <span style="color:var(--teal);">Synchronized expiry</span>` : (b.firstEntryTime && b.lastEntryTime ? ` · Entry spread: <b>${b.lastEntryTime - b.firstEntryTime}ms</b>` : '')} ${resolved < b.trades && !inProgress ? ' · <span style="color:var(--amber);">Some trades never resolved</span>' : ''}</div>
             <div id="bulk-batch-detail-${b.id}" style="display:none;margin-top:8px;border-top:1px solid var(--border);padding-top:8px;">
                 <div style="display:flex;justify-content:flex-end;margin-bottom:6px;">
                     <span style="font-size:9px;color:var(--teal);cursor:pointer;" onclick="event.stopPropagation();">VIEW ${results.length} TRADE${results.length===1?'':'S'}</span>
@@ -2431,8 +2515,15 @@ async function bulkAutoTick() {
 
     if (!derivWS || derivWS.readyState !== WebSocket.OPEN) { stopBulkAuto('connection_lost'); return; }
 
-    const maxBatches = parseInt(document.getElementById('bulk-auto-max-batches')?.value || 5);
-    if (bulkAutoSessions >= maxBatches) { stopBulkAuto('max_batches'); return; }
+    // No artificial cap on the number of batches by default — Bulk Auto
+    // Mode runs indefinitely until a legitimate stop condition (manual
+    // stop, Take Profit, Stop Loss, connection loss, or an outright-failed
+    // batch) occurs. "Max Batches per Day" is now an OPT-IN safety control:
+    // 0 (the default) means unlimited; a user who sets a number gets that
+    // as an intentional, explicit risk control — which is a legitimate
+    // reason to stop, unlike an arbitrary hidden default ever was.
+    const maxBatches = parseInt(document.getElementById('bulk-auto-max-batches')?.value || 0);
+    if (maxBatches > 0 && bulkAutoSessions >= maxBatches) { stopBulkAuto('max_batches'); return; }
 
     const tp = parseFloat(document.getElementById('bulk-auto-tp')?.value || 0);
     const sl = parseFloat(document.getElementById('bulk-auto-sl')?.value || 0);
@@ -2725,6 +2816,8 @@ function resetAndContinue() {
     isInRecoveryMode   = false;
     originalDirection  = null;
     originalPrediction = null;
+    recoveryDirection  = null;
+    recoveryPrediction = null;
 
     // Clear transactions list
     const txList = document.getElementById('tx-list');
